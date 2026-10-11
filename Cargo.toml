@@ -52,6 +52,7 @@ tokio = { version = "1.32.0", features = [
     "rt",
     "sync",
     "signal",
+    "time",
 ] }
 futures = "0.3.28"
 clap = { version = "4.4.11", features = ["derive"] }
@@ -68,9 +69,27 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+] }
+rustls-pki-types = { version = "1.14", features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+
+[target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
+ashpd = { version = "0.13.9", default-features = false, features = [
+    "clipboard",
+    "remote_desktop",
+    "tokio",
+] }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "5.4", features = ["monitor"] }
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "png",
+] }
 
 [features]
 default = [
@@ -98,3 +117,8 @@ icon = ["target/icon.icns"]
 identifier = "de.feschber.LanMouse"
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]
+
+# webrtc-util 0.11.0 with webrtc-rs/webrtc#812 backported (Windows WSAECONNRESET
+# tears down the DTLS listener, lan-mouse #262)
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }

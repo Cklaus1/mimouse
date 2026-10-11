@@ -318,6 +318,7 @@ It is of the form "aa:bb:cc:..."
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
 
 If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
+Clipboard sharing (`clipboard = true`) additionally needs TCP on the same port.
 </details>
 
 <details>
@@ -384,6 +385,12 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
 # optional port (defaults to 4242)
 port = 4242
+
+# optional clipboard sharing (defaults to false): text, HTML and images
+# are sent over TLS on TCP using the same port number. Peers must authorize
+# each other's fingerprint. Linux support uses the xdg-desktop-portal
+# Clipboard interface (RemoteDesktop session), e.g. on GNOME.
+clipboard = true
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic

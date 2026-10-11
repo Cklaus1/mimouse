@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::Clipboard,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -45,6 +46,8 @@ pub struct Service {
     capture: Capture,
     /// input emulation
     emulation: Emulation,
+    /// clipboard sharing
+    clipboard: Clipboard,
     /// dns resolver
     resolver: DnsResolver,
     /// frontend listener
@@ -105,6 +108,14 @@ impl Service {
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 
+        let clipboard = Clipboard::new(
+            config.clipboard(),
+            config.port(),
+            &cert,
+            authorized_keys.clone(),
+            client_manager.clone(),
+        );
+
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
@@ -113,6 +124,7 @@ impl Service {
             config,
             capture,
             emulation,
+            clipboard,
             frontend_listener,
             resolver,
             authorized_keys,
@@ -160,6 +172,8 @@ impl Service {
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
+        log::debug!("terminating clipboard ...");
+        self.clipboard.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
@@ -302,6 +316,7 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    self.clipboard.port_changed(port);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -341,6 +356,7 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.clipboard.client_entered(handle);
                 self.spawn_hook_command(handle);
             }
         }

@@ -56,6 +56,7 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    clipboard: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -430,6 +431,14 @@ impl Config {
             .as_ref()
             .and_then(|c| c.authorized_fingerprints.clone())
             .unwrap_or_default()
+    }
+
+    /// whether clipboard sharing is enabled (default: disabled)
+    pub fn clipboard(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard)
+            .unwrap_or(false)
     }
 
     /// path to certificate
