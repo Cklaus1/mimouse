@@ -1,6 +1,6 @@
+use crate::proto::{MAX_EVENT_SIZE, ProtoEvent};
 use futures::{Stream, StreamExt};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mimouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, VecDeque},

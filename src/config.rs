@@ -15,8 +15,8 @@ use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
 
-use mimouse_cli::CliArgs;
-use mimouse_ipc::{DEFAULT_PORT, Position};
+use crate::cli::CliArgs;
+use crate::ipc::{DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -341,11 +341,9 @@ impl Config {
             .to_path_buf();
 
         // Ensure the config directory exists and write a default config file
-        // if none is present. Runs on every Config::new(), regardless of which
-        // entry path (GUI main, spawned daemon, CLI, test commands) we're on,
-        // so a fresh Mac never hits "No such file or directory" on config.toml
-        // and notify::Watcher (which requires the dir to exist on macOS
-        // FSEvents and some Linux backends) has a concrete path to watch.
+        // if none is present, on every entry path (service, CLI, test commands),
+        // so notify::Watcher (which requires the dir to exist on macOS FSEvents
+        // and some Linux backends) has a concrete path to watch.
         fs::create_dir_all(&config_dir)?;
         if !config_path.exists() {
             let default_toml = toml::to_string_pretty(&ConfigToml::default())
@@ -542,14 +540,8 @@ impl Config {
         let new_config = self.config_toml.clone().unwrap_or_default();
         let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
 
-        /*
-         * TODO merge with current config file to preserve comments
-         * => eventually we might want to split this up into clients configured
-         * via the config file and clients managed through the GUI / frontend.
-         * The latter should be saved to $XDG_DATA_HOME instead of $XDG_CONFIG_HOME,
-         * and clients configured through .config could be made permanent.
-         * For now we just override the config file.
-         */
+        // TODO merge with the current config file to preserve comments;
+        // for now `save-config` overwrites it.
 
         let _ = self.unwatch();
         /* write new config to file */

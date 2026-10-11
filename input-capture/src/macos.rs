@@ -732,9 +732,9 @@ fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> 
 }
 
 fn request_accessibility_permission() -> bool {
-    // Silent check. The GUI owns the one-time user-visible prompt at
-    // startup (see mimouse_gtk::macos_privacy) so retries triggered by
-    // clicking the "Reenable" button don't pop a fresh Accessibility
+    // Silent check. The service fires the one-time user-visible prompt at
+    // startup (see mimouse's macos_permissions module) so retries triggered
+    // by `mimouse cli enable-capture` don't pop a fresh Accessibility
     // alert every time.
     unsafe { AXIsProcessTrusted() }
 }

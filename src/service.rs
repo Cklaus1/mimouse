@@ -1,3 +1,7 @@
+use crate::ipc::{
+    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
+    IpcListenerCreationError, Position, Status,
+};
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
@@ -12,10 +16,6 @@ use crate::{
 use futures::StreamExt;
 use hickory_resolver::ResolveError;
 use log;
-use mimouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
-};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
@@ -92,6 +92,7 @@ impl Service {
         // load certificate
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
         let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        log::info!("certificate fingerprint: {public_key_fingerprint}");
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
@@ -101,6 +102,10 @@ impl Service {
         let listener =
             MiMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
+
+        // after the already-running check, so a second instance never prompts
+        #[cfg(target_os = "macos")]
+        crate::macos_permissions::request_permissions();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -289,6 +294,9 @@ impl Service {
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
+                log::warn!(
+                    "connection attempt from unauthorized fingerprint {fingerprint}; approve with `mimouse cli authorize-key <name> {fingerprint}`"
+                );
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
             EmulationEvent::Entered {

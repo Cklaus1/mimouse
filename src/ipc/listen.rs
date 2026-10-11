@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::net::TcpStream;
 
-use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
+use super::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
 
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
@@ -43,7 +43,7 @@ impl AsyncFrontendListener {
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
         #[cfg(unix)]
         let (socket_path, listener) = {
-            let socket_path = crate::default_socket_path()?;
+            let socket_path = super::default_socket_path()?;
 
             log::debug!("remove socket: {socket_path:?}");
             if socket_path.exists() {

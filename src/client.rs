@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use mimouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use crate::ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
 

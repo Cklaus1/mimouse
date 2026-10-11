@@ -1,4 +1,4 @@
-use crate::{ConnectionError, FrontendEvent, FrontendRequest, IpcError};
+use super::{ConnectionError, FrontendEvent, FrontendRequest, IpcError};
 use std::{
     cmp::min,
     task::{Poll, ready},
@@ -81,7 +81,7 @@ pub async fn connect_async(
 /// wait for the mimouse socket to come online
 #[cfg(unix)]
 async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
-    let socket_path = crate::default_socket_path()?;
+    let socket_path = super::default_socket_path()?;
     let mut duration = Duration::from_millis(10);
     loop {
         if let Ok(stream) = UnixStream::connect(&socket_path).await {

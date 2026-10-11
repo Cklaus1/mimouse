@@ -6,7 +6,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use hickory_resolver::{ResolveError, TokioResolver};
 use tokio_util::sync::CancellationToken;
 
-use mimouse_ipc::ClientHandle;
+use crate::ipc::ClientHandle;
 
 pub(crate) struct DnsResolver {
     cancellation_token: CancellationToken,

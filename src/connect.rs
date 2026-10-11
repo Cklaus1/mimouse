@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
+use crate::ipc::{ClientHandle, DEFAULT_PORT};
+use crate::proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mimouse_ipc::{ClientHandle, DEFAULT_PORT};
-use mimouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},

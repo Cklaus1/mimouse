@@ -4,7 +4,7 @@ use futures::StreamExt;
 use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
-use mimouse_ipc::{
+use crate::ipc::{
     ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position,
     connect_async,
 };

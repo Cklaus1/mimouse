@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use mimouse_ipc::ClientHandle;
+use crate::ipc::ClientHandle;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, spawn_local},
@@ -32,11 +32,16 @@ use webrtc_dtls::crypto::Certificate;
 
 use crate::client::ClientManager;
 
+// mime types and accessors below are used by the platform backends only;
+// macOS has no clipboard backend yet
 /// UTF-8 text
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const MIME_TEXT: &str = "text/plain;charset=utf-8";
 /// HTML fragment (UTF-8)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const MIME_HTML: &str = "text/html";
 /// PNG image
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const MIME_PNG: &str = "image/png";
 
 /// maximum accepted size of a clipboard update (all formats combined)
@@ -56,6 +61,7 @@ impl ClipboardData {
         }
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn get(&self, mime: &str) -> Option<&[u8]> {
         self.items
             .iter()
@@ -63,6 +69,7 @@ impl ClipboardData {
             .map(|(_, d)| d.as_slice())
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

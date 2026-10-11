@@ -1,40 +1,26 @@
-# example configuration
+# example config: ~/.config/mimouse/config.toml (Windows: %LOCALAPPDATA%\mimouse\config.toml)
 
-# configure release bind
-release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
+# keys that return control to this machine (names: input-event/src/scancode.rs)
+release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 
-# optional port (defaults to 4242)
+# default 4242; UDP for input, TCP for clipboard
 port = 4242
 
-# optional clipboard sharing (defaults to false): text, HTML and images
-# are sent over TLS on TCP using the same port number. Peers must authorize
-# each other's fingerprint. Linux support uses the xdg-desktop-portal
-# Clipboard interface (RemoteDesktop session), e.g. on GNOME.
+# share clipboard (text, HTML, images); default false
 clipboard = true
 
-# list of authorized tls certificate fingerprints that
-# are accepted for incoming traffic
+# peers allowed to connect: fingerprint = name
 [authorized_fingerprints]
 "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
 
-# define a client on the right side with host name "iridium"
 [[clients]]
-# position (left | right | top | bottom)
-position = "right"
-# hostname
+position = "right" # left | right | top | bottom
 hostname = "iridium"
-# activate this client immediately when mimouse is started
 activate_on_startup = true
-# optional list of (known) ip addresses
-ips = ["192.168.178.156"]
+ips = ["192.168.178.156"] # optional if hostname resolves
 
-# define a client on the left side with IP address 192.168.178.189
 [[clients]]
 position = "left"
-# The hostname is optional: When no hostname is specified,
-# at least one ip address needs to be specified.
-hostname = "thorium"
-# ips for ethernet and wifi
+hostname = "thorium" # optional if ips are given
 ips = ["192.168.178.189", "192.168.178.172"]
-# optional port
 port = 4242

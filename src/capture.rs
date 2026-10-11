@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::proto::ProtoEvent;
 use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mimouse_proto::ProtoEvent;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
@@ -109,7 +109,7 @@ impl Capture {
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
-        pos: mimouse_ipc::Position,
+        pos: crate::ipc::Position,
         capture_type: CaptureType,
     ) {
         let pos = to_capture_pos(pos);
@@ -431,21 +431,21 @@ enum State {
     Sending,
 }
 
-fn to_capture_pos(pos: mimouse_ipc::Position) -> input_capture::Position {
+fn to_capture_pos(pos: crate::ipc::Position) -> input_capture::Position {
     match pos {
-        mimouse_ipc::Position::Left => input_capture::Position::Left,
-        mimouse_ipc::Position::Right => input_capture::Position::Right,
-        mimouse_ipc::Position::Top => input_capture::Position::Top,
-        mimouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+        crate::ipc::Position::Left => input_capture::Position::Left,
+        crate::ipc::Position::Right => input_capture::Position::Right,
+        crate::ipc::Position::Top => input_capture::Position::Top,
+        crate::ipc::Position::Bottom => input_capture::Position::Bottom,
     }
 }
 
-fn to_proto_pos(pos: input_capture::Position) -> mimouse_proto::Position {
+fn to_proto_pos(pos: input_capture::Position) -> crate::proto::Position {
     match pos {
-        input_capture::Position::Left => mimouse_proto::Position::Left,
-        input_capture::Position::Right => mimouse_proto::Position::Right,
-        input_capture::Position::Top => mimouse_proto::Position::Top,
-        input_capture::Position::Bottom => mimouse_proto::Position::Bottom,
+        input_capture::Position::Left => crate::proto::Position::Left,
+        input_capture::Position::Right => crate::proto::Position::Right,
+        input_capture::Position::Top => crate::proto::Position::Top,
+        input_capture::Position::Bottom => crate::proto::Position::Bottom,
     }
 }
 

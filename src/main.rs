@@ -3,19 +3,13 @@ use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use mimouse::{
     capture_test,
+    cli::{self, CliError},
     config::{self, Command, Config, ConfigError},
     emulation_test,
+    ipc::{IpcError, IpcListenerCreationError},
     service::{Service, ServiceError},
 };
-use mimouse_cli::CliError;
-#[cfg(feature = "gtk")]
-use mimouse_gtk::GtkError;
-use mimouse_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -33,9 +27,6 @@ enum MiMouseError {
     Capture(#[from] InputCaptureError),
     #[error(transparent)]
     Emulation(#[from] InputEmulationError),
-    #[cfg(feature = "gtk")]
-    #[error(transparent)]
-    Gtk(#[from] GtkError),
     #[error(transparent)]
     Cli(#[from] CliError),
 }
@@ -54,53 +45,20 @@ fn main() {
 fn run() -> Result<(), MiMouseError> {
     let config = config::Config::new()?;
     match config.command() {
-        Some(command) => match command {
-            Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
-            Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
-            Command::Cli(cli_args) => run_async(mimouse_cli::run(cli_args))?,
-            Command::Daemon => {
-                // if daemon is specified we run the service
-                match run_async(run_service(config)) {
-                    Err(MiMouseError::Service(ServiceError::IpcListen(
-                        IpcListenerCreationError::AlreadyRunning,
-                    ))) => log::info!("service already running!"),
-                    r => r?,
-                }
+        Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args)),
+        Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args)),
+        Some(Command::Cli(cli_args)) => run_async(cli::run(cli_args)),
+        // `mimouse` and `mimouse daemon` both run the service
+        Some(Command::Daemon) | None => match run_async(run_service(config)) {
+            Err(MiMouseError::Service(ServiceError::IpcListen(
+                IpcListenerCreationError::AlreadyRunning,
+            ))) => {
+                log::info!("service already running!");
+                Ok(())
             }
+            r => r,
         },
-        None => {
-            //  otherwise start the service as a child process and
-            //  run a frontend
-            #[cfg(feature = "gtk")]
-            {
-                let mut service = start_service()?;
-                let res = mimouse_gtk::run();
-                #[cfg(unix)]
-                {
-                    // on unix we give the service a chance to terminate gracefully
-                    let pid = service.id() as libc::pid_t;
-                    unsafe {
-                        libc::kill(pid, libc::SIGINT);
-                    }
-                    service.wait()?;
-                }
-                service.kill()?;
-                res?;
-            }
-            #[cfg(not(feature = "gtk"))]
-            {
-                // run daemon if gtk is diabled
-                match run_async(run_service(config)) {
-                    Err(MiMouseError::Service(ServiceError::IpcListen(
-                        IpcListenerCreationError::AlreadyRunning,
-                    ))) => log::info!("service already running!"),
-                    r => r?,
-                }
-            }
-        }
     }
-
-    Ok(())
 }
 
 fn run_async<F, E>(f: F) -> Result<(), MiMouseError>
@@ -116,14 +74,6 @@ where
 
     // run async event loop
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
-}
-
-fn start_service() -> Result<Child, io::Error> {
-    let child = process::Command::new(std::env::current_exe()?)
-        .args(std::env::args().skip(1))
-        .arg("daemon")
-        .spawn()?;
-    Ok(child)
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {

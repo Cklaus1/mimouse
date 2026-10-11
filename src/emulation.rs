@@ -1,9 +1,9 @@
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
+use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
 use local_channel::mpsc::{Receiver, Sender, channel};
-use mimouse_proto::{Position, ProtoEvent};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -36,7 +36,7 @@ pub(crate) enum EmulationEvent {
         /// address of the connection
         addr: SocketAddr,
         /// position of the connection
-        pos: mimouse_ipc::Position,
+        pos: crate::ipc::Position,
         /// certificate fingerprint of the connection
         fingerprint: String,
     },
@@ -383,12 +383,12 @@ impl EmulationTask {
     }
 }
 
-fn to_ipc_pos(pos: Position) -> mimouse_ipc::Position {
+fn to_ipc_pos(pos: Position) -> crate::ipc::Position {
     match pos {
-        Position::Left => mimouse_ipc::Position::Left,
-        Position::Right => mimouse_ipc::Position::Right,
-        Position::Top => mimouse_ipc::Position::Top,
-        Position::Bottom => mimouse_ipc::Position::Bottom,
+        Position::Left => crate::ipc::Position::Left,
+        Position::Right => crate::ipc::Position::Right,
+        Position::Top => crate::ipc::Position::Top,
+        Position::Bottom => crate::ipc::Position::Bottom,
     }
 }
 

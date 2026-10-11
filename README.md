@@ -2,458 +2,85 @@
 
 [![CI](https://github.com/Cklaus1/mimouse/actions/workflows/rust.yml/badge.svg)](https://github.com/Cklaus1/mimouse/actions/workflows/rust.yml) [![Release](https://github.com/Cklaus1/mimouse/actions/workflows/release.yml/badge.svg)](https://github.com/Cklaus1/mimouse/actions/workflows/release.yml)
 
-MiMouse is a fork of [Lan Mouse](https://github.com/feschber/lan-mouse) by Ferdinand Schober (GPL-3.0-or-later).
-It adds clipboard sharing (text, HTML, images) and a fix for the Windows UDP listener dying on `WSAECONNRESET` ([feschber/lan-mouse#262](https://github.com/feschber/lan-mouse/issues/262)).
-The network protocol for input events is unchanged.
+Share one mouse and keyboard between Linux, Windows and macOS over the LAN (software KVM).
+Fork of [Lan Mouse](https://github.com/feschber/lan-mouse) by Ferdinand Schober (GPL-3.0-or-later); the input protocol is unchanged, so it interoperates with Lan Mouse 0.11.
 
-MiMouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
-It allows for using multiple PCs via a single set of mouse and keyboard.
-This is also known as a Software KVM switch.
+Changes from upstream:
+- Clipboard sharing: text, HTML, images (Linux via xdg-desktop-portal, Windows).
+- Windows UDP listener no longer dies on `WSAECONNRESET` ([lan-mouse#262](https://github.com/feschber/lan-mouse/issues/262)).
+- No GUI: a single background binary, configured by `config.toml` and `mimouse cli`.
 
-Goal of this project is to be an open-source alternative to proprietary tools like [Synergy 2/3](https://symless.com/synergy), [Share Mouse](https://www.sharemouse.com/de/)
-and other open source tools like [Deskflow](https://github.com/deskflow/deskflow) or [Input Leap](https://github.com/input-leap) (Synergy fork).
+Traffic is encrypted with DTLS (input) and TLS (clipboard); peers authenticate by certificate fingerprint.
 
-Focus lies on performance, ease of use and a maintainable implementation that can be expanded to support additional backends for e.g. Android, iOS, ... in the future.
+## Build
 
-***blazingly fast™*** because it's written in rust.
-
-- _Now with a gtk frontend_
-
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
-    <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of MiMouse" srcset="/screenshots/dark.png">
-</picture>
-
-
-## Encryption
-
-MiMouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
-There are currently no mitigations in place for timing side-channel attacks.
-
-## OS Support
-
-Most current desktop environments and operating systems are fully supported, this includes
-- GNOME >= 45
-- KDE Plasma >= 6.1
-- Most wlroots based compositors, including Sway (>= 1.8), Hyprland and Wayfire
-- Windows
-- MacOS
-
-
-### Caveats / Known Issues
-
-> [!Important]
-> - **X11** currently only has support for input emulation, i.e. can only be used on the receiving end.
->
-> - **Sway / wlroots**: Wlroots based compositors without libei support on the receiving end currently do not handle modifier events on the client side.
-> This results in CTRL / SHIFT / ALT / SUPER keys not working with a sending device that is NOT using the `layer-shell` backend
->
-> - **Wayfire**: If you are using [Wayfire](https://github.com/WayfireWM/wayfire), make sure to use a recent version (must be newer than October 23rd) and **add `shortcuts-inhibit` to the list of plugins in your wayfire config!**
-> Otherwise input capture will not work.
->
-> - **Windows**: The mouse cursor will be invisible when sending input to a Windows system if
-> there is no real mouse connected to the machine.
-
-For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
-
-### Android & IOS
-
-A proof of concept for an Android / IOS Application by [rohitsangwan01](https://github.com/rohitsangwan01) can be found [here](https://github.com/rohitsangwan01/lan-mouse-mobile).
-It was written for upstream Lan Mouse; MiMouse keeps the same input protocol.
-
-## Installation
-
-<details>
-    <summary>MacOS</summary>
-
-- Download the package for your Mac (Intel or ARM) from the releases page
-- Unzip it
-- Remove the quarantine with `xattr -rd com.apple.quarantine "MiMouse.app"`
-- Launch the app
-- Use the menu bar item to open the settings window or quit MiMouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
-- Grant accessibility permissions in System Preferences
-
-</details>
-
-
-<details>
-    <summary>Manual Installation</summary>
-
-First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
-
-Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/Cklaus1/mimouse/releases).
-For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
-
-Alternatively, the `mimouse` binary can be compiled from source (see below).
-
-### Installing desktop file, app icon and firewall rules (optional)
 ```sh
-# install mimouse (replace path/to/ with the correct path)
-sudo cp path/to/mimouse /usr/local/bin/
-
-# install app icon
-sudo mkdir -p /usr/local/share/icons/hicolor/scalable/apps
-sudo cp mimouse-gtk/resources/io.github.cklaus1.MiMouse.svg /usr/local/share/icons/hicolor/scalable/apps
-
-# update icon cache
-gtk-update-icon-cache /usr/local/share/icons/hicolor/
-
-# install desktop entry
-sudo mkdir -p /usr/local/share/applications
-sudo cp io.github.cklaus1.MiMouse.desktop /usr/local/share/applications
-
-# when using firewalld: install firewall rule
-sudo cp firewall/mimouse.xml /etc/firewalld/services
-# -> enable the service in firewalld settings
+sudo apt install libx11-dev libxtst-dev   # Debian/Ubuntu
+sudo dnf install libX11-devel libXtst-devel   # Fedora
+sudo pacman -S libx11 libxtst   # Arch
+cargo build --release   # -> target/release/mimouse
 ```
 
-Instead of downloading from the releases, the `mimouse` binary
-can be easily compiled via cargo or nix:
+Windows and macOS need no extra libraries. Windows also cross-compiles from Linux:
+`cargo build --release --target x86_64-pc-windows-gnu`.
+Release binaries: [releases](https://github.com/Cklaus1/mimouse/releases).
 
-### Compiling and installing manually:
-```sh
-# compile in release mode
-cargo build --release
+## Setup
 
-# install mimouse
-sudo cp target/release/mimouse /usr/local/bin/
-```
+1. Run `mimouse` on each machine. The log shows `certificate fingerprint: aa:bb:...`.
+2. Write `config.toml` on each machine (see [config.toml](config.toml)): the peer under `[[clients]]` with its position, and the peer's fingerprint under `[authorized_fingerprints]`.
+   - Linux/macOS: `~/.config/mimouse/config.toml`
+   - Windows: `%LOCALAPPDATA%\mimouse\config.toml`
+3. Open the port (default 4242): UDP for input, plus TCP if `clipboard = true`. firewalld: `firewall/mimouse.xml`.
+4. Restart `mimouse`.
 
-### Compiling and installing via cargo:
-```sh
-# will end up in ~/.cargo/bin
-cargo install --git https://github.com/Cklaus1/mimouse mimouse
-```
+An unauthorized peer shows up in the log with the command to approve it (`mimouse cli authorize-key <name> <fingerprint>`; persist with `mimouse cli save-config`).
 
-### Compiling and installing via nix:
-```sh
-# you can find the executable in result/bin/mimouse
-nix-build
-```
-### Conditional compilation
-Support for other platforms is omitted automatically based on the active
-rust toolchain.
+Default release bind (return control to the local machine): Ctrl+Shift+Super+Alt.
 
-Additionally, available backends and frontends can be configured manually via
-[cargo features](https://doc.rust-lang.org/cargo/reference/features.html).
+## Run at login
 
-E.g. if only support for sway is needed, the following command produces
-an executable with support for only the `layer-shell` capture backend
-and `wlroots` emulation backend:
-```sh
-cargo build --no-default-features --features layer_shell_capture,wlroots_emulation
-```
-For a detailed list of available features, checkout the [Cargo.toml](./Cargo.toml)
-</details>
+- **Linux:** install `service/mimouse.service` to `~/.config/systemd/user/` (fix `ExecStart` if the binary isn't `/usr/bin/mimouse`), then `systemctl --user enable --now mimouse`.
+- **Windows:** scheduled task at logon running `mimouse.exe daemon`, "run with highest privileges" (needed to control elevated windows).
+- **macOS:** on first start, grant Accessibility and Input Monitoring when prompted.
 
+## CLI
 
+Talks to the running service. `mimouse cli help` lists commands:
+`list`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`.
+
+Logging: `MIMOUSE_LOG_LEVEL=debug mimouse`.
+
+## Platform support
+
+Sending needs a capture backend; receiving needs an emulation backend. Chosen automatically; override with `--capture-backend` / `--emulation-backend`.
+
+| Desktop | Capture | Emulation |
+|---|---|---|
+| GNOME >= 45 | libei | libei, remote-desktop portal |
+| KDE Plasma >= 6.1 | libei, layer-shell | libei, remote-desktop portal |
+| wlroots (Sway >= 1.8, Hyprland, Wayfire) | layer-shell | wlroots |
+| X11 | none | x11 |
+| Windows | windows | windows |
+| macOS | macos | macos |
+
+Backends are cargo features (`Cargo.toml`), e.g. `cargo build --no-default-features --features layer_shell_capture,wlroots_emulation`.
+Clipboard: Linux (portal Clipboard interface, e.g. GNOME) and Windows; not macOS.
+
+## Known issues
+
+- X11 can only receive.
+- wlroots without libei on the receiving side ignores modifiers unless the sender uses layer-shell.
+- Wayfire needs the `shortcuts-inhibit` plugin.
+- Windows hides the cursor while receiving if no physical mouse is attached.
+- The first crossing right after start can be dropped while the peer connects; cross again.
+- GNOME can stop accepting emulated input ([lan-mouse#193](https://github.com/feschber/lan-mouse/issues/193)); run `mimouse cli enable-emulation`.
 
 ## Development
 
-### Git pre-commit hook
-
-This repository includes a local git hooks directory `.githooks/` with a `pre-commit` script that enforces formatting, lints, and tests before allowing a commit.  It is optional to enable it, but it will prevent you from committing code with failing unit tests or that needs clippy/fmt fixes. To enable the hook locally:
-
-1. Make the hook executable:
-
 ```sh
-chmod +x .githooks/pre-commit
+cargo fmt && cargo clippy --workspace --all-targets && cargo test --workspace
+git config core.hooksPath .githooks   # optional pre-commit: fmt, clippy, test
 ```
 
-2. Point git to the hooks directory (one-time per clone):
-
-```sh
-git config core.hooksPath .githooks
-```
-
-The `pre-commit` script runs `cargo fmt --all` (and fails if files were modified), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`.
-
-### Dependencies & Compiling from Source
-<details>
-    <summary>MacOS</summary>
-
-```sh
-# Install dependencies
-brew install libadwaita pkg-config imagemagick
-cargo install cargo-bundle
-# Create the macOS icon file
-scripts/makeicns.sh
-# Create the .app bundle
-cargo bundle
-# Copy all dynamic libraries into the bundle, and update the bundle to find them there
-scripts/copy-macos-dylib.sh
-```
-</details>
-
-<details>
-    <summary>Ubuntu and derivatives</summary>
-
-```sh
-sudo apt install libadwaita-1-dev libgtk-4-dev libx11-dev libxtst-dev
-```
-</details>
-
-<details>
-    <summary>Arch and derivatives</summary>
-
-```sh
-sudo pacman -S libadwaita gtk libx11 libxtst
-```
-</details>
-
-<details>
-    <summary>Fedora and derivatives</summary>
-
-```sh
-sudo dnf install libadwaita-devel libXtst-devel libX11-devel
-```
-</details>
-<details>
-    <summary>Nix</summary>
-
-```sh
-nix-shell .
-```
-</details>
-<details>
-    <summary>Nix (flake)</summary>
-
-```sh
-nix develop
-```
-</details>
-
-<details>
-    <summary>Windows</summary>
-
-- First install [Rust](https://www.rust-lang.org/tools/install).
-
-- **Headless (no GUI, no GTK):** `cargo build --release --no-default-features` produces a single `mimouse.exe`
-  (it also cross-compiles from Linux with `--target x86_64-pc-windows-gnu`).
-  Without the GTK frontend, `mimouse.exe` runs the daemon directly; configure it through
-  `%LOCALAPPDATA%\mimouse\config.toml` and control the running daemon with `mimouse.exe cli <command>`
-  (`list`, `add-client`, `authorize-key`, `enable-capture`, `save-config`, ...).
-  The steps below are only needed for the GTK frontend.
-
-- Then follow the instructions at [gtk-rs.org](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html)
-
-*TLDR:*
-
-Build gtk from source
-
-- The following commands should be run in an **admin power shell** instance:
-```sh
-# install chocolatey
-Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-# install gvsbuild dependencies
-choco install python git msys2 visualstudio2022-workload-vctools
-```
-
-- The following commands should be run in a **regular power shell** instance:
-
-```sh
-# install gvsbuild with python
-python -m pip install --user pipx
-python -m pipx ensurepath
-```
-
-- Relaunch your powershell instance so the changes in the environment are reflected.
-```sh
-pipx install gvsbuild
-
-# build gtk + libadwaita
-gvsbuild build gtk4 libadwaita librsvg adwaita-icon-theme
-```
-
-- **Make sure to add the directory** `C:\gtk-build\gtk\x64\release\bin`
-[**to the `PATH` environment variable**]((https://learn.microsoft.com/en-us/previous-versions/office/developer/sharepoint-2010/ee537574(v=office.14))). Otherwise the project will fail to build.
-
-To avoid building GTK from source, it is possible to disable
-the gtk frontend (see conditional compilation).
-</details>
-
-## Usage
-<details>
-    <summary>Gtk Frontend</summary>
-
-By default the gtk frontend will open when running `mimouse`.
-
-To connect a device you want to control, simply click the `Add` button and enter the hostname
-of the device.
-
-On the *remote* device, authorize your *local* device for incoming traffic using the `Authorize` button
-under the "Incoming Connections" section.
-The fingerprint for authorization can be found under the general section of your *local* device.
-It is of the form "aa:bb:cc:..."
-
-Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
-
-If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
-Clipboard sharing (`clipboard = true`) additionally needs TCP on the same port.
-</details>
-
-<details>
-    <summary>Command Line Interface</summary>
-
-The cli interface can be accessed by passing `cli` as a commandline argument.
-Use
-```sh
-mimouse cli help
-```
- to list the available commands and
-```sh
-mimouse cli <cmd> help
-```
-for information on how to use a specific command.
-
-</details>
-
-<details>
-    <summary>Daemon Mode</summary>
-
-MiMouse can be launched in daemon mode to keep it running in the background (e.g. for use in a systemd-service).
-
-To do so, use the `daemon` subcommand:
-
-```sh
-mimouse daemon
-```
-</details>
-
-## Systemd Service
-
-In order to start mimouse with a graphical session automatically,
-the [systemd-service](service/mimouse.service) can be used:
-
-Copy the file to `~/.config/systemd/user/` and enable the service:
-
-```sh
-cp service/mimouse.service ~/.config/systemd/user
-systemctl --user daemon-reload
-systemctl --user enable --now mimouse.service
-```
-> [!Important]
-> Make sure to point `ExecStart=/usr/bin/mimouse daemon` to the actual `mimouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
-
-
-## Configuration
-To automatically load clients on startup, the file `$XDG_CONFIG_HOME/mimouse/config.toml` is parsed.
-`$XDG_CONFIG_HOME` defaults to `~/.config/`.
-
-To create this file you can copy the following example config:
-
-### Example config
-> [!TIP]
-> key symbols in the release bind are named according
-> to their names in [input-event/src/scancode.rs#L172](input-event/src/scancode.rs#L176).
-> This is bound to change
-
-```toml
-# example configuration
-
-# configure release bind
-release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
-
-# optional port (defaults to 4242)
-port = 4242
-
-# optional clipboard sharing (defaults to false): text, HTML and images
-# are sent over TLS on TCP using the same port number. Peers must authorize
-# each other's fingerprint. Linux support uses the xdg-desktop-portal
-# Clipboard interface (RemoteDesktop session), e.g. on GNOME.
-clipboard = true
-
-# list of authorized tls certificate fingerprints that
-# are accepted for incoming traffic
-[authorized_fingerprints]
-"bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"
-
-# define a client on the right side with host name "iridium"
-[[clients]]
-# position (left | right | top | bottom)
-position = "right"
-# hostname
-hostname = "iridium"
-# activate this client immediately when mimouse is started
-activate_on_startup = true
-# optional list of (known) ip addresses
-ips = ["192.168.178.156"]
-
-# define a client on the left side with IP address 192.168.178.189
-[[clients]]
-position = "left"
-# The hostname is optional: When no hostname is specified,
-# at least one ip address needs to be specified.
-hostname = "thorium"
-# ips for ethernet and wifi
-ips = ["192.168.178.189", "192.168.178.172"]
-# optional port
-port = 4242
-```
-
-Where `left` can be either `left`, `right`, `top` or `bottom`.
-
-## Roadmap
-- [x] Graphical frontend (gtk + libadwaita)
-- [x] respect xdg-config-home for config file location.
-- [x] IP Address switching
-- [x] Liveness tracking Automatically ungrab mouse when client unreachable
-- [x] Liveness tracking: Automatically release keys, when server offline
-- [x] MacOS KeyCode Translation
-- [x] Libei Input Capture
-- [x] MacOS Input Capture
-- [x] Windows Input Capture
-- [x] Encryption
-- [ ] X11 Input Capture
-- [ ] Latency measurement and visualization
-- [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
-
-
-## Detailed OS Support
-
-In order to use a device for sending events, an **input-capture** backend is required, while receiving events requires
-a supported **input-emulation** *and* **input-capture** backend.
-
-A suitable backend is chosen automatically based on the active desktop environment / compositor.
-
-The following sections detail the emulation and capture backends provided by mimouse and their support in desktop environments / operating systems.
-
-### Input Emulation Support
-
-| Desktop / Backend         | wlroots                  | libei                    | remote-desktop portal    | windows                  |   macos                                | x11                |
-|---------------------------|--------------------------|--------------------------|--------------------------|--------------------------|----------------------------------------|--------------------|
-| Wayland (wlroots)         | :heavy_check_mark:       |                          |                          |                          |                                        |                    |
-| Wayland (KDE)             |                          | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |                    |
-| Wayland (Gnome)           |                          | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |                    |
-| Windows                   |                          |                          |                          | :heavy_check_mark:       |                                        |                    |
-| MacOS                     |                          |                          |                          |                          |   :heavy_check_mark:                   |                    |
-| X11                       |                          |                          |                          |                          |                                        | :heavy_check_mark: |
-
-- `wlroots`: This backend makes use of the [wlr-virtual-pointer-unstable-v1](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1) and [virtual-keyboard-unstable-v1](https://wayland.app/protocols/virtual-keyboard-unstable-v1) protocols and is supported by most wlroots based compositors.
-- `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
-- `xdp`: This backend uses the [freedesktop remote-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/#gdbus-org.freedesktop.portal.RemoteDesktop) and is supported on GNOME and Plasma.
-- `x11`: Backend for X11 sessions.
-- `windows`: Backend for Windows.
-- `macos`: Backend for MacOS.
-
-
-
-### Input Capture Support
-
-| Desktop / Backend         | layer-shell              | libei                    | windows                  |   macos                                | x11 |
-|---------------------------|--------------------------|--------------------------|--------------------------|----------------------------------------|-----|
-| Wayland (wlroots)         | :heavy_check_mark:       |                          |                          |                                        |     |
-| Wayland (KDE)             | :heavy_check_mark:       | :heavy_check_mark:       |                          |                                        |     |
-| Wayland (Gnome)           |                          | :heavy_check_mark:       |                          |                                        |     |
-| Windows                   |                          |                          | :heavy_check_mark:       |                                        |     |
-| MacOS                     |                          |                          |                          |   :heavy_check_mark:                   |     |
-| X11                       |                          |                          |                          |                                        | WIP |
-
-- `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
-- `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
-- `windows`: Backend for input capture on Windows.
-- `macos`: Backend for input capture on MacOS.
-- `x11`: TODO (not yet supported)
+See [AGENTS.md](AGENTS.md) for architecture.
