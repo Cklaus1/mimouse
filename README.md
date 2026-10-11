@@ -1,10 +1,12 @@
-# Lan Mouse
+# MiMouse
 
-[![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
+[![CI](https://github.com/Cklaus1/mimouse/actions/workflows/rust.yml/badge.svg)](https://github.com/Cklaus1/mimouse/actions/workflows/rust.yml) [![Release](https://github.com/Cklaus1/mimouse/actions/workflows/release.yml/badge.svg)](https://github.com/Cklaus1/mimouse/actions/workflows/release.yml)
 
-[![crates.io](https://img.shields.io/crates/v/lan-mouse.svg)](https://crates.io/crates/lan-mouse)  [![license](https://img.shields.io/crates/l/lan-mouse.svg)](https://github.com/feschber/lan-mouse/blob/main/Cargo.toml)
+MiMouse is a fork of [Lan Mouse](https://github.com/feschber/lan-mouse) by Ferdinand Schober (GPL-3.0-or-later).
+It adds clipboard sharing (text, HTML, images) and a fix for the Windows UDP listener dying on `WSAECONNRESET` ([feschber/lan-mouse#262](https://github.com/feschber/lan-mouse/issues/262)).
+The network protocol for input events is unchanged.
 
-Lan Mouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
+MiMouse is a *cross-platform* mouse and keyboard sharing software similar to universal-control on Apple devices.
 It allows for using multiple PCs via a single set of mouse and keyboard.
 This is also known as a Software KVM switch.
 
@@ -20,13 +22,13 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 <picture>
     <source media="(prefers-color-scheme: dark)" srcset="/screenshots/dark.png?raw=true">
     <source media="(prefers-color-scheme: light)" srcset="/screenshots/light.png?raw=true">
-    <img alt="Screenshot of Lan-Mouse" srcset="/screenshots/dark.png">
+    <img alt="Screenshot of MiMouse" srcset="/screenshots/dark.png">
 </picture>
 
 
 ## Encryption
 
-Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
+MiMouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
 There are currently no mitigations in place for timing side-channel attacks.
 
 ## OS Support
@@ -58,54 +60,18 @@ For more detailed information about os support see [Detailed OS Support](#detail
 ### Android & IOS
 
 A proof of concept for an Android / IOS Application by [rohitsangwan01](https://github.com/rohitsangwan01) can be found [here](https://github.com/rohitsangwan01/lan-mouse-mobile).
-It can be used as a remote control for any device supported by Lan Mouse.
+It was written for upstream Lan Mouse; MiMouse keeps the same input protocol.
 
 ## Installation
-
-<details>
-    <summary>Arch Linux</summary>
-
-Lan Mouse can be installed from the [official repositories](https://archlinux.org/packages/extra/x86_64/lan-mouse/):
-
-```sh
-pacman -S lan-mouse
-```
-
-The prerelease version (following `main`) is available on the AUR:
-
-```sh
-paru -S lan-mouse-git
-```
-</details>
-
-
-<details>
-    <summary>Nix (OS)</summary>
-
-- nixpkgs: [search.nixos.org](https://search.nixos.org/packages?channel=unstable&show=lan-mouse&from=0&size=50&sort=relevance&type=packages&query=lan-mouse)
-- flake: [README.md](./nix/README.md)
-</details>
-
-<details>
-    <summary>Fedora</summary>
-You can install Lan Mouse from the [Terra Repository](https://terra.fyralabs.com).
-
-
-After enabling Terra:
-
-```sh
-dnf install lan-mouse
-```
-</details>
 
 <details>
     <summary>MacOS</summary>
 
 - Download the package for your Mac (Intel or ARM) from the releases page
 - Unzip it
-- Remove the quarantine with `xattr -rd com.apple.quarantine "Lan Mouse.app"`
+- Remove the quarantine with `xattr -rd com.apple.quarantine "MiMouse.app"`
 - Launch the app
-- Use the menu bar item to open the settings window or quit Lan Mouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
+- Use the menu bar item to open the settings window or quit MiMouse. Bundled macOS builds run as a menu bar app and do not keep a Dock icon visible.
 - Grant accessibility permissions in System Preferences
 
 </details>
@@ -116,33 +82,33 @@ dnf install lan-mouse
 
 First make sure to [install the necessary dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/feschber/lan-mouse/releases).
+Precompiled release binaries for Windows, MacOS and Linux are available in the [releases section](https://github.com/Cklaus1/mimouse/releases).
 For Windows, the depenedencies are included in the .zip file, for other operating systems see [Installing Dependencies](#installing-dependencies-for-development--compiling-from-source).
 
-Alternatively, the `lan-mouse` binary can be compiled from source (see below).
+Alternatively, the `mimouse` binary can be compiled from source (see below).
 
 ### Installing desktop file, app icon and firewall rules (optional)
 ```sh
-# install lan-mouse (replace path/to/ with the correct path)
-sudo cp path/to/lan-mouse /usr/local/bin/
+# install mimouse (replace path/to/ with the correct path)
+sudo cp path/to/mimouse /usr/local/bin/
 
 # install app icon
 sudo mkdir -p /usr/local/share/icons/hicolor/scalable/apps
-sudo cp lan-mouse-gtk/resources/de.feschber.LanMouse.svg /usr/local/share/icons/hicolor/scalable/apps
+sudo cp mimouse-gtk/resources/io.github.cklaus1.MiMouse.svg /usr/local/share/icons/hicolor/scalable/apps
 
 # update icon cache
 gtk-update-icon-cache /usr/local/share/icons/hicolor/
 
 # install desktop entry
 sudo mkdir -p /usr/local/share/applications
-sudo cp de.feschber.LanMouse.desktop /usr/local/share/applications
+sudo cp io.github.cklaus1.MiMouse.desktop /usr/local/share/applications
 
 # when using firewalld: install firewall rule
-sudo cp firewall/lan-mouse.xml /etc/firewalld/services
+sudo cp firewall/mimouse.xml /etc/firewalld/services
 # -> enable the service in firewalld settings
 ```
 
-Instead of downloading from the releases, the `lan-mouse` binary
+Instead of downloading from the releases, the `mimouse` binary
 can be easily compiled via cargo or nix:
 
 ### Compiling and installing manually:
@@ -150,19 +116,19 @@ can be easily compiled via cargo or nix:
 # compile in release mode
 cargo build --release
 
-# install lan-mouse
-sudo cp target/release/lan-mouse /usr/local/bin/
+# install mimouse
+sudo cp target/release/mimouse /usr/local/bin/
 ```
 
 ### Compiling and installing via cargo:
 ```sh
 # will end up in ~/.cargo/bin
-cargo install lan-mouse
+cargo install --git https://github.com/Cklaus1/mimouse mimouse
 ```
 
 ### Compiling and installing via nix:
 ```sh
-# you can find the executable in result/bin/lan-mouse
+# you can find the executable in result/bin/mimouse
 nix-build
 ```
 ### Conditional compilation
@@ -263,6 +229,13 @@ nix develop
 
 - First install [Rust](https://www.rust-lang.org/tools/install).
 
+- **Headless (no GUI, no GTK):** `cargo build --release --no-default-features` produces a single `mimouse.exe`
+  (it also cross-compiles from Linux with `--target x86_64-pc-windows-gnu`).
+  Without the GTK frontend, `mimouse.exe` runs the daemon directly; configure it through
+  `%LOCALAPPDATA%\mimouse\config.toml` and control the running daemon with `mimouse.exe cli <command>`
+  (`list`, `add-client`, `authorize-key`, `enable-capture`, `save-config`, ...).
+  The steps below are only needed for the GTK frontend.
+
 - Then follow the instructions at [gtk-rs.org](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html)
 
 *TLDR:*
@@ -305,7 +278,7 @@ the gtk frontend (see conditional compilation).
 <details>
     <summary>Gtk Frontend</summary>
 
-By default the gtk frontend will open when running `lan-mouse`.
+By default the gtk frontend will open when running `mimouse`.
 
 To connect a device you want to control, simply click the `Add` button and enter the hostname
 of the device.
@@ -327,11 +300,11 @@ Clipboard sharing (`clipboard = true`) additionally needs TCP on the same port.
 The cli interface can be accessed by passing `cli` as a commandline argument.
 Use
 ```sh
-lan-mouse cli help
+mimouse cli help
 ```
  to list the available commands and
 ```sh
-lan-mouse cli <cmd> help
+mimouse cli <cmd> help
 ```
 for information on how to use a specific command.
 
@@ -340,33 +313,33 @@ for information on how to use a specific command.
 <details>
     <summary>Daemon Mode</summary>
 
-Lan Mouse can be launched in daemon mode to keep it running in the background (e.g. for use in a systemd-service).
+MiMouse can be launched in daemon mode to keep it running in the background (e.g. for use in a systemd-service).
 
 To do so, use the `daemon` subcommand:
 
 ```sh
-lan-mouse daemon
+mimouse daemon
 ```
 </details>
 
 ## Systemd Service
 
-In order to start lan-mouse with a graphical session automatically,
-the [systemd-service](service/lan-mouse.service) can be used:
+In order to start mimouse with a graphical session automatically,
+the [systemd-service](service/mimouse.service) can be used:
 
 Copy the file to `~/.config/systemd/user/` and enable the service:
 
 ```sh
-cp service/lan-mouse.service ~/.config/systemd/user
+cp service/mimouse.service ~/.config/systemd/user
 systemctl --user daemon-reload
-systemctl --user enable --now lan-mouse.service
+systemctl --user enable --now mimouse.service
 ```
 > [!Important]
-> Make sure to point `ExecStart=/usr/bin/lan-mouse daemon` to the actual `lan-mouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
+> Make sure to point `ExecStart=/usr/bin/mimouse daemon` to the actual `mimouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
 
 
 ## Configuration
-To automatically load clients on startup, the file `$XDG_CONFIG_HOME/lan-mouse/config.toml` is parsed.
+To automatically load clients on startup, the file `$XDG_CONFIG_HOME/mimouse/config.toml` is parsed.
 `$XDG_CONFIG_HOME` defaults to `~/.config/`.
 
 To create this file you can copy the following example config:
@@ -403,7 +376,7 @@ clipboard = true
 position = "right"
 # hostname
 hostname = "iridium"
-# activate this client immediately when lan-mouse is started
+# activate this client immediately when mimouse is started
 activate_on_startup = true
 # optional list of (known) ip addresses
 ips = ["192.168.178.156"]
@@ -446,7 +419,7 @@ a supported **input-emulation** *and* **input-capture** backend.
 
 A suitable backend is chosen automatically based on the active desktop environment / compositor.
 
-The following sections detail the emulation and capture backends provided by lan-mouse and their support in desktop environments / operating systems.
+The following sections detail the emulation and capture backends provided by mimouse and their support in desktop environments / operating systems.
 
 ### Input Emulation Support
 

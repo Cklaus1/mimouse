@@ -1,9 +1,9 @@
-use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mimouse_proto::{Position, ProtoEvent};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -36,7 +36,7 @@ pub(crate) enum EmulationEvent {
         /// address of the connection
         addr: SocketAddr,
         /// position of the connection
-        pos: lan_mouse_ipc::Position,
+        pos: mimouse_ipc::Position,
         /// certificate fingerprint of the connection
         fingerprint: String,
     },
@@ -64,7 +64,7 @@ enum EmulationRequest {
 impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
-        listener: LanMouseListener,
+        listener: MiMouseListener,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -118,7 +118,7 @@ impl Emulation {
 }
 
 struct ListenTask {
-    listener: LanMouseListener,
+    listener: MiMouseListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -383,12 +383,12 @@ impl EmulationTask {
     }
 }
 
-fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
+fn to_ipc_pos(pos: Position) -> mimouse_ipc::Position {
     match pos {
-        Position::Left => lan_mouse_ipc::Position::Left,
-        Position::Right => lan_mouse_ipc::Position::Right,
-        Position::Top => lan_mouse_ipc::Position::Top,
-        Position::Bottom => lan_mouse_ipc::Position::Bottom,
+        Position::Left => mimouse_ipc::Position::Left,
+        Position::Right => mimouse_ipc::Position::Right,
+        Position::Top => mimouse_ipc::Position::Top,
+        Position::Bottom => mimouse_ipc::Position::Bottom,
     }
 }
 

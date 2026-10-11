@@ -2,7 +2,7 @@
 set -eu
 
 homebrew_path=""
-exec_path="target/debug/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse"
+exec_path="target/debug/bundle/osx/MiMouse.app/Contents/MacOS/mimouse"
 
 usage() {
     cat <<EOF

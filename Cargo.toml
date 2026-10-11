@@ -3,19 +3,19 @@ members = [
     "input-capture",
     "input-emulation",
     "input-event",
-    "lan-mouse-ipc",
-    "lan-mouse-cli",
-    "lan-mouse-gtk",
-    "lan-mouse-proto",
+    "mimouse-ipc",
+    "mimouse-cli",
+    "mimouse-gtk",
+    "mimouse-proto",
 ]
 
 [package]
-name = "lan-mouse"
+name = "mimouse"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
 version = "0.11.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+repository = "https://github.com/Cklaus1/mimouse"
 
 [profile.release]
 codegen-units = 1
@@ -30,10 +30,10 @@ shadow-rs = "1.2.0"
 input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
-lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
-lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
-lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
+mimouse-cli = { path = "mimouse-cli", version = "0.3.0" }
+mimouse-gtk = { path = "mimouse-gtk", version = "0.3.0", optional = true }
+mimouse-ipc = { path = "mimouse-ipc", version = "0.3.0" }
+mimouse-proto = { path = "mimouse-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
 
 hickory-resolver = "0.25.2"
@@ -102,7 +102,7 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
+gtk = ["dep:mimouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -112,13 +112,13 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "MiMouse"
 icon = ["target/icon.icns"]
-identifier = "de.feschber.LanMouse"
+identifier = "io.github.cklaus1.MiMouse"
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]
 
 # webrtc-util 0.11.0 with webrtc-rs/webrtc#812 backported (Windows WSAECONNRESET
-# tears down the DTLS listener, lan-mouse #262)
+# tears down the DTLS listener, feschber/lan-mouse#262)
 [patch.crates-io]
 webrtc-util = { path = "vendor/webrtc-util" }

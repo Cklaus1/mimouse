@@ -1,5 +1,5 @@
 {
-  description = "Nix Flake for lan-mouse";
+  description = "Nix Flake for mimouse";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     rust-overlay = {
@@ -60,11 +60,11 @@
             cargo = rustToolchainForBuild;
             rustc = rustToolchainForBuild;
           };
-          lan-mouse = pkgs.callPackage ./nix { rustPlatform = customRustPlatform; };
+          mimouse = pkgs.callPackage ./nix { rustPlatform = customRustPlatform; };
         in
         {
-          default = lan-mouse;
-          inherit lan-mouse;
+          default = mimouse;
+          inherit mimouse;
         }
       );
       devShells = forEachPkgs (

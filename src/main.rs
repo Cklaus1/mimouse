@@ -1,16 +1,16 @@
 use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
-use lan_mouse::{
+use mimouse::{
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
     service::{Service, ServiceError},
 };
-use lan_mouse_cli::CliError;
+use mimouse_cli::CliError;
 #[cfg(feature = "gtk")]
-use lan_mouse_gtk::GtkError;
-use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+use mimouse_gtk::GtkError;
+use mimouse_ipc::{IpcError, IpcListenerCreationError};
 use std::{
     future::Future,
     io,
@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::task::LocalSet;
 
 #[derive(Debug, Error)]
-enum LanMouseError {
+enum MiMouseError {
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -42,7 +42,7 @@ enum LanMouseError {
 
 fn main() {
     // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
+    let env = Env::default().filter_or("MIMOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
 
     if let Err(e) = run() {
@@ -51,17 +51,17 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), LanMouseError> {
+fn run() -> Result<(), MiMouseError> {
     let config = config::Config::new()?;
     match config.command() {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
             Command::TestCapture(args) => run_async(capture_test::run(config, args))?,
-            Command::Cli(cli_args) => run_async(lan_mouse_cli::run(cli_args))?,
+            Command::Cli(cli_args) => run_async(mimouse_cli::run(cli_args))?,
             Command::Daemon => {
                 // if daemon is specified we run the service
                 match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
+                    Err(MiMouseError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
                     ))) => log::info!("service already running!"),
                     r => r?,
@@ -74,7 +74,7 @@ fn run() -> Result<(), LanMouseError> {
             #[cfg(feature = "gtk")]
             {
                 let mut service = start_service()?;
-                let res = lan_mouse_gtk::run();
+                let res = mimouse_gtk::run();
                 #[cfg(unix)]
                 {
                     // on unix we give the service a chance to terminate gracefully
@@ -91,7 +91,7 @@ fn run() -> Result<(), LanMouseError> {
             {
                 // run daemon if gtk is diabled
                 match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
+                    Err(MiMouseError::Service(ServiceError::IpcListen(
                         IpcListenerCreationError::AlreadyRunning,
                     ))) => log::info!("service already running!"),
                     r => r?,
@@ -103,10 +103,10 @@ fn run() -> Result<(), LanMouseError> {
     Ok(())
 }
 
-fn run_async<F, E>(f: F) -> Result<(), LanMouseError>
+fn run_async<F, E>(f: F) -> Result<(), MiMouseError>
 where
     F: Future<Output = Result<(), E>>,
-    LanMouseError: From<E>,
+    MiMouseError: From<E>,
 {
     // create single threaded tokio runtime
     let runtime = tokio::runtime::Builder::new_current_thread()

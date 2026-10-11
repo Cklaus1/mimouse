@@ -9,12 +9,12 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
+use mimouse_proto::ProtoEvent;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::MiMouseConnection;
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -66,7 +66,7 @@ enum CaptureRequest {
 impl Capture {
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
-        conn: LanMouseConnection,
+        conn: MiMouseConnection,
         release_bind: Vec<scancode::Linux>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
@@ -109,7 +109,7 @@ impl Capture {
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
-        pos: lan_mouse_ipc::Position,
+        pos: mimouse_ipc::Position,
         capture_type: CaptureType,
     ) {
         let pos = to_capture_pos(pos);
@@ -161,7 +161,7 @@ struct CaptureTask {
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
-    conn: LanMouseConnection,
+    conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -431,21 +431,21 @@ enum State {
     Sending,
 }
 
-fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
+fn to_capture_pos(pos: mimouse_ipc::Position) -> input_capture::Position {
     match pos {
-        lan_mouse_ipc::Position::Left => input_capture::Position::Left,
-        lan_mouse_ipc::Position::Right => input_capture::Position::Right,
-        lan_mouse_ipc::Position::Top => input_capture::Position::Top,
-        lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+        mimouse_ipc::Position::Left => input_capture::Position::Left,
+        mimouse_ipc::Position::Right => input_capture::Position::Right,
+        mimouse_ipc::Position::Top => input_capture::Position::Top,
+        mimouse_ipc::Position::Bottom => input_capture::Position::Bottom,
     }
 }
 
-fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
+fn to_proto_pos(pos: input_capture::Position) -> mimouse_proto::Position {
     match pos {
-        input_capture::Position::Left => lan_mouse_proto::Position::Left,
-        input_capture::Position::Right => lan_mouse_proto::Position::Right,
-        input_capture::Position::Top => lan_mouse_proto::Position::Top,
-        input_capture::Position::Bottom => lan_mouse_proto::Position::Bottom,
+        input_capture::Position::Left => mimouse_proto::Position::Left,
+        input_capture::Position::Right => mimouse_proto::Position::Right,
+        input_capture::Position::Top => mimouse_proto::Position::Top,
+        input_capture::Position::Bottom => mimouse_proto::Position::Bottom,
     }
 }
 

@@ -1,6 +1,6 @@
 //! TLS over TCP transport for clipboard updates.
 //!
-//! Uses the lan-mouse DTLS certificate on both ends. A connection is accepted
+//! Uses the mimouse DTLS certificate on both ends. A connection is accepted
 //! only if the peer's certificate fingerprint is in `authorized_fingerprints`
 //! (checked by both the client and the server).
 //!
@@ -78,7 +78,7 @@ impl Tls {
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, TransportError> {
         // the PEM file uses a nonstandard `PRIVATE_KEY` tag, so take the
-        // already parsed certificate; lan-mouse generates PKCS#8 keys
+        // already parsed certificate; mimouse generates PKCS#8 keys
         let certs = cert.certificate.clone();
         let key: PrivateKeyDer =
             PrivatePkcs8KeyDer::from(cert.private_key.serialized_der.clone()).into();
@@ -114,7 +114,7 @@ impl Tls {
 }
 
 /// accepts peers whose certificate fingerprint is authorized;
-/// lan-mouse certificates are self-signed, so there is no chain to verify
+/// mimouse certificates are self-signed, so there is no chain to verify
 #[derive(Debug)]
 struct PeerVerifier {
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
@@ -239,7 +239,7 @@ pub(crate) async fn send(
 async fn send_to(tls: &Tls, addr: SocketAddr, payload: &[u8]) -> Result<(), TransportError> {
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
-    let name = ServerName::try_from("lan-mouse").expect("valid server name");
+    let name = ServerName::try_from("mimouse").expect("valid server name");
     let mut stream = timeout(HANDSHAKE_TIMEOUT, tls.connector.connect(name, stream)).await??;
     timeout(TRANSFER_TIMEOUT, async {
         stream

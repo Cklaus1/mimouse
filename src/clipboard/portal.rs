@@ -306,7 +306,7 @@ fn token_path() -> PathBuf {
     let cache = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"));
-    cache.join("lan-mouse").join("clipboard.token")
+    cache.join("mimouse").join("clipboard.token")
 }
 
 fn read_token() -> Option<String> {

@@ -3,10 +3,10 @@
 ## Run
 
 ```bash
-nix run github:feschber/lan-mouse
+nix run github:Cklaus1/mimouse
 
 # With params
-nix run github:feschber/lan-mouse -- --help
+nix run github:Cklaus1/mimouse -- --help
 
 ```
 
@@ -16,24 +16,11 @@ Add input:
 
 ```nix
 inputs = {
-    lan-mouse.url = "github:feschber/lan-mouse";
+    mimouse.url = "github:Cklaus1/mimouse";
 }
 ```
 
-Optional: add [our binary cache](https://app.cachix.org/cache/lan-mouse) to allow a faster package install.
-
-```nix
-nixConfig = {
-    extra-substituters = [
-        "https://lan-mouse.cachix.org/"
-    ];
-    extra-trusted-public-keys = [
-      "lan-mouse.cachix.org-1:KlE2AEZUgkzNKM7BIzMQo8w9yJYqUpor1CAUNRY6OyM="
-    ];
-};
-```
-
-Enable lan-mouse:
+Enable mimouse:
 
 ``` nix
 {
@@ -41,12 +28,12 @@ Enable lan-mouse:
   ...
 }: {
   # Add the Home Manager module
-  imports = [inputs.lan-mouse.homeManagerModules.default];
+  imports = [inputs.mimouse.homeManagerModules.default];
 
-  programs.lan-mouse = {
+  programs.mimouse = {
     enable = true;
     # systemd = false;
-    # package = inputs.lan-mouse.packages.${pkgs.stdenv.hostPlatform.system}.default
+    # package = inputs.mimouse.packages.${pkgs.stdenv.hostPlatform.system}.default
     # Optional configuration in nix syntax, see config.toml for available options
     # settings = { };
     };

@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use lan_mouse_ipc::ClientHandle;
+use mimouse_ipc::ClientHandle;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, spawn_local},
@@ -141,7 +141,7 @@ impl Clipboard {
         }
     }
 
-    /// the lan-mouse port changed
+    /// the mimouse port changed
     pub(crate) fn port_changed(&self, port: u16) {
         if let Some(tx) = &self.request_tx {
             let _ = tx.send(Request::PortChanged(port));

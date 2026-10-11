@@ -3,19 +3,19 @@ use crate::{
     client::ClientManager,
     clipboard::Clipboard,
     config::{Config, ConfigClient},
-    connect::LanMouseConnection,
+    connect::MiMouseConnection,
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
-    listen::{LanMouseListener, ListenerCreationError},
+    listen::{ListenerCreationError, MiMouseListener},
 };
 use futures::StreamExt;
 use hickory_resolver::ResolveError;
-use lan_mouse_ipc::{
+use log;
+use mimouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
-use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
@@ -99,8 +99,8 @@ impl Service {
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
         // listener + connection
         let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+            MiMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
