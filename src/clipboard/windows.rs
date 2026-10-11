@@ -25,6 +25,11 @@ use super::{BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, M
 
 const OPEN_ATTEMPTS: usize = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
+// WM_CLIPBOARDUPDATE can arrive while the owner is still rendering delayed
+// formats (e.g. OleSetClipboard followed by OleFlushClipboard); reading then
+// fails with OS error 1418 and no further update is posted for that change
+const READ_ATTEMPTS: usize = 10;
+const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub(super) fn spawn(changes: BackendTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -59,7 +64,7 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         if *own == seq_num() {
             return true;
         }
-        let data = read();
+        let data = read_settled();
         drop(own);
         match data {
             Ok(data) if data.is_empty() => true,
@@ -81,6 +86,20 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         }
         if !report() {
             return;
+        }
+    }
+}
+
+fn read_settled() -> SysResult<ClipboardData> {
+    let mut attempts = READ_ATTEMPTS;
+    loop {
+        match read() {
+            Err(e) if attempts > 1 => {
+                log::debug!("clipboard: read failed ({e}), retrying");
+                attempts -= 1;
+                thread::sleep(READ_RETRY_DELAY);
+            }
+            result => return result,
         }
     }
 }
