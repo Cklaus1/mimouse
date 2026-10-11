@@ -30,6 +30,7 @@ toml_edit = { version = "0.22", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4.20"
 env_logger = "0.11.3"
+jiff = { version = "0.2.23", default-features = false, features = ["std"] }
 serde_json = "1.0.107"
 tokio = { version = "1.32.0", features = [
     "io-util",
@@ -74,6 +75,13 @@ ashpd = { version = "0.13.9", default-features = false, features = [
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = { version = "5.4", features = ["monitor"] }
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 image = { version = "0.25", default-features = false, features = [
     "bmp",
     "png",

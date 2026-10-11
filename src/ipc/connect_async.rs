@@ -1,4 +1,4 @@
-use super::{ConnectionError, FrontendEvent, FrontendRequest, IpcError};
+use super::{ConnectionError, FrontendEvent, FrontendRequest, IpcError, Request};
 use std::{
     cmp::min,
     task::{Poll, ready},
@@ -11,22 +11,21 @@ use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
+type IpcStream = UnixStream;
 
 #[cfg(windows)]
-use tokio::net::TcpStream;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(windows)]
+type IpcStream = NamedPipeClient;
 
 pub struct AsyncFrontendEventReader {
-    #[cfg(unix)]
-    lines_stream: LinesStream<BufReader<ReadHalf<UnixStream>>>,
-    #[cfg(windows)]
-    lines_stream: LinesStream<BufReader<ReadHalf<TcpStream>>>,
+    lines_stream: LinesStream<BufReader<ReadHalf<IpcStream>>>,
 }
 
 pub struct AsyncFrontendRequestWriter {
-    #[cfg(unix)]
-    tx: WriteHalf<UnixStream>,
-    #[cfg(windows)]
-    tx: WriteHalf<TcpStream>,
+    tx: WriteHalf<IpcStream>,
+    seq: u64,
 }
 
 impl Stream for AsyncFrontendEventReader {
@@ -35,7 +34,7 @@ impl Stream for AsyncFrontendEventReader {
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
         let line = ready!(self.lines_stream.poll_next_unpin(cx));
         let event = line.map(|l| {
             l.map_err(Into::<IpcError>::into)
@@ -46,12 +45,18 @@ impl Stream for AsyncFrontendEventReader {
 }
 
 impl AsyncFrontendRequestWriter {
-    pub async fn request(&mut self, request: FrontendRequest) -> Result<(), IpcError> {
-        let mut json = serde_json::to_string(&request).unwrap();
+    /// send a request, returns its sequence number
+    pub async fn request(&mut self, request: FrontendRequest) -> Result<u64, IpcError> {
+        self.seq += 1;
+        let request = Request {
+            seq: self.seq,
+            request,
+        };
+        let mut json = serde_json::to_string(&request).expect("serializable request");
         log::debug!("requesting: {json}");
         json.push('\n');
         self.tx.write_all(json.as_bytes()).await?;
-        Ok(())
+        Ok(self.seq)
     }
 }
 
@@ -66,16 +71,12 @@ pub async fn connect_async(
     } else {
         wait_for_service().await?
     };
-    #[cfg(unix)]
-    let (rx, tx): (ReadHalf<UnixStream>, WriteHalf<UnixStream>) = tokio::io::split(stream);
-    #[cfg(windows)]
-    let (rx, tx): (ReadHalf<TcpStream>, WriteHalf<TcpStream>) = tokio::io::split(stream);
-    let buf_reader = BufReader::new(rx);
-    let lines = buf_reader.lines();
-    let lines_stream = LinesStream::new(lines);
-    let reader = AsyncFrontendEventReader { lines_stream };
-    let writer = AsyncFrontendRequestWriter { tx };
-    Ok((reader, writer))
+    let (rx, tx) = tokio::io::split(stream);
+    let lines_stream = LinesStream::new(BufReader::new(rx).lines());
+    Ok((
+        AsyncFrontendEventReader { lines_stream },
+        AsyncFrontendRequestWriter { tx, seq: 0 },
+    ))
 }
 
 /// wait for the mimouse socket to come online
@@ -93,12 +94,20 @@ async fn wait_for_service() -> Result<UnixStream, ConnectionError> {
     }
 }
 
+/// wait for the mimouse pipe to come online and check its owner
 #[cfg(windows)]
-async fn wait_for_service() -> Result<TcpStream, ConnectionError> {
+async fn wait_for_service() -> Result<NamedPipeClient, ConnectionError> {
+    let name = super::windows::pipe_name()?;
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252").await {
-            break Ok(stream);
+        // not found: service not running; busy: all instances in use
+        match ClientOptions::new().open(&name) {
+            Ok(pipe) => {
+                super::windows::verify_owner(&pipe)?;
+                break Ok(pipe);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => break Err(e.into()),
+            Err(_) => {}
         }
         tokio::time::sleep(exponential_back_off(&mut duration)).await;
     }

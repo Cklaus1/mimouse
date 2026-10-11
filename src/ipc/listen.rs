@@ -1,48 +1,61 @@
-use futures::{Stream, StreamExt, stream::SelectAll};
+use std::collections::HashMap;
 #[cfg(unix)]
-use std::path::PathBuf;
-use std::{
-    io::ErrorKind,
-    pin::Pin,
-    task::{Context, Poll},
+use std::{io::ErrorKind, path::PathBuf};
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf},
+    sync::mpsc,
+    task::{JoinHandle, spawn_local},
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio_stream::wrappers::LinesStream;
-
 #[cfg(unix)]
-use tokio::net::UnixListener;
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(windows)]
-use tokio::net::TcpListener;
-#[cfg(windows)]
-use tokio::net::TcpStream;
+use tokio::net::windows::named_pipe::NamedPipeServer;
 
-use super::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
+use super::{FrontendEvent, IpcError, IpcListenerCreationError, Peer, Request};
+
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = NamedPipeServer;
+
+/// identifies one frontend connection
+pub type ConnId = u64;
+
+pub enum IpcEvent {
+    /// a frontend connected
+    Connected(ConnId),
+    /// a frontend sent a request
+    Request(ConnId, Request),
+}
+
+enum Internal {
+    Accepted(ConnId, Peer, WriteHalf<IpcStream>),
+    Line(ConnId, Result<Request, IpcError>),
+    Closed(ConnId),
+}
+
+struct Conn {
+    peer: Peer,
+    tx: WriteHalf<IpcStream>,
+}
 
 pub struct AsyncFrontendListener {
-    #[cfg(windows)]
-    listener: TcpListener,
-    #[cfg(unix)]
-    listener: UnixListener,
+    rx: mpsc::UnboundedReceiver<Internal>,
+    conns: HashMap<ConnId, Conn>,
+    accept: JoinHandle<()>,
     #[cfg(unix)]
     socket_path: PathBuf,
-    #[cfg(unix)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
-    #[cfg(windows)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<TcpStream>>>>,
-    #[cfg(unix)]
-    tx_streams: Vec<WriteHalf<UnixStream>>,
-    #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<TcpStream>>,
 }
 
 impl AsyncFrontendListener {
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+
         #[cfg(unix)]
-        let (socket_path, listener) = {
+        let (socket_path, accept) = {
             let socket_path = super::default_socket_path()?;
 
             log::debug!("remove socket: {socket_path:?}");
@@ -67,81 +80,182 @@ impl AsyncFrontendListener {
                 }
                 Err(e) => return Err(IpcListenerCreationError::Bind(e)),
             };
-            (socket_path, listener)
+            (socket_path, spawn_local(accept_unix(listener, tx)))
         };
 
         #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
-            Ok(ls) => ls,
-            // some other mimouse instance has bound the socket in the meantime
-            Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                return Err(IpcListenerCreationError::AlreadyRunning);
-            }
-            Err(e) => return Err(IpcListenerCreationError::Bind(e)),
+        let accept = {
+            let pipe =
+                super::windows::PipeSecurity::new().map_err(IpcListenerCreationError::Bind)?;
+            let server = match pipe.create(true) {
+                Ok(server) => server,
+                // the pipe exists: another instance (or another account
+                // squatting the name, which clients refuse)
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Err(IpcListenerCreationError::AlreadyRunning);
+                }
+                Err(e) => return Err(IpcListenerCreationError::Bind(e)),
+            };
+            spawn_local(accept_windows(server, pipe, tx))
         };
 
-        let adapter = Self {
-            listener,
+        Ok(Self {
+            rx,
+            conns: HashMap::new(),
+            accept,
             #[cfg(unix)]
             socket_path,
-            line_streams: SelectAll::new(),
-            tx_streams: vec![],
-        };
-
-        Ok(adapter)
+        })
     }
 
-    pub async fn broadcast(&mut self, notify: FrontendEvent) {
-        // encode event
-        let mut json = serde_json::to_string(&notify).unwrap();
-        json.push('\n');
+    /// next connection or request (cancel safe)
+    pub async fn next(&mut self) -> IpcEvent {
+        loop {
+            let Some(event) = self.rx.recv().await else {
+                log::error!("control socket closed, no further requests");
+                return std::future::pending().await;
+            };
+            match event {
+                Internal::Accepted(id, peer, tx) => {
+                    log::debug!("frontend {id} connected: {peer:?}");
+                    self.conns.insert(id, Conn { peer, tx });
+                    return IpcEvent::Connected(id);
+                }
+                Internal::Line(id, Ok(request)) => return IpcEvent::Request(id, request),
+                Internal::Line(id, Err(e)) => log::warn!("invalid request from frontend {id}: {e}"),
+                Internal::Closed(id) => {
+                    self.conns.remove(&id);
+                }
+            }
+        }
+    }
 
-        let mut keep = vec![];
-        // TODO do simultaneously
-        for tx in self.tx_streams.iter_mut() {
-            // write len + payload
-            if tx.write(json.as_bytes()).await.is_err() {
-                keep.push(false);
+    /// the process on the other end of connection `id`
+    pub fn peer(&self, id: ConnId) -> Option<&Peer> {
+        self.conns.get(&id).map(|c| &c.peer)
+    }
+
+    /// send `event` to connection `to`, or to all connections
+    pub async fn send(&mut self, to: Option<ConnId>, event: &FrontendEvent) {
+        let mut json = serde_json::to_string(event).expect("serializable event");
+        json.push('\n');
+        let mut failed = vec![];
+        for (id, conn) in self.conns.iter_mut() {
+            if to.is_some_and(|to| to != *id) {
                 continue;
             }
-            keep.push(true);
+            if conn.tx.write_all(json.as_bytes()).await.is_err() {
+                failed.push(*id);
+            }
         }
+        for id in failed {
+            self.conns.remove(&id);
+        }
+    }
+}
 
-        // could not find a better solution because async
-        let mut keep = keep.into_iter();
-        self.tx_streams.retain(|_| keep.next().unwrap());
+impl Drop for AsyncFrontendListener {
+    fn drop(&mut self) {
+        self.accept.abort();
+        #[cfg(unix)]
+        {
+            log::debug!("remove socket: {:?}", self.socket_path);
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
 #[cfg(unix)]
-impl Drop for AsyncFrontendListener {
-    fn drop(&mut self) {
-        log::debug!("remove socket: {:?}", self.socket_path);
-        let _ = std::fs::remove_file(&self.socket_path);
+async fn accept_unix(listener: UnixListener, tx: mpsc::UnboundedSender<Internal>) {
+    for id in 0.. {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                log::warn!("control socket: accept failed: {e}");
+                continue;
+            }
+        };
+        let peer = unix_peer(&stream);
+        if !register(id, stream, peer, &tx) {
+            return;
+        }
     }
 }
 
-impl Stream for AsyncFrontendListener {
-    type Item = Result<FrontendRequest, IpcError>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(Ok(l))) = self.line_streams.poll_next_unpin(cx) {
-            let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
-            return Poll::Ready(Some(request));
+#[cfg(unix)]
+fn unix_peer(stream: &UnixStream) -> Peer {
+    let cred = stream.peer_cred().ok();
+    let pid = cred
+        .and_then(|c| c.pid())
+        .and_then(|p| u32::try_from(p).ok());
+    Peer {
+        pid,
+        uid: cred.map(|c| c.uid()),
+        // Linux; elsewhere there is no /proc and `exe` stays empty
+        exe: pid.and_then(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|p| p.display().to_string())
+        }),
+    }
+}
+
+#[cfg(windows)]
+async fn accept_windows(
+    mut server: NamedPipeServer,
+    pipe: super::windows::PipeSecurity,
+    tx: mpsc::UnboundedSender<Internal>,
+) {
+    for id in 0.. {
+        let connected = server.connect().await;
+        // keep an instance waiting before handing this one off
+        let next = match pipe.create(false) {
+            Ok(next) => next,
+            Err(e) => return log::error!("control pipe: could not create instance: {e}"),
+        };
+        let stream = std::mem::replace(&mut server, next);
+        if let Err(e) = connected {
+            log::warn!("control pipe: connect failed: {e}");
+            continue;
         }
-        let mut sync = false;
-        while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
-            let (rx, tx) = tokio::io::split(stream);
-            let buf_reader = BufReader::new(rx);
-            let lines = buf_reader.lines();
-            let lines = LinesStream::new(lines);
-            self.line_streams.push(lines);
-            self.tx_streams.push(tx);
-            sync = true;
-        }
-        if sync {
-            Poll::Ready(Some(Ok(FrontendRequest::Sync)))
-        } else {
-            Poll::Pending
+        let peer = pipe.client_peer(&stream);
+        if !register(id, stream, peer, &tx) {
+            return;
         }
     }
+}
+
+/// hand the write half to the listener and spawn a reader for requests;
+/// false if the listener is gone
+fn register(
+    id: ConnId,
+    stream: IpcStream,
+    peer: Peer,
+    tx: &mpsc::UnboundedSender<Internal>,
+) -> bool {
+    let (rx_half, tx_half) = tokio::io::split(stream);
+    if tx.send(Internal::Accepted(id, peer, tx_half)).is_err() {
+        return false;
+    }
+    let tx = tx.clone();
+    spawn_local(async move {
+        let mut lines = BufReader::new(rx_half).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let request = serde_json::from_str(&line).map_err(IpcError::from);
+                    if tx.send(Internal::Line(id, request)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    log::debug!("frontend {id}: {e}");
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(Internal::Closed(id));
+    });
+    true
 }

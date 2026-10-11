@@ -1698,6 +1698,7 @@ dependencies = [
  "input-capture",
  "input-emulation",
  "input-event",
+ "jiff",
  "local-channel",
  "log",
  "notify",
@@ -1720,6 +1721,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "webrtc-dtls",
  "webrtc-util",
+ "windows",
 ]
 
 [[package]]

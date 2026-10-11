@@ -34,7 +34,7 @@ Release binaries: [releases](https://github.com/Cklaus1/mimouse/releases).
 3. Open the port (default 4242): UDP for input, plus TCP if `clipboard = true`. firewalld: `firewall/mimouse.xml`.
 4. Restart `mimouse`.
 
-An unauthorized peer shows up in the log with the command to approve it (`mimouse cli authorize-key <name> <fingerprint>`; persist with `mimouse cli save-config`).
+An unauthorized peer shows up in the log with the command to approve it (`mimouse cli authorize-key <name> <fingerprint>`).
 
 Default release bind (return control to the local machine): Ctrl+Shift+Super+Alt.
 
@@ -46,8 +46,13 @@ Default release bind (return control to the local machine): Ctrl+Shift+Super+Alt
 
 ## CLI
 
-Talks to the running service. `mimouse cli help` lists commands:
-`list`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`.
+Talks to the running service; `mimouse cli help` lists commands:
+`list`, `watch`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `set-enter-hook`, `change-port`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`.
+
+- Commands wait for the service, exit non-zero on failure (e.g. unknown client id), and save `config.toml` on success.
+- `--json`: one JSON value per result. `watch --json` prints the current state, then streams events (clients, connections, clipboard transfers without contents, unauthorized attempts) as JSON lines; schema: `FrontendEvent` in `src/ipc/mod.rs`.
+- Control channel: Unix socket in `$XDG_RUNTIME_DIR` (Linux) or `~/Library/Caches` (macOS); on Windows the named pipe `\\.\pipe\mimouse-<user SID>`, accessible only to the current user, local only. The CLI refuses a pipe owned by anyone else.
+- Audit log: every state-changing request is appended to `audit.jsonl` next to `config.toml` (time, requesting pid/user/exe, action, details, result); rotated at 10 MiB, 3 old files kept. `list` and `watch` are not logged.
 
 Logging: `MIMOUSE_LOG_LEVEL=debug mimouse`.
 

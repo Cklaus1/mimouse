@@ -423,6 +423,11 @@ impl Config {
         &self.config_path
     }
 
+    /// directory of the config file (also holds the audit log)
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     /// public key fingerprints authorized for connection
     pub fn authorized_fingerprints(&self) -> HashMap<String, String> {
         self.config_toml

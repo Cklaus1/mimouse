@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::ipc::ClientHandle;
+use crate::ipc::{ClientHandle, ClipboardDirection};
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinHandle, spawn_local},
@@ -91,6 +91,32 @@ impl ClipboardData {
 
 type Snapshot = (u64, Arc<ClipboardData>);
 
+/// a clipboard transfer to or from a peer; contents are never included
+pub(crate) struct ClipboardEvent {
+    pub(crate) direction: ClipboardDirection,
+    pub(crate) peer: IpAddr,
+    pub(crate) mime: Vec<String>,
+    pub(crate) size: usize,
+}
+
+impl ClipboardEvent {
+    fn new(direction: ClipboardDirection, peer: IpAddr, data: &ClipboardData) -> Self {
+        Self {
+            direction,
+            peer,
+            mime: data.mime_types().map(str::to_owned).collect(),
+            size: data.size(),
+        }
+    }
+}
+
+/// a client received the clipboard with the given digest
+struct Delivered {
+    handle: ClientHandle,
+    digest: u64,
+    event: ClipboardEvent,
+}
+
 enum Request {
     ClientEntered(ClientHandle),
     PortChanged(u16),
@@ -98,6 +124,7 @@ enum Request {
 
 pub(crate) struct Clipboard {
     request_tx: Option<mpsc::UnboundedSender<Request>>,
+    event_rx: Option<mpsc::UnboundedReceiver<ClipboardEvent>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -111,6 +138,7 @@ impl Clipboard {
     ) -> Self {
         let disabled = Self {
             request_tx: None,
+            event_rx: None,
             task: None,
         };
         if !enabled {
@@ -126,6 +154,7 @@ impl Clipboard {
         };
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (delivered_tx, delivered_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let task = ClipboardTask {
             tls,
             client_manager,
@@ -133,11 +162,24 @@ impl Clipboard {
             delivered: Default::default(),
             senders: Default::default(),
             delivered_tx,
+            event_tx,
         };
         let task = spawn_local(task.run(port, request_rx, delivered_rx));
         Self {
             request_tx: Some(request_tx),
+            event_rx: Some(event_rx),
             task: Some(task),
+        }
+    }
+
+    /// the next clipboard transfer; never resolves while sharing is disabled
+    pub(crate) async fn event(&mut self) -> ClipboardEvent {
+        match self.event_rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(event) => event,
+                None => std::future::pending().await,
+            },
+            None => std::future::pending().await,
         }
     }
 
@@ -189,7 +231,8 @@ struct ClipboardTask {
     /// per-client sender tasks; a watch channel coalesces rapid updates and
     /// keeps them in order
     senders: HashMap<ClientHandle, watch::Sender<Option<Snapshot>>>,
-    delivered_tx: mpsc::UnboundedSender<(ClientHandle, u64)>,
+    delivered_tx: mpsc::UnboundedSender<Delivered>,
+    event_tx: mpsc::UnboundedSender<ClipboardEvent>,
 }
 
 impl ClipboardTask {
@@ -197,7 +240,7 @@ impl ClipboardTask {
         mut self,
         mut port: u16,
         mut requests: mpsc::UnboundedReceiver<Request>,
-        mut delivered_rx: mpsc::UnboundedReceiver<(ClientHandle, u64)>,
+        mut delivered_rx: mpsc::UnboundedReceiver<Delivered>,
     ) {
         let (local_tx, mut local_rx) = mpsc::unbounded_channel();
         let Some(backend) = spawn_backend(local_tx) else {
@@ -221,8 +264,9 @@ impl ClipboardTask {
                 },
                 Some(data) = local_rx.recv() => self.local_changed(data),
                 Some((data, ip)) = received_rx.recv() => self.received(data, ip, &backend),
-                Some((handle, digest)) = delivered_rx.recv() => {
-                    self.delivered.insert(handle, digest);
+                Some(delivered) = delivered_rx.recv() => {
+                    self.delivered.insert(delivered.handle, delivered.digest);
+                    let _ = self.event_tx.send(delivered.event);
                 }
             }
         }
@@ -248,6 +292,11 @@ impl ClipboardTask {
     }
 
     fn received(&mut self, data: Arc<ClipboardData>, from: IpAddr, backend: &BackendTx) {
+        let _ = self.event_tx.send(ClipboardEvent::new(
+            ClipboardDirection::Received,
+            from,
+            &data,
+        ));
         let digest = data.digest();
         // the sender already has this clipboard
         for (handle, _, state) in self.client_manager.get_client_states() {
@@ -296,7 +345,7 @@ async fn client_sender(
     mut rx: watch::Receiver<Option<Snapshot>>,
     tls: Rc<transport::Tls>,
     client_manager: ClientManager,
-    delivered_tx: mpsc::UnboundedSender<(ClientHandle, u64)>,
+    delivered_tx: mpsc::UnboundedSender<Delivered>,
 ) {
     loop {
         let snapshot = rx.borrow_and_update().clone();
@@ -309,7 +358,11 @@ async fn client_sender(
                 Some(addrs) => match transport::send(&tls, &addrs, &data).await {
                     Ok(addr) => {
                         log::info!("clipboard sent to {addr} ({} bytes)", data.size());
-                        let _ = delivered_tx.send((handle, digest));
+                        let _ = delivered_tx.send(Delivered {
+                            handle,
+                            digest,
+                            event: ClipboardEvent::new(ClipboardDirection::Sent, addr.ip(), &data),
+                        });
                     }
                     Err(e) => log::warn!("could not send clipboard to client {handle}: {e}"),
                 },

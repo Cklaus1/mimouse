@@ -14,6 +14,7 @@ Software KVM: one Rust binary (`mimouse`) runs the service; `mimouse cli` contro
 
 - A peer is either sending or receiving, never both; this prevents feedback loops and indirect control through a third machine.
 - Input: UDP/DTLS. Clipboard: TCP/TLS on the same port, same certificate, same `authorized_fingerprints`.
+- IPC (`ipc/`): newline-delimited JSON; requests carry a `seq` and get exactly one `Reply`. Windows uses a per-user named pipe with an owner-only DACL, never a TCP port. State-changing requests are audited (`audit.rs`); never log typed text or clipboard contents.
 - Wire-format changes break compatibility with Lan Mouse peers.
 - Capture and emulation track pressed keys and release them on disconnect (`terminate()`).
 - macOS: only `macos_permissions` shows permission prompts (once, at service start); backends check silently.

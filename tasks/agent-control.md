@@ -31,23 +31,23 @@ Let a local agent (CLI script, MCP client) observe and drive MiMouse machines, i
 
 ### P0
 
-**A1 Windows IPC auth.** Replace `127.0.0.1:5252` with a named pipe (`tokio::net::windows::named_pipe`) whose DACL grants only the current user SID.
+**A1 Windows IPC auth.** Replace `127.0.0.1:5252` with a per-user named pipe `\\.\pipe\mimouse-<user SID>` (`tokio::net::windows::named_pipe`), owner and DACL set to the current user SID only, remote clients rejected. The CLI refuses a pipe whose owner is not the current user (squatting).
 Accept: another local user gets access denied; same-user `mimouse cli list` works; nothing listens on TCP 5252.
 
-**A2 Grants and preemption.** Per-peer grants on the target: `agent = "deny" | "allow"` and `screen = "deny" | "allow"` (default `deny`, D6). Requests to `self` are subject to `[self]` grants (default `deny`). An agent session on a target ends (keys released, `preempted` returned to the requester) when the target sees physical input, or `release_bind`, or `agent_idle_timeout` (default 30 s).
-Accept: a request without the grant is rejected by the target and nothing is injected; with a session streaming motion, physical mouse movement on the target ends it within 100 ms.
-Note: physical-input detection per OS: Windows `LLMHF_INJECTED`/`LLKHF_INJECTED`; Linux and macOS spike S1.
+**A3 Audit log.** JSONL at `<config dir>/audit.jsonl`: `ts, requester {pid, uid, exe}, action, details`. P0 records every state-changing local control request (add/remove/activate peers, trust changes, enter hooks, port, save); P1 adds agent requests on requester and target, with sizes and counts only. Rotate at 10 MiB, keep 3.
+Accept: each state-changing CLI command writes one record naming the requesting process; read-only commands (`list`, `watch`) write none; no typed text, clipboard contents or image bytes ever.
 
-**A3 Audit log.** JSONL at `<state dir>/agent-audit.jsonl` on requester and target: `ts, requester (fingerprint or local pid/uid), target, action, summary` (sizes and counts only). Rotate at 10 MiB, keep 3.
-Accept: each agent request writes one record per side; no typed text, clipboard contents or image bytes in either file.
+**A4 Machine-readable CLI.** `--json` on every CLI command; commands wait until the service has applied the request and exit non-zero on failure (e.g. unknown client id). `mimouse cli watch [--json]` streams state, connection, connection_attempt and clipboard (mime + size) events; P1 adds agent_session and preempted.
+Accept: `cli list --json | jq` parses; `cli activate <unknown>` exits 1; `watch` emits `connection` within 1 s of a peer connecting; schema in README.
 
-**A4 Machine-readable CLI.** `--json` on every CLI command; `mimouse cli watch --json` streams connection, connection_attempt, clipboard (mime + size), agent_session and preempted events.
-Accept: `cli list --json | jq` parses; `watch` emits `connection` within 1 s of a peer connecting; schema in README.
-
-### P1 (requires A1–A3)
+### P1 (requires A1, A3)
 
 **C1 Agent channel.** Generalize the clipboard transport into versioned, typed request/response frames over the same TLS listener: `Clipboard` (existing), `Session{open,close}`, `Key`, `Text`, `PointerTo`, `PointerMove`, `Button`, `Scroll`, `Screenshot`, `UiTree`, `Geometry`. Clipboard push keeps working between MiMouse peers.
 Accept: existing clipboard smoke passes unchanged; an unknown request type returns an error frame, not a dropped connection.
+
+**A2 Grants and preemption** (ships with C1 + A5, where it can be exercised). Per-peer grants on the target: `agent = "deny" | "allow"` and `screen = "deny" | "allow"` (default `deny`, D6). Requests to `self` are subject to `[self]` grants (default `deny`). An agent session on a target ends (keys released, `preempted` returned to the requester) when the target sees physical input, or `release_bind`, or `agent_idle_timeout` (default 30 s).
+Accept: a request without the grant is rejected by the target and nothing is injected; with a session streaming motion, physical mouse movement on the target ends it within 100 ms.
+Note: physical-input detection per OS: Windows `LLMHF_INJECTED`/`LLKHF_INJECTED`; Linux and macOS spike S1.
 
 **A5 Session.** `cli session open <target>` / `close`. Opening validates grants on the target and starts A2 preemption monitoring.
 Accept: `watch` shows `agent_session started/ended/preempted`.
@@ -102,7 +102,7 @@ Accept: an MCP client completes "screenshot → pointer_to → click → screens
 | D3 | Text typing | sender maps text to keys; target maps to its own layout | Target-side: it knows its layout and OS Unicode APIs | engineering |
 | D4 | Absolute pointer | approximate via relative moves; real absolute via OS APIs on the agent channel | Real absolute: needed for screenshot-driven clicks; no wire break now | engineering |
 | D5 | MCP implementation | hand-rolled over `serde_json`; SDK crate | Hand-rolled: few tools, no new dependency | engineering |
-| D6 | Default grants | `deny`; `allow` | `deny` for `agent` and `screen`, opt-in per peer and `self` | needs-human |
+| D6 | Default grants | `deny`; `allow` | **Decided:** `deny` for `agent` and `screen`, opt-in per peer and `self` | decided |
 | D7 | GNOME capture | ScreenCast + PipeWire (new `pipewire` crate, libpipewire present); Screenshot portal (no new dependency) | ScreenCast: same session also unlocks V2 absolute pointer; Screenshot portal only if S2 shows it is silent and V2 is dropped | engineering |
 | D8 | Visible indicator while observed on Windows | none (audit only); toast per session; persistent tray icon | Toast per session: a person at the screen should know; no GUI to maintain | needs-human |
 
@@ -111,6 +111,7 @@ Accept: an MCP client completes "screenshot → pointer_to → click → screens
 ```mermaid
 graph LR
   S1 --> A2
+  C1 --> A2
   A1 --> A4
   A1 --> A5
   A2 --> A5

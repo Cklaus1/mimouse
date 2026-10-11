@@ -1,11 +1,12 @@
 use crate::ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, ClientInfo, ConnId, FrontendEvent, FrontendRequest,
+    IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
 };
 use crate::{
+    audit::AuditLog,
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
-    clipboard::Clipboard,
+    clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
     connect::MiMouseConnection,
     crypto,
@@ -13,7 +14,6 @@ use crate::{
     emulation::{Emulation, EmulationEvent},
     listen::{ListenerCreationError, MiMouseListener},
 };
-use futures::StreamExt;
 use hickory_resolver::ResolveError;
 use log;
 use std::{
@@ -52,6 +52,10 @@ pub struct Service {
     resolver: DnsResolver,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
+    /// audit log of control requests
+    audit: AuditLog,
+    /// `ChangePort` requests waiting for the listener to rebind
+    port_requests: Vec<(ConnId, u64, Peer, FrontendRequest)>,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     /// (outgoing) client information
@@ -62,8 +66,8 @@ pub struct Service {
     public_key_fingerprint: String,
     /// notify for pending frontend events
     frontend_event_pending: Notify,
-    /// frontend events queued for sending
-    pending_frontend_events: VecDeque<FrontendEvent>,
+    /// frontend events queued for sending, to one connection or all
+    pending_frontend_events: VecDeque<(Option<ConnId>, FrontendEvent)>,
     /// status of input capture (enabled / disabled)
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
@@ -125,8 +129,11 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let audit = AuditLog::new(config.config_dir());
         let service = Self {
             config,
+            audit,
+            port_requests: Default::default(),
             capture,
             emulation,
             clipboard,
@@ -162,8 +169,9 @@ impl Service {
 
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                event = self.frontend_listener.next() => self.handle_ipc_event(event),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
+                event = self.clipboard.event() => self.handle_clipboard_event(event),
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
@@ -185,62 +193,164 @@ impl Service {
         Ok(())
     }
 
-    fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
-        let request = match request.expect("frontend listener closed") {
-            Ok(r) => r,
-            Err(e) => return log::error!("error receiving request: {e}"),
-        };
-        match request {
-            FrontendRequest::Activate(handle, active) => {
-                self.set_client_active(handle, active);
-                self.save_config();
+    fn handle_ipc_event(&mut self, event: IpcEvent) {
+        match event {
+            IpcEvent::Connected(conn) => {
+                for event in self.sync_events() {
+                    self.pending_frontend_events.push_back((Some(conn), event));
+                }
+                self.frontend_event_pending.notify_one();
             }
-            FrontendRequest::AuthorizeKey(desc, fp) => {
-                self.add_authorized_key(desc, fp);
-                self.save_config();
+            IpcEvent::Request(conn, Request { seq, request }) => {
+                let peer = self
+                    .frontend_listener
+                    .peer(conn)
+                    .cloned()
+                    .unwrap_or_default();
+                if let FrontendRequest::ChangePort { port } = request {
+                    if port != self.port {
+                        // answered once the listener has rebound
+                        self.emulation.request_port_change(port);
+                        self.port_requests.push((conn, seq, peer, request));
+                        return;
+                    }
+                }
+                let result = self.handle_request(&request);
+                if !request.is_read_only() {
+                    let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+                    self.audit.record(&peer, &request, &outcome);
+                }
+                self.reply(conn, seq, result);
             }
-            FrontendRequest::ChangePort(port) => self.change_port(port),
-            FrontendRequest::Create => {
-                self.add_client();
-                self.save_config();
-            }
-            FrontendRequest::Delete(handle) => {
-                self.remove_client(handle);
-                self.save_config();
-            }
-            FrontendRequest::EnableCapture => self.capture.reenable(),
-            FrontendRequest::EnableEmulation => self.emulation.reenable(),
-            FrontendRequest::Enumerate() => self.enumerate(),
-            FrontendRequest::UpdateFixIps(handle, fix_ips) => {
-                self.update_fix_ips(handle, fix_ips);
-                self.save_config();
-            }
-            FrontendRequest::UpdateHostname(handle, host) => {
-                self.update_hostname(handle, host);
-                self.save_config();
-            }
-            FrontendRequest::UpdatePort(handle, port) => {
-                self.update_port(handle, port);
-                self.save_config();
-            }
-            FrontendRequest::UpdatePosition(handle, pos) => {
-                self.update_pos(handle, pos);
-                self.save_config();
-            }
-            FrontendRequest::ResolveDns(handle) => self.resolve(handle),
-            FrontendRequest::Sync => self.sync_frontend(),
-            FrontendRequest::RemoveAuthorizedKey(key) => {
-                self.remove_authorized_key(key);
-                self.save_config();
-            }
-            FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
-            }
-            FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
 
-    fn save_config(&mut self) {
+    /// apply a request; events it causes are queued before its reply
+    fn handle_request(&mut self, request: &FrontendRequest) -> Result<Reply, String> {
+        if let Some(handle) = request.client() {
+            if self.client_manager.get_state(handle).is_none() {
+                return Err(format!("no such client: {handle}"));
+            }
+        }
+        let reply = match request.clone() {
+            FrontendRequest::AddClient {
+                hostname,
+                port,
+                ips,
+                enter_hook,
+            } => {
+                let handle = self.add_client();
+                self.update_hostname(handle, hostname);
+                self.update_port(handle, port);
+                self.update_fix_ips(handle, ips);
+                self.update_enter_hook(handle, enter_hook);
+                self.save_config()?;
+                self.client_reply(handle)
+            }
+            FrontendRequest::RemoveClient { id } => {
+                self.remove_client(id);
+                self.save_config()?;
+                Reply::Done
+            }
+            FrontendRequest::Activate { id } => {
+                self.activate_client(id);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::Deactivate { id } => {
+                self.deactivate_client(id);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::List => Reply::Clients(self.client_infos()),
+            FrontendRequest::SetHost { id, hostname } => {
+                self.update_hostname(id, hostname);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::SetPort { id, port } => {
+                self.update_port(id, port);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::SetPosition { id, position } => {
+                self.update_pos(id, position);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::SetIps { id, ips } => {
+                self.update_fix_ips(id, ips);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            FrontendRequest::SetEnterHook { id, enter_hook } => {
+                self.update_enter_hook(id, enter_hook);
+                self.save_config()?;
+                self.client_reply(id)
+            }
+            // a different port is handled in `handle_ipc_event`
+            FrontendRequest::ChangePort { .. } => Reply::Done,
+            FrontendRequest::EnableCapture => {
+                self.capture.reenable();
+                Reply::Done
+            }
+            FrontendRequest::EnableEmulation => {
+                self.emulation.reenable();
+                Reply::Done
+            }
+            FrontendRequest::AuthorizeKey {
+                description,
+                fingerprint,
+            } => {
+                self.add_authorized_key(description, fingerprint);
+                self.save_config()?;
+                Reply::Done
+            }
+            FrontendRequest::RemoveAuthorizedKey { fingerprint } => {
+                if !self.remove_authorized_key(&fingerprint) {
+                    return Err(format!("no such authorized key: {fingerprint}"));
+                }
+                self.save_config()?;
+                Reply::Done
+            }
+            FrontendRequest::SaveConfig => {
+                self.save_config()?;
+                Reply::Done
+            }
+        };
+        Ok(reply)
+    }
+
+    fn reply(&mut self, conn: ConnId, seq: u64, result: Result<Reply, String>) {
+        self.pending_frontend_events
+            .push_back((Some(conn), FrontendEvent::Reply { seq, result }));
+        self.frontend_event_pending.notify_one();
+    }
+
+    fn client_info(&self, handle: ClientHandle) -> Option<ClientInfo> {
+        let (config, state) = self.client_manager.get_state(handle)?;
+        Some(ClientInfo {
+            id: handle,
+            config,
+            state,
+        })
+    }
+
+    fn client_infos(&self) -> Vec<ClientInfo> {
+        self.client_manager
+            .get_client_states()
+            .into_iter()
+            .map(|(id, config, state)| ClientInfo { id, config, state })
+            .collect()
+    }
+
+    fn client_reply(&self, handle: ClientHandle) -> Reply {
+        self.client_info(handle)
+            .map(Reply::Client)
+            .unwrap_or(Reply::Done)
+    }
+
+    fn save_config(&mut self) -> Result<(), String> {
         let clients = self.client_manager.clients();
         let clients = clients
             .into_iter()
@@ -256,9 +366,10 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
-        if let Err(e) = self.config.write_back() {
+        self.config.write_back().map_err(|e| {
             log::warn!("failed to write config: {e}");
-        }
+            format!("failed to write config: {e}")
+        })
     }
 
     fn handle_config_change(&mut self) {
@@ -268,12 +379,14 @@ impl Service {
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
-            let (c, s) = self.client_manager.get_state(handle).unwrap();
+            let (_, s) = self.client_manager.get_state(handle).unwrap();
             if s.active {
                 self.client_manager.deactivate_client(handle);
                 self.activate_client(handle);
             }
-            self.notify_frontend(FrontendEvent::Created(handle, c, s));
+            if let Some(client) = self.client_info(handle) {
+                self.notify_frontend(FrontendEvent::Created { client });
+            }
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
@@ -282,13 +395,24 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
-        self.sync_frontend();
+        for event in self.sync_events() {
+            self.notify_frontend(event);
+        }
     }
 
     async fn handle_frontend_pending(&mut self) {
-        while let Some(event) = self.pending_frontend_events.pop_front() {
-            self.frontend_listener.broadcast(event).await;
+        while let Some((to, event)) = self.pending_frontend_events.pop_front() {
+            self.frontend_listener.send(to, &event).await;
         }
+    }
+
+    fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
+        self.notify_frontend(FrontendEvent::Clipboard {
+            direction: event.direction,
+            peer: event.peer,
+            mime: event.mime,
+            size: event.size,
+        });
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -307,10 +431,10 @@ impl Service {
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
-                    self.notify_frontend(FrontendEvent::DeviceEntered {
+                    self.notify_frontend(FrontendEvent::Entered {
                         fingerprint,
                         addr,
-                        pos,
+                        position: pos,
                     });
                 } else {
                     self.update_incoming(addr, pos, fingerprint);
@@ -318,29 +442,42 @@ impl Service {
             }
             EmulationEvent::Disconnected { addr } => {
                 if let Some(addr) = self.remove_incoming(addr) {
-                    self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+                    self.notify_frontend(FrontendEvent::Disconnected { addr });
                 }
             }
-            EmulationEvent::PortChanged(port) => match port {
-                Ok(port) => {
-                    self.port = port;
-                    self.clipboard.port_changed(port);
-                    self.notify_frontend(FrontendEvent::PortChanged(port, None));
+            EmulationEvent::PortChanged(port) => {
+                let result = match port {
+                    Ok(port) => {
+                        self.port = port;
+                        self.clipboard.port_changed(port);
+                        self.notify_frontend(FrontendEvent::Port { port, error: None });
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let error = format!("{e}");
+                        self.notify_frontend(FrontendEvent::Port {
+                            port: self.port,
+                            error: Some(error.clone()),
+                        });
+                        Err(error)
+                    }
+                };
+                for (conn, seq, peer, request) in std::mem::take(&mut self.port_requests) {
+                    self.audit.record(&peer, &request, &result);
+                    self.reply(conn, seq, result.clone().map(|_| Reply::Done));
                 }
-                Err(e) => self
-                    .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
-            },
+            }
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.notify_frontend(FrontendEvent::Emulation { enabled: false });
             }
             EmulationEvent::EmulationEnabled => {
                 self.emulation_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
+                self.notify_frontend(FrontendEvent::Emulation { enabled: true });
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
-                self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+                self.notify_frontend(FrontendEvent::Connection { addr, fingerprint });
             }
         }
     }
@@ -356,11 +493,11 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.notify_frontend(FrontendEvent::Capture { enabled: false });
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.notify_frontend(FrontendEvent::Capture { enabled: true });
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
@@ -395,16 +532,29 @@ impl Service {
         }
     }
 
-    fn sync_frontend(&mut self) {
-        self.enumerate();
-        self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
-        self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
-        self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
-        self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
-            self.public_key_fingerprint.clone(),
-        ));
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+    /// full state, sent to each new frontend connection
+    fn sync_events(&self) -> Vec<FrontendEvent> {
+        vec![
+            FrontendEvent::Clients {
+                clients: self.client_infos(),
+            },
+            FrontendEvent::Emulation {
+                enabled: self.emulation_status.into(),
+            },
+            FrontendEvent::Capture {
+                enabled: self.capture_status.into(),
+            },
+            FrontendEvent::Port {
+                port: self.port,
+                error: None,
+            },
+            FrontendEvent::Fingerprint {
+                fingerprint: self.public_key_fingerprint.clone(),
+            },
+            FrontendEvent::AuthorizedKeys {
+                keys: self.authorized_keys.read().expect("lock").clone(),
+            },
+        ]
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -443,11 +593,11 @@ impl Service {
         if changed {
             self.remove_incoming(addr);
             self.add_incoming(addr, pos, fingerprint.clone());
-            self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-            self.notify_frontend(FrontendEvent::DeviceEntered {
+            self.notify_frontend(FrontendEvent::Disconnected { addr });
+            self.notify_frontend(FrontendEvent::Entered {
                 fingerprint,
                 addr,
-                pos,
+                position: pos,
             });
         }
     }
@@ -466,40 +616,39 @@ impl Service {
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
-        self.pending_frontend_events.push_back(event);
+        self.pending_frontend_events.push_back((None, event));
         self.frontend_event_pending.notify_one();
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::AuthorizedKeys { keys });
     }
 
-    fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
+    /// false if `fp` was not authorized
+    fn remove_authorized_key(&mut self, fp: &str) -> bool {
+        if self
+            .authorized_keys
+            .write()
+            .expect("lock")
+            .remove(fp)
+            .is_none()
+        {
+            return false;
+        }
         let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_frontend(FrontendEvent::AuthorizedKeys { keys });
+        true
     }
 
-    fn enumerate(&mut self) {
-        let clients = self.client_manager.get_client_states();
-        self.notify_frontend(FrontendEvent::Enumerate(clients));
-    }
-
-    fn add_client(&mut self) {
+    fn add_client(&mut self) -> ClientHandle {
         let handle = self.client_manager.add_client();
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
-        self.notify_frontend(FrontendEvent::Created(handle, c, s));
-    }
-
-    fn set_client_active(&mut self, handle: ClientHandle, active: bool) {
-        if active {
-            self.activate_client(handle);
-        } else {
-            self.deactivate_client(handle);
+        if let Some(client) = self.client_info(handle) {
+            self.notify_frontend(FrontendEvent::Created { client });
         }
+        handle
     }
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
@@ -537,14 +686,6 @@ impl Service {
         }
     }
 
-    fn change_port(&mut self, port: u16) {
-        if self.port != port {
-            self.emulation.request_port_change(port);
-        } else {
-            self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
-        }
-    }
-
     fn remove_client(&mut self, handle: ClientHandle) {
         if self
             .client_manager
@@ -554,7 +695,7 @@ impl Service {
         {
             self.capture.destroy(handle);
         }
-        self.notify_frontend(FrontendEvent::Deleted(handle));
+        self.notify_frontend(FrontendEvent::Deleted { id: handle });
     }
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
@@ -590,12 +731,9 @@ impl Service {
     }
 
     fn broadcast_client(&mut self, handle: ClientHandle) {
-        let event = self
-            .client_manager
-            .get_state(handle)
-            .map(|(c, s)| FrontendEvent::State(handle, c, s))
-            .unwrap_or(FrontendEvent::NoSuchClient(handle));
-        self.notify_frontend(event);
+        if let Some(client) = self.client_info(handle) {
+            self.notify_frontend(FrontendEvent::State { client });
+        }
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle) {

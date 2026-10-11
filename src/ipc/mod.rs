@@ -18,9 +18,11 @@ use serde::{Deserialize, Serialize};
 
 mod connect_async;
 mod listen;
+#[cfg(windows)]
+mod windows;
 
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
-pub use listen::AsyncFrontendListener;
+pub use listen::{AsyncFrontendListener, ConnId, IpcEvent};
 
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -30,6 +32,10 @@ pub enum ConnectionError {
     Io(#[from] io::Error),
     #[error("connection timed out")]
     Timeout,
+    /// the control pipe exists but another account created it
+    #[cfg(windows)]
+    #[error("control pipe is owned by {0}, not the current user; refusing to connect")]
+    NotOwner(String),
 }
 
 #[derive(Debug, Error)]
@@ -135,8 +141,10 @@ pub struct ClientConfig {
     /// both active_addr and addrs can be None / empty so port needs to be stored seperately
     pub port: u16,
     /// position of a client on screen
+    #[serde(rename = "position")]
     pub pos: Position,
     /// enter hook
+    #[serde(rename = "enter_hook")]
     pub cmd: Option<String>,
 }
 
@@ -176,83 +184,186 @@ pub struct ClientState {
     pub resolving: bool,
 }
 
+/// a client as reported to frontends: `{"id": .., <config>, <state>}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FrontendEvent {
-    /// a client was created
-    Created(ClientHandle, ClientConfig, ClientState),
-    /// no such client
-    NoSuchClient(ClientHandle),
-    /// state changed
-    State(ClientHandle, ClientConfig, ClientState),
-    /// the client was deleted
-    Deleted(ClientHandle),
-    /// new port, reason of failure (if failed)
-    PortChanged(u16, Option<String>),
-    /// list of all clients, used for initial state synchronization
-    Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
-    /// an error occured
-    Error(String),
-    /// capture status
-    CaptureStatus(Status),
-    /// emulation status
-    EmulationStatus(Status),
-    /// authorized public key fingerprints have been updated
-    AuthorizedUpdated(HashMap<String, String>),
-    /// public key fingerprint of this device
-    PublicKeyFingerprint(String),
-    /// new device connected
-    DeviceConnected {
-        addr: SocketAddr,
-        fingerprint: String,
-    },
-    /// incoming device entered the screen
-    DeviceEntered {
-        fingerprint: String,
-        addr: SocketAddr,
-        pos: Position,
-    },
-    /// incoming disconnected
-    IncomingDisconnected(SocketAddr),
-    /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+pub struct ClientInfo {
+    pub id: ClientHandle,
+    #[serde(flatten)]
+    pub config: ClientConfig,
+    #[serde(flatten)]
+    pub state: ClientState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardDirection {
+    Sent,
+    Received,
+}
+
+/// Events from the service, one JSON object per line, tagged by `event`.
+/// `Reply` goes to the requesting connection only; a new connection first
+/// receives `clients`, `capture`, `emulation`, `port`, `fingerprint` and
+/// `authorized_keys`; everything else is broadcast. This is also the
+/// `mimouse cli watch --json` schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum FrontendEvent {
+    /// result of the request with sequence number `seq`
+    Reply {
+        seq: u64,
+        result: Result<Reply, String>,
+    },
+    /// all configured clients
+    Clients { clients: Vec<ClientInfo> },
+    /// a client was added
+    Created { client: ClientInfo },
+    /// config or state of a client changed
+    State { client: ClientInfo },
+    /// a client was removed
+    Deleted { id: ClientHandle },
+    /// listen port, with the reason if changing it failed
+    Port { port: u16, error: Option<String> },
+    /// input capture enabled / disabled
+    Capture { enabled: bool },
+    /// input emulation enabled / disabled
+    Emulation { enabled: bool },
+    /// authorized certificate fingerprints (fingerprint -> description)
+    AuthorizedKeys { keys: HashMap<String, String> },
+    /// certificate fingerprint of this machine
+    Fingerprint { fingerprint: String },
+    /// an authorized peer connected to this machine
+    Connection {
+        addr: SocketAddr,
+        fingerprint: String,
+    },
+    /// the cursor of a connected peer entered this machine
+    Entered {
+        addr: SocketAddr,
+        fingerprint: String,
+        position: Position,
+    },
+    /// a connected peer went away
+    Disconnected { addr: SocketAddr },
+    /// a peer with an unauthorized fingerprint tried to connect
+    ConnectionAttempt { fingerprint: String },
+    /// clipboard sent to or received from a peer; contents are never included
+    Clipboard {
+        direction: ClipboardDirection,
+        peer: IpAddr,
+        mime: Vec<String>,
+        size: usize,
+    },
+}
+
+/// successful result of a request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reply {
+    Done,
+    Client(ClientInfo),
+    Clients(Vec<ClientInfo>),
+}
+
+/// a request on the wire: `{"seq": n, "request": {...}}`, answered by a
+/// `Reply` with the same `seq`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Request {
+    pub seq: u64,
+    pub request: FrontendRequest,
+}
+
+/// Requests from a frontend (the CLI). Serialized with the `action` tag,
+/// which is also the action name in the audit log.
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum FrontendRequest {
-    /// activate/deactivate client
-    Activate(ClientHandle, bool),
-    /// add a new client
-    Create,
-    /// change the listen port (recreate udp listener)
-    ChangePort(u16),
-    /// remove a client
-    Delete(ClientHandle),
-    /// request an enumeration of all clients
-    Enumerate(),
-    /// resolve dns
-    ResolveDns(ClientHandle),
-    /// update hostname
-    UpdateHostname(ClientHandle, Option<String>),
-    /// update port
-    UpdatePort(ClientHandle, u16),
-    /// update position
-    UpdatePosition(ClientHandle, Position),
-    /// update fix-ips
-    UpdateFixIps(ClientHandle, Vec<IpAddr>),
-    /// request reenabling input capture
+    AddClient {
+        hostname: Option<String>,
+        port: u16,
+        ips: Vec<IpAddr>,
+        enter_hook: Option<String>,
+    },
+    RemoveClient {
+        id: ClientHandle,
+    },
+    Activate {
+        id: ClientHandle,
+    },
+    Deactivate {
+        id: ClientHandle,
+    },
+    List,
+    SetHost {
+        id: ClientHandle,
+        hostname: Option<String>,
+    },
+    SetPort {
+        id: ClientHandle,
+        port: u16,
+    },
+    SetPosition {
+        id: ClientHandle,
+        position: Position,
+    },
+    SetIps {
+        id: ClientHandle,
+        ips: Vec<IpAddr>,
+    },
+    SetEnterHook {
+        id: ClientHandle,
+        enter_hook: Option<String>,
+    },
+    /// change the listen port of this machine
+    ChangePort {
+        port: u16,
+    },
     EnableCapture,
-    /// request reenabling input emulation
     EnableEmulation,
-    /// synchronize all state
-    Sync,
-    /// authorize fingerprint (description, fingerprint)
-    AuthorizeKey(String, String),
-    /// remove fingerprint (fingerprint)
-    RemoveAuthorizedKey(String),
-    /// change the hook command
-    UpdateEnterHook(u64, Option<String>),
-    /// save config file
-    SaveConfiguration,
+    AuthorizeKey {
+        description: String,
+        fingerprint: String,
+    },
+    RemoveAuthorizedKey {
+        fingerprint: String,
+    },
+    SaveConfig,
+}
+
+impl FrontendRequest {
+    /// read-only requests are not audited
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::List)
+    }
+
+    /// the client this request refers to, which must exist
+    pub fn client(&self) -> Option<ClientHandle> {
+        match self {
+            Self::RemoveClient { id }
+            | Self::Activate { id }
+            | Self::Deactivate { id }
+            | Self::SetHost { id, .. }
+            | Self::SetPort { id, .. }
+            | Self::SetPosition { id, .. }
+            | Self::SetIps { id, .. }
+            | Self::SetEnterHook { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+/// user id of a local process: uid on Unix, SID on Windows
+#[cfg(unix)]
+pub type Uid = u32;
+#[cfg(windows)]
+pub type Uid = String;
+
+/// the local process on the other end of a control connection
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Peer {
+    pub pid: Option<u32>,
+    pub uid: Option<Uid>,
+    pub exe: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
