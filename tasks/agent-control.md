@@ -9,7 +9,7 @@ Let a local agent (CLI script, MCP client) observe and drive MiMouse machines, i
 - Two peer channels:
   - DTLS/UDP input (`src/proto.rs`): `Enter | Leave | Ack | Input | Ping | Pong`, relative motion and scancodes only; wire-compatible with upstream Lan Mouse; the receiver cannot tell synthetic from physical input.
   - TLS/TCP on the same port (`src/clipboard/transport.rs`): MiMouse-only, mutual fingerprint auth, length-prefixed frames, one update per connection.
-- `release_bind` (default Ctrl+Shift+Meta+Alt) returns control to the capturing machine (`src/capture.rs`).
+- `release_bind` (default Ctrl+Shift+Meta+Alt) and Ctrl double-tap (`release_double_tap_ctrl`, default on) return control to the capturing machine (`src/capture.rs`).
 - Windows capture hook ignores `LLMHF_INJECTED` (`input-capture/src/windows/event_thread.rs`).
 - GNOME InputCapture activates only on a barrier hit (`input-capture/src/libei.rs`).
 - libei emulation has no absolute pointer (`input-emulation/src/libei.rs:366`). ashpd 0.13.9 ships `screencast`, `screenshot` and `RemoteDesktop::notify_pointer_motion_absolute` (absolute motion requires a ScreenCast stream in the same session).

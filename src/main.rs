@@ -81,7 +81,15 @@ async fn run_service(config: Config) -> Result<(), ServiceError> {
     let config_path = config.config_path().to_owned();
     let mut service = Service::new(config).await?;
     log::info!("using config: {config_path:?}");
-    log::info!("Press {release_bind:?} to release the mouse");
+    log::info!(
+        "Press {:?}{} to release the mouse",
+        release_bind.keys,
+        if release_bind.double_tap_ctrl {
+            " or double-tap Ctrl"
+        } else {
+            ""
+        }
+    );
     service.run().await?;
     log::info!("service exited!");
     Ok(())

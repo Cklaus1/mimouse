@@ -53,6 +53,7 @@ struct ConfigToml {
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
+    release_double_tap_ctrl: Option<bool>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
@@ -326,6 +327,15 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
+/// ways to return control to the capturing machine
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseBind {
+    /// chord: all keys held at once
+    pub keys: Vec<scancode::Linux>,
+    /// Ctrl tapped twice in quick succession
+    pub double_tap_ctrl: bool,
+}
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -484,11 +494,14 @@ impl Config {
     }
 
     /// release bind for returning control to the host
-    pub fn release_bind(&self) -> Vec<scancode::Linux> {
-        self.config_toml
-            .as_ref()
-            .and_then(|c| c.release_bind.clone())
-            .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
+    pub fn release_bind(&self) -> ReleaseBind {
+        let toml = self.config_toml.as_ref();
+        ReleaseBind {
+            keys: toml
+                .and_then(|c| c.release_bind.clone())
+                .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned())),
+            double_tap_ctrl: toml.and_then(|c| c.release_double_tap_ctrl).unwrap_or(true),
+        }
     }
 
     /// set configured clients

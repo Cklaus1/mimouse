@@ -1,7 +1,9 @@
 # example config: ~/.config/mimouse/config.toml (Windows: %LOCALAPPDATA%\mimouse\config.toml)
 
-# keys that return control to this machine (names: input-event/src/scancode.rs)
+# keys that, held together, return control to this machine (names: input-event/src/scancode.rs)
 release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
+# double-tapping Ctrl also returns control; default true
+release_double_tap_ctrl = true
 
 # default 4242; UDP for input, TCP for clipboard
 port = 4242

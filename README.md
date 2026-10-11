@@ -36,7 +36,7 @@ Release binaries: [releases](https://github.com/Cklaus1/mimouse/releases).
 
 An unauthorized peer shows up in the log with the command to approve it (`mimouse cli authorize-key <name> <fingerprint>`).
 
-Default release bind (return control to the local machine): Ctrl+Shift+Super+Alt.
+Return control to the local machine: double-tap Ctrl (either side, nothing pressed in between), or hold Ctrl+Shift+Super+Alt. Change with `release_double_tap_ctrl = false` and `release_bind = [...]` in `config.toml`.
 
 ## Run at login
 

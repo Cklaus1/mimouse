@@ -9,12 +9,15 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{
+    Event, KeyboardEvent, PointerEvent,
+    scancode::Linux::{KeyLeftCtrl, KeyRightCtrl},
+};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::MiMouseConnection;
+use crate::{config::ReleaseBind, connect::MiMouseConnection};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -60,14 +63,14 @@ enum CaptureRequest {
     /// reenable input capture
     Reenable,
     /// set release bind
-    SetReleaseBind(Vec<scancode::Linux>),
+    SetReleaseBind(ReleaseBind),
 }
 
 impl Capture {
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
         conn: MiMouseConnection,
-        release_bind: Vec<scancode::Linux>,
+        release_bind: ReleaseBind,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -81,6 +84,7 @@ impl Capture {
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
+            ctrl_taps: Default::default(),
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -134,7 +138,7 @@ impl Capture {
         self.event_rx.recv().await.expect("channel closed")
     }
 
-    pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
+    pub(crate) fn set_release_bind(&mut self, bind: ReleaseBind) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 }
@@ -163,7 +167,8 @@ struct CaptureTask {
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
-    release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
+    release_bind: Rc<RefCell<ReleaseBind>>,
+    ctrl_taps: CtrlDoubleTap,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -322,7 +327,7 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
+        if capture.keys_pressed(&self.release_bind.borrow().keys) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
         }
@@ -354,6 +359,19 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
+        // checked before sending, applied after: the final Ctrl release must
+        // reach the peer or Ctrl stays held there
+        let double_tapped = match event {
+            CaptureEvent::Begin => {
+                self.ctrl_taps = Default::default();
+                false
+            }
+            CaptureEvent::Input(e) => {
+                self.release_bind.borrow().double_tap_ctrl
+                    && self.ctrl_taps.feed(&e, Instant::now())
+            }
+        };
+
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
@@ -368,7 +386,12 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            return capture.release().await;
+        }
+
+        if double_tapped {
+            log::info!("releasing capture: Ctrl double-tap");
+            return self.release_capture(capture).await;
         }
         Ok(())
     }
@@ -424,6 +447,67 @@ thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+/// Ctrl (left or right) pressed and released twice in quick succession, with
+/// no other key, button or scroll in between, so Ctrl+C or Ctrl+click never
+/// trigger it
+#[derive(Debug, Default)]
+struct CtrlDoubleTap {
+    /// when the currently held Ctrl went down
+    down: Option<Instant>,
+    /// when the previous tap ended
+    tapped: Option<Instant>,
+}
+
+impl CtrlDoubleTap {
+    /// a tap is a press held at most this long
+    const MAX_HOLD: Duration = Duration::from_millis(300);
+    /// the second tap must start at most this long after the first ended
+    const MAX_GAP: Duration = Duration::from_millis(400);
+
+    /// returns true when `event` completes a double tap
+    fn feed(&mut self, event: &Event, now: Instant) -> bool {
+        let (key, state) = match *event {
+            Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => (key, state),
+            // modifier updates accompany every Ctrl press; motion is harmless
+            Event::Keyboard(KeyboardEvent::Modifiers { .. })
+            | Event::Pointer(PointerEvent::Motion { .. }) => return false,
+            _ => {
+                *self = Self::default();
+                return false;
+            }
+        };
+        if key != KeyLeftCtrl as u32 && key != KeyRightCtrl as u32 {
+            *self = Self::default();
+            return false;
+        }
+        if state != 0 {
+            // auto-repeat keeps the original press time
+            if self.down.is_none() {
+                if self
+                    .tapped
+                    .is_some_and(|t| now.duration_since(t) > Self::MAX_GAP)
+                {
+                    self.tapped = None;
+                }
+                self.down = Some(now);
+            }
+            return false;
+        }
+        let Some(down) = self.down.take() else {
+            return false;
+        };
+        if now.duration_since(down) > Self::MAX_HOLD {
+            self.tapped = None;
+            return false;
+        }
+        if self.tapped.take().is_some() {
+            return true;
+        }
+        self.tapped = Some(now);
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
@@ -467,5 +551,116 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key: input_event::scancode::Linux, down: bool) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: key as u32,
+            state: down as u8,
+        })
+    }
+
+    /// feeds `(ms, event)` pairs; returns the times at which a double tap fired
+    fn fired(events: &[(u64, Event)]) -> Vec<u64> {
+        let start = Instant::now();
+        let mut taps = CtrlDoubleTap::default();
+        events
+            .iter()
+            .filter(|(ms, e)| taps.feed(e, start + Duration::from_millis(*ms)))
+            .map(|(ms, _)| *ms)
+            .collect()
+    }
+
+    #[test]
+    fn quick_double_tap_fires_on_second_release() {
+        let ctrl = |down| key(KeyLeftCtrl, down);
+        let repeat = ctrl(true);
+        let events = [
+            (0, ctrl(true)),
+            (80, ctrl(false)),
+            (200, ctrl(true)),
+            (230, repeat),
+            (280, ctrl(false)),
+        ];
+        assert_eq!(fired(&events), [280]);
+        // left then right Ctrl counts too
+        let mixed = [
+            (0, ctrl(true)),
+            (80, ctrl(false)),
+            (200, key(KeyRightCtrl, true)),
+            (280, key(KeyRightCtrl, false)),
+        ];
+        assert_eq!(fired(&mixed), [280]);
+    }
+
+    #[test]
+    fn other_input_between_taps_cancels() {
+        let ctrl = |down| key(KeyLeftCtrl, down);
+        let click = Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: 0x110,
+            state: 1,
+        });
+        let motion = Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        });
+        // Ctrl+C, Ctrl+V typed fast
+        let copy_paste = [
+            (0, ctrl(true)),
+            (20, key(input_event::scancode::Linux::KeyC, true)),
+            (40, ctrl(false)),
+            (100, ctrl(true)),
+            (120, key(input_event::scancode::Linux::KeyV, true)),
+            (140, ctrl(false)),
+        ];
+        assert!(fired(&copy_paste).is_empty());
+        let ctrl_click = [
+            (0, ctrl(true)),
+            (20, click),
+            (40, ctrl(false)),
+            (100, ctrl(true)),
+            (140, ctrl(false)),
+        ];
+        assert!(fired(&ctrl_click).is_empty());
+        // moving the mouse between taps is fine
+        let moving = [
+            (0, ctrl(true)),
+            (40, ctrl(false)),
+            (60, motion),
+            (100, ctrl(true)),
+            (140, ctrl(false)),
+        ];
+        assert_eq!(fired(&moving), [140]);
+    }
+
+    #[test]
+    fn slow_taps_or_long_holds_do_not_fire() {
+        let ctrl = |down| key(KeyLeftCtrl, down);
+        // gap just over MAX_GAP; the third tap pairs with the second
+        let slow = [
+            (0, ctrl(true)),
+            (50, ctrl(false)),
+            (451, ctrl(true)),
+            (500, ctrl(false)),
+            (600, ctrl(true)),
+            (650, ctrl(false)),
+        ];
+        assert_eq!(fired(&slow), [650]);
+        // second press held past MAX_HOLD
+        let held = [
+            (0, ctrl(true)),
+            (50, ctrl(false)),
+            (100, ctrl(true)),
+            (401, ctrl(false)),
+        ];
+        assert!(fired(&held).is_empty());
     }
 }
