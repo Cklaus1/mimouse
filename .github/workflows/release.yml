@@ -20,15 +20,20 @@ jobs:
   build:
     name: build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
+    env:
+      # signing runs only when both secrets exist (base64 PFX + its password)
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERT_PFX != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
     strategy:
       matrix:
         include:
           - os: ubuntu-22.04
             artifact: mimouse-linux-x86_64
             binary: mimouse
+            packages: true
           - os: ubuntu-22.04-arm
             artifact: mimouse-linux-arm64
             binary: mimouse
+            packages: true
           - os: windows-latest
             artifact: mimouse-windows-x86_64.exe
             binary: mimouse.exe
@@ -46,25 +51,83 @@ jobs:
         sudo apt-get update
         sudo apt-get install libx11-dev libxtst-dev
     - name: Release Build
+      run: cargo build --release
+    - name: Sign Windows binary
+      if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
+      shell: pwsh
+      env:
+        WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+        WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
       run: |
-        cargo build --release
-        cp target/release/${{ matrix.binary }} ${{ matrix.artifact }}
+        $pfx = Join-Path $env:RUNNER_TEMP 'mimouse-signing.pfx'
+        [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+        try {
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            /d MiMouse /du https://github.com/Cklaus1/mimouse target\release\mimouse.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed ($LASTEXITCODE)" }
+          & $signtool.FullName verify /pa target\release\mimouse.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed ($LASTEXITCODE)" }
+        } finally {
+          Remove-Item -Force $pfx
+        }
+    - name: Copy build artifact
+      run: cp target/release/${{ matrix.binary }} ${{ matrix.artifact }}
     - name: Upload build artifact
       uses: actions/upload-artifact@v6
       with:
         name: ${{ matrix.artifact }}
         path: ${{ matrix.artifact }}
+    - name: Install cargo-deb and cargo-generate-rpm
+      if: matrix.packages
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deb,cargo-generate-rpm
+    - name: Build .deb and .rpm
+      if: matrix.packages
+      run: |
+        cargo deb --no-build
+        cargo generate-rpm
+        mkdir packages
+        cp target/debian/*.deb target/generate-rpm/*.rpm packages/
+        dpkg-deb --info packages/*.deb
+        dpkg-deb --contents packages/*.deb
+    - name: Upload packages
+      if: matrix.packages
+      uses: actions/upload-artifact@v6
+      with:
+        name: packages-${{ matrix.artifact }}
+        path: packages/*
 
   release:
     name: "Release"
     needs: [build]
     runs-on: "ubuntu-latest"
     steps:
+    - uses: actions/checkout@v6
+      with:
+        path: src
     - name: Download build artifacts
       uses: actions/download-artifact@v4
     - name: Get short SHA
       id: vars
       run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+    - name: Render package manifests
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        curl -fsSL -o source.tar.gz "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+        python3 -m venv "$RUNNER_TEMP/venv"
+        "$RUNNER_TEMP/venv/bin/pip" install --quiet jsonschema pyyaml
+        "$RUNNER_TEMP/venv/bin/python" src/packaging/render-manifests.py \
+          --version "${GITHUB_REF_NAME#v}" \
+          --windows-exe mimouse-windows-x86_64.exe/mimouse-windows-x86_64.exe \
+          --source-tarball source.tar.gz \
+          --out manifests --validate
+        ruby -wc manifests/homebrew/mimouse.rb
     - name: Create Pre-Release
       if: ${{ !startsWith(github.ref, 'refs/tags/') }}
       uses: softprops/action-gh-release@v2
@@ -80,6 +143,8 @@ jobs:
           mimouse-macos-intel/mimouse-macos-intel
           mimouse-macos-arm64/mimouse-macos-arm64
           mimouse-windows-x86_64.exe/mimouse-windows-x86_64.exe
+          packages-*/*.deb
+          packages-*/*.rpm
     - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
@@ -93,3 +158,8 @@ jobs:
           mimouse-macos-intel/mimouse-macos-intel
           mimouse-macos-arm64/mimouse-macos-arm64
           mimouse-windows-x86_64.exe/mimouse-windows-x86_64.exe
+          packages-*/*.deb
+          packages-*/*.rpm
+          manifests/scoop/mimouse.json
+          manifests/homebrew/mimouse.rb
+          manifests/winget/*.yaml
