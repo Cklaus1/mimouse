@@ -1,4 +1,5 @@
 use crate::client::ClientManager;
+use crate::dns::DnsRequester;
 use crate::ipc::{ClientHandle, DEFAULT_PORT};
 use crate::proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -118,6 +119,8 @@ pub(crate) struct Connector {
     changed: Rc<Notify>,
     /// cancels the reconnect task of each client kept connected
     keepers: Rc<RefCell<HashMap<ClientHandle, CancellationToken>>>,
+    /// re-resolves host names before reconnect attempts, once set
+    resolver: Rc<RefCell<Option<DnsRequester>>>,
 }
 
 pub(crate) struct MiMouseConnection {
@@ -137,6 +140,7 @@ impl MiMouseConnection {
             ping_response: Default::default(),
             changed: Default::default(),
             keepers: Default::default(),
+            resolver: Default::default(),
         };
         Self { connector, recv_rx }
     }
@@ -272,6 +276,9 @@ impl Connector {
                 }
             }
             if !first_attempt {
+                // the name may resolve by now (e.g. the network came up
+                // after the service) or point somewhere else
+                self.resolve(handle);
                 let delay = backoff.next();
                 log::debug!("client {handle}: reconnecting in {delay:?}");
                 tokio::select! {
@@ -284,6 +291,20 @@ impl Connector {
             if !self.is_connected(handle).await {
                 self.start_connect(handle).await;
             }
+        }
+    }
+
+    /// lets reconnect attempts re-resolve the client's host name
+    pub(crate) fn set_resolver(&self, resolver: DnsRequester) {
+        self.resolver.replace(Some(resolver));
+    }
+
+    fn resolve(&self, handle: ClientHandle) {
+        if let (Some(resolver), Some(hostname)) = (
+            self.resolver.borrow().as_ref(),
+            self.client_manager.get_hostname(handle),
+        ) {
+            resolver.resolve(handle, hostname);
         }
     }
 

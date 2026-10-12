@@ -148,6 +148,7 @@ impl Service {
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
+        connector.set_resolver(resolver.requester());
 
         let port = config.port();
         let audit = AuditLog::new(config.config_dir());
@@ -736,11 +737,12 @@ impl Service {
             }
             DnsEvent::Resolved(handle, hostname, ips) => {
                 self.client_manager.set_resolving(handle, false);
-                if let Err(e) = &ips {
-                    log::warn!("could not resolve {hostname}: {e}");
+                match ips {
+                    // reconnect attempts re-resolve: a failed lookup keeps
+                    // the last addresses (cleared when the host name changes)
+                    Err(e) => log::warn!("could not resolve {hostname}: {e}"),
+                    Ok(ips) => self.client_manager.set_dns_ips(handle, ips),
                 }
-                let ips = ips.unwrap_or_default();
-                self.client_manager.set_dns_ips(handle, ips);
                 handle
             }
         };
