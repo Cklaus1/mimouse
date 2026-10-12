@@ -4,8 +4,24 @@
 //!
 //! The session is persisted with a restore token so the permission dialog is
 //! only shown once.
+//!
+//! Copied files are read from and offered as `text/uri-list` and
+//! `x-special/gnome-copied-files` (Nautilus).
 
-use std::{env, fs, io, os::fd::OwnedFd, path::PathBuf, pin::pin, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    ffi::OsString,
+    fmt::Write,
+    fs, io,
+    os::{
+        fd::OwnedFd,
+        unix::ffi::{OsStrExt, OsStringExt},
+    },
+    path::{Path, PathBuf},
+    pin::pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use ashpd::desktop::{
     PersistMode, Session,
@@ -19,11 +35,17 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::unix::pipe,
     sync::mpsc,
-    task::spawn_local,
+    task::{spawn_blocking, spawn_local},
     time::timeout,
 };
 
-use super::{BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT};
+use super::{
+    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML, MIME_PNG, MIME_TEXT,
+    files::{FileRef, cache_dir, local_files},
+};
+
+/// file list format of GNOME Files: `copy` or `cut`, then one URI per line
+const GNOME_FILES: &str = "x-special/gnome-copied-files";
 
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -170,7 +192,7 @@ async fn session(
             transfer = transfers.next() => {
                 let Some((_, mime, serial)) = transfer else { return Err(PortalError::Closed) };
                 let served = match owned.as_ref().and_then(|d| lookup(d, &mime)) {
-                    Some(data) => write_selection(&clipboard, &session, serial, data).await,
+                    Some(data) => write_selection(&clipboard, &session, serial, &data).await,
                     None => Err(PortalError::Io(io::ErrorKind::NotFound.into())),
                 };
                 if let Err(e) = served {
@@ -197,11 +219,19 @@ async fn session(
 }
 
 /// the data to serve for a requested mime type
-fn lookup<'a>(data: &'a ClipboardData, mime: &str) -> Option<&'a [u8]> {
+fn lookup<'a>(data: &'a ClipboardData, mime: &str) -> Option<Cow<'a, [u8]>> {
+    if !data.files().is_empty() {
+        match mime {
+            MIME_FILES => return Some(Cow::Owned(uri_list(data.files()))),
+            GNOME_FILES => return Some(Cow::Owned(gnome_copied_files(data.files()))),
+            _ => {}
+        }
+    }
     FORMATS
         .iter()
         .find(|(_, mimes)| mimes.contains(&mime))
         .and_then(|(canonical, _)| data.get(canonical))
+        .map(Cow::Borrowed)
 }
 
 async fn set_selection(
@@ -209,11 +239,14 @@ async fn set_selection(
     session: &Session<RemoteDesktop>,
     data: &ClipboardData,
 ) -> Result<(), PortalError> {
-    let mimes: Vec<&str> = FORMATS
+    let mut mimes: Vec<&str> = FORMATS
         .iter()
         .filter(|(canonical, _)| data.get(canonical).is_some())
         .flat_map(|(_, mimes)| mimes.iter().copied())
         .collect();
+    if !data.files().is_empty() {
+        mimes.extend([MIME_FILES, GNOME_FILES]);
+    }
     let options = SetSelectionOptions::default().set_mime_types(&mimes);
     clipboard.set_selection(session, options).await?;
     Ok(())
@@ -245,7 +278,23 @@ async fn read_selection(
     offered: &[String],
 ) -> Result<ClipboardData, PortalError> {
     let mut data = ClipboardData::default();
+    let files = match [MIME_FILES, GNOME_FILES]
+        .into_iter()
+        .find(|m| offered.iter().any(|o| o == m))
+    {
+        Some(mime) => {
+            let paths = parse_uri_list(&read_mime(clipboard, session, mime).await?);
+            spawn_blocking(move || local_files(paths))
+                .await
+                .map_err(io::Error::other)?
+        }
+        None => Vec::new(),
+    };
     for (canonical, mimes) in FORMATS {
+        // file managers offer the paths of copied files as text
+        if *canonical == MIME_TEXT && !files.is_empty() {
+            continue;
+        }
         let Some(mime) = mimes.iter().find(|m| offered.iter().any(|o| o == *m)) else {
             continue;
         };
@@ -261,6 +310,7 @@ async fn read_selection(
         }
         data.push(canonical, bytes);
     }
+    data.set_files(files);
     Ok(data)
 }
 
@@ -303,10 +353,10 @@ fn normalize_html(bytes: Vec<u8>) -> Vec<u8> {
 }
 
 fn token_path() -> PathBuf {
-    let cache = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"));
-    cache.join("mimouse").join("clipboard.token")
+    cache_dir()
+        .unwrap_or_default()
+        .join("mimouse")
+        .join("clipboard.token")
 }
 
 fn read_token() -> Option<String> {
@@ -321,4 +371,129 @@ fn write_token(token: &str) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, token)
+}
+
+/// local paths of the `file://` URIs in a `text/uri-list` or
+/// `x-special/gnome-copied-files` list; other schemes, remote hosts and
+/// comments are ignored
+fn parse_uri_list(list: &[u8]) -> Vec<PathBuf> {
+    String::from_utf8_lossy(list)
+        .lines()
+        .filter_map(|line| file_uri_path(line.trim()))
+        .collect()
+}
+
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri
+        .get(..5)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        .map(|_| &uri[5..])?;
+    let path = match rest.strip_prefix("//") {
+        Some(authority) => {
+            let (host, path) = authority.split_at(authority.find('/')?);
+            (host.is_empty() || host.eq_ignore_ascii_case("localhost")).then_some(path)?
+        }
+        None => rest.starts_with('/').then_some(rest)?,
+    };
+    Some(PathBuf::from(OsString::from_vec(percent_decode(path)?)))
+}
+
+fn percent_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let hi = (bytes.next()? as char).to_digit(16)?;
+        let lo = (bytes.next()? as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// `file://` URI of an absolute path
+fn file_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            uri.push(b as char);
+        } else {
+            let _ = write!(uri, "%{b:02X}");
+        }
+    }
+    uri
+}
+
+fn uri_list(files: &[FileRef]) -> Vec<u8> {
+    let mut list = String::new();
+    for file in files {
+        list.push_str(&file_uri(&file.path));
+        list.push_str("\r\n");
+    }
+    list.into_bytes()
+}
+
+fn gnome_copied_files(files: &[FileRef]) -> Vec<u8> {
+    let mut list = String::from("copy");
+    for file in files {
+        list.push('\n');
+        list.push_str(&file_uri(&file.path));
+    }
+    list.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{file_uri, parse_uri_list};
+
+    fn paths(list: &str) -> Vec<PathBuf> {
+        parse_uri_list(list.as_bytes())
+    }
+
+    #[test]
+    fn parses_uri_lists() {
+        let list = "# comment\r\n\
+                    file:///home/u/a%20b.txt\r\n\
+                    https://example.com/x\r\n\
+                    file://localhost/tmp/gr%C3%BC%C3%9Fe\r\n\
+                    file://otherhost/tmp/remote\r\n\
+                    sftp://host/tmp/x\r\n\
+                    FILE:/tmp/short%25\r\n\
+                    \r\n";
+        assert_eq!(
+            paths(list),
+            [
+                PathBuf::from("/home/u/a b.txt"),
+                PathBuf::from("/tmp/grüße"),
+                PathBuf::from("/tmp/short%"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_gnome_copied_files() {
+        assert_eq!(
+            paths("copy\nfile:///tmp/a\nfile:///tmp/b%2Fc"),
+            [PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b/c")]
+        );
+        assert_eq!(paths("cut\nfile:///tmp/a"), [PathBuf::from("/tmp/a")]);
+    }
+
+    #[test]
+    fn rejects_malformed_percent_escapes() {
+        assert!(paths("file:///tmp/a%2\nfile:///tmp/a%zz\nfile:///tmp/%+1").is_empty());
+    }
+
+    #[test]
+    fn non_utf8_paths() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        let path = PathBuf::from(OsStr::from_bytes(b"/tmp/\xff x#?%"));
+        let uri = file_uri(&path);
+        assert_eq!(uri, "file:///tmp/%FF%20x%23%3F%25");
+        assert_eq!(paths(&uri), [path]);
+    }
 }

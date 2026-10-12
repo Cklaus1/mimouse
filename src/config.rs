@@ -58,6 +58,7 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     clipboard: Option<bool>,
+    max_file_size: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -327,6 +328,9 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
+/// default `max_file_size`: 100 MiB, Mouse Without Borders' limit
+const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
 /// ways to return control to the capturing machine
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseBind {
@@ -452,6 +456,14 @@ impl Config {
             .as_ref()
             .and_then(|c| c.clipboard)
             .unwrap_or(false)
+    }
+
+    /// largest total size of copied files sent to a client (default: 100 MiB)
+    pub fn max_file_size(&self) -> u64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.max_file_size)
+            .unwrap_or(DEFAULT_MAX_FILE_SIZE)
     }
 
     /// path to certificate
