@@ -71,7 +71,10 @@ pub(crate) enum KeyAction {
 /// Modifier and key-repeat state of the emulated keyboard.
 #[derive(Debug, Default)]
 pub(crate) struct KeyPlanner {
+    /// effective modifiers: the sender's mask, updated by modifier keys
     mods: u32,
+    /// modifiers of the modifier keys held down
+    held: u32,
     repeating: Option<u16>,
 }
 
@@ -80,9 +83,14 @@ impl KeyPlanner {
     pub(crate) fn key(&mut self, key: u32, code: u16, pressed: bool) -> KeyAction {
         if let Some(mask) = modifier_mask(key) {
             if pressed {
+                self.held |= mask;
                 self.mods |= mask;
             } else {
-                self.mods &= !mask;
+                self.held &= !mask;
+                // the sender's mask may name this key differently (e.g.
+                // Control for Caps Lock with ctrl:nocaps): keep only what
+                // a held modifier key still accounts for
+                self.mods &= self.held;
             }
             return KeyAction::FlagsChanged {
                 code,
@@ -235,6 +243,26 @@ mod tests {
             }
         );
         p.set_modifiers(0);
+        assert_eq!(p.flags(), 0);
+    }
+
+    /// a remapped modifier (ctrl:nocaps): the sender reports Control while
+    /// Caps Lock is held; releasing it must clear Control too
+    #[test]
+    fn remapped_modifier_release_clears_the_sender_mask() {
+        let mut p = KeyPlanner::default();
+        const MAC_CAPS: u16 = 0x39;
+        p.key(key(Linux::KeyCapsLock), MAC_CAPS, true);
+        p.set_modifiers(CONTROL);
+        assert_eq!(p.flags(), CG_CONTROL);
+        assert_eq!(
+            p.key(key(Linux::KeyCapsLock), MAC_CAPS, false),
+            KeyAction::FlagsChanged {
+                code: MAC_CAPS,
+                pressed: false,
+                flags: 0
+            }
+        );
         assert_eq!(p.flags(), 0);
     }
 }
