@@ -254,14 +254,13 @@ async fn read_loop(
     let mut b = [0u8; MAX_EVENT_SIZE];
 
     while let Ok(n) = conn.recv(&mut b).await {
+        // one corrupt datagram or an event id from a newer peer must not
+        // drop the connection (upstream 82766cd, lan-mouse#307)
         match ProtoEvent::decode(&b[..n]) {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),
-            Err(e) => {
-                log::warn!("error receiving event: {e}");
-                break;
-            }
+            Err(e) => log::warn!("{addr}: skipping undecodable datagram: {e}"),
         }
     }
     log::info!("dtls client disconnected {addr:?}");
@@ -272,4 +271,42 @@ async fn read_loop(
         .expect("connection not found");
     conns.remove(index);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webrtc_util::conn::conn_pipe::pipe;
+
+    #[tokio::test]
+    async fn read_loop_skips_undecodable_datagrams() {
+        let addr: SocketAddr = "192.0.2.1:4242".parse().unwrap();
+        let (local, remote) = pipe();
+        let local: ArcConn = Arc::new(local);
+        let conns = Rc::new(AsyncMutex::new(vec![(addr, local.clone())]));
+        let (tx, mut rx) = channel();
+
+        // unknown event id, `Enter` with an invalid position, then a Ping
+        remote.send(&[0xee, 1, 2, 3]).await.unwrap();
+        remote.send(&[8, 9]).await.unwrap();
+        let (ping, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+        remote.send(&ping[..len]).await.unwrap();
+        drop(remote);
+
+        read_loop(conns.clone(), addr, local, tx).await.unwrap();
+
+        let mut received = vec![];
+        while let Some(event) = rx.recv().await {
+            match event {
+                ListenEvent::Msg { event, addr: from } => {
+                    assert_eq!(from, addr);
+                    received.push(event);
+                }
+                _ => panic!("unexpected listen event"),
+            }
+        }
+        assert!(matches!(received[..], [ProtoEvent::Ping]), "{received:?}");
+        // the connection is dropped only once the transport fails
+        assert!(conns.lock().await.is_empty());
+    }
 }

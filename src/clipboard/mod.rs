@@ -6,9 +6,15 @@
 //! receives the current clipboard as soon as the cursor enters it, similar to
 //! Deskflow's push-on-enter behaviour.
 //!
+//! Copied files (no directories) are sent only to the client the cursor
+//! enters, up to `max_file_size` bytes in total; the receiver stores them in
+//! its cache directory and puts them on its clipboard as files.
+//!
 //! Both peers must have authorized each other's certificate fingerprint.
 
+mod files;
 mod transport;
+mod wire;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod portal;
@@ -31,6 +37,7 @@ use tokio::{
 use webrtc_dtls::crypto::Certificate;
 
 use crate::client::ClientManager;
+use files::FileRef;
 
 // mime types and accessors below are used by the platform backends only;
 // macOS has no clipboard backend yet
@@ -43,15 +50,20 @@ pub(crate) const MIME_HTML: &str = "text/html";
 /// PNG image
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) const MIME_PNG: &str = "image/png";
+/// copied files; listed in events and served by the Linux backend, the
+/// contents travel as files (see `wire`)
+pub(crate) const MIME_FILES: &str = "text/uri-list";
 
-/// maximum accepted size of a clipboard update (all formats combined)
+/// maximum accepted size of a clipboard update (all formats combined,
+/// copied files are limited by `max_file_size` instead)
 pub(crate) const MAX_CLIPBOARD_SIZE: usize = 32 * 1024 * 1024;
 
 /// clipboard contents in all formats offered by the source,
-/// keyed by one of the canonical mime types above
+/// keyed by one of the canonical mime types above, and copied files
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct ClipboardData {
     items: Vec<(String, Vec<u8>)>,
+    files: Vec<FileRef>,
 }
 
 impl ClipboardData {
@@ -71,15 +83,33 @@ impl ClipboardData {
 
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.files.is_empty()
     }
 
+    pub(crate) fn set_files(&mut self, files: Vec<FileRef>) {
+        self.files = files;
+    }
+
+    pub(crate) fn files(&self) -> &[FileRef] {
+        &self.files
+    }
+
+    /// size of all formats except files
     pub(crate) fn size(&self) -> usize {
         self.items.iter().map(|(m, d)| m.len() + d.len()).sum()
     }
 
+    pub(crate) fn files_size(&self) -> u64 {
+        self.files.iter().map(|f| f.size).sum()
+    }
+
+    pub(crate) fn total_size(&self) -> u64 {
+        self.size() as u64 + self.files_size()
+    }
+
     pub(crate) fn mime_types(&self) -> impl Iterator<Item = &str> {
-        self.items.iter().map(|(m, _)| m.as_str())
+        let files = (!self.files.is_empty()).then_some(MIME_FILES);
+        self.items.iter().map(|(m, _)| m.as_str()).chain(files)
     }
 
     fn digest(&self) -> u64 {
@@ -105,7 +135,7 @@ impl ClipboardEvent {
             direction,
             peer,
             mime: data.mime_types().map(str::to_owned).collect(),
-            size: data.size(),
+            size: usize::try_from(data.total_size()).unwrap_or(usize::MAX),
         }
     }
 }
@@ -132,6 +162,7 @@ impl Clipboard {
     pub(crate) fn new(
         enabled: bool,
         port: u16,
+        max_file_size: u64,
         cert: &Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         client_manager: ClientManager,
@@ -157,6 +188,7 @@ impl Clipboard {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let task = ClipboardTask {
             tls,
+            max_file_size,
             client_manager,
             current: None,
             delivered: Default::default(),
@@ -223,6 +255,8 @@ fn spawn_backend(changes: BackendTx) -> Option<BackendTx> {
 
 struct ClipboardTask {
     tls: Rc<transport::Tls>,
+    /// largest total size of copied files to send
+    max_file_size: u64,
     client_manager: ClientManager,
     /// latest clipboard contents (local or received)
     current: Option<Snapshot>,
@@ -248,7 +282,12 @@ impl ClipboardTask {
             return;
         };
         let (received_tx, mut received_rx) = mpsc::unbounded_channel();
-        let mut listener = transport::listen(port, self.tls.clone(), received_tx.clone());
+        let mut listener = transport::listen(
+            port,
+            self.tls.clone(),
+            self.max_file_size,
+            received_tx.clone(),
+        );
 
         loop {
             tokio::select! {
@@ -258,7 +297,12 @@ impl ClipboardTask {
                     Some(Request::PortChanged(p)) if p != port => {
                         port = p;
                         listener.abort();
-                        listener = transport::listen(port, self.tls.clone(), received_tx.clone());
+                        listener = transport::listen(
+                            port,
+                            self.tls.clone(),
+                            self.max_file_size,
+                            received_tx.clone(),
+                        );
                     }
                     Some(Request::PortChanged(_)) => {}
                 },
@@ -280,10 +324,24 @@ impl ClipboardTask {
         }
         log::info!(
             "local clipboard changed ({} bytes: {})",
-            data.size(),
+            data.total_size(),
             data.mime_types().collect::<Vec<_>>().join(", ")
         );
+        if data.files_size() > self.max_file_size {
+            log::warn!(
+                "clipboard: copied files are not sent: {} bytes exceed max_file_size ({} bytes)",
+                data.files_size(),
+                self.max_file_size
+            );
+            self.current = None;
+            return;
+        }
+        let has_files = !data.files().is_empty();
         self.current = Some((digest, data));
+        // files go only to the client the cursor enters
+        if has_files {
+            return;
+        }
         for (handle, _, state) in self.client_manager.get_client_states() {
             if state.active {
                 self.update(handle);
@@ -334,6 +392,7 @@ impl ClipboardTask {
             self.tls.clone(),
             self.client_manager.clone(),
             self.delivered_tx.clone(),
+            self.max_file_size,
         ));
         self.senders.insert(handle, tx);
     }
@@ -346,6 +405,7 @@ async fn client_sender(
     tls: Rc<transport::Tls>,
     client_manager: ClientManager,
     delivered_tx: mpsc::UnboundedSender<Delivered>,
+    max_file_size: u64,
 ) {
     loop {
         let snapshot = rx.borrow_and_update().clone();
@@ -355,9 +415,11 @@ async fn client_sender(
                 Some(addrs) if addrs.is_empty() => {
                     log::debug!("clipboard: no address known for client {handle}")
                 }
-                Some(addrs) => match transport::send(&tls, &addrs, &data).await {
+                Some(addrs) => match transport::send(&tls, &addrs, data.clone(), max_file_size)
+                    .await
+                {
                     Ok(addr) => {
-                        log::info!("clipboard sent to {addr} ({} bytes)", data.size());
+                        log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
                         let _ = delivered_tx.send(Delivered {
                             handle,
                             digest,
@@ -388,89 +450,4 @@ fn client_addrs(client_manager: &ClientManager, handle: ClientHandle) -> Option<
         }
     }
     Some(addrs)
-}
-
-/// wire format of a clipboard update:
-/// `"LMCB" | version: u8 | count: u8 | count * (mime_len: u8 | mime | len: u32 BE | data)`
-mod wire {
-    use super::{ClipboardData, MAX_CLIPBOARD_SIZE};
-
-    const MAGIC: &[u8; 4] = b"LMCB";
-    const VERSION: u8 = 1;
-
-    pub(super) fn encode(data: &ClipboardData) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(data.size() + 6 + 5 * data.items.len());
-        buf.extend_from_slice(MAGIC);
-        buf.push(VERSION);
-        let items: Vec<_> = data
-            .items
-            .iter()
-            .filter(|(mime, _)| mime.len() <= u8::MAX as usize)
-            .take(u8::MAX as usize)
-            .collect();
-        buf.push(items.len() as u8);
-        for (mime, bytes) in items {
-            buf.push(mime.len() as u8);
-            buf.extend_from_slice(mime.as_bytes());
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        buf
-    }
-
-    pub(super) fn decode(buf: &[u8]) -> Option<ClipboardData> {
-        let rest = buf.strip_prefix(MAGIC)?;
-        let (&version, rest) = rest.split_first()?;
-        if version != VERSION {
-            return None;
-        }
-        let (&count, mut rest) = rest.split_first()?;
-        let mut data = ClipboardData::default();
-        for _ in 0..count {
-            let (&mime_len, r) = rest.split_first()?;
-            let (mime, r) = r.split_at_checked(mime_len as usize)?;
-            let (len, r) = r.split_first_chunk::<4>()?;
-            let (bytes, r) = r.split_at_checked(u32::from_be_bytes(*len) as usize)?;
-            rest = r;
-            data.push(std::str::from_utf8(mime).ok()?, bytes.to_vec());
-        }
-        (rest.is_empty() && data.size() <= MAX_CLIPBOARD_SIZE).then_some(data)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ClipboardData, MIME_HTML, MIME_PNG, MIME_TEXT, wire};
-
-    fn sample() -> ClipboardData {
-        let mut data = ClipboardData::default();
-        data.push(MIME_TEXT, "grüße".into());
-        data.push(MIME_HTML, "<b>x</b>".into());
-        data.push(MIME_PNG, vec![0x89, b'P', b'N', b'G', 0, 0xff]);
-        data
-    }
-
-    #[test]
-    fn roundtrip() {
-        let data = sample();
-        assert_eq!(wire::decode(&wire::encode(&data)), Some(data));
-    }
-
-    #[test]
-    fn rejects_truncated_and_trailing_bytes() {
-        let encoded = wire::encode(&sample());
-        for len in 0..encoded.len() {
-            assert_eq!(wire::decode(&encoded[..len]), None, "prefix of {len} bytes");
-        }
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert_eq!(wire::decode(&trailing), None);
-    }
-
-    #[test]
-    fn rejects_unknown_version() {
-        let mut encoded = wire::encode(&sample());
-        encoded[4] = 2;
-        assert_eq!(wire::decode(&encoded), None);
-    }
 }

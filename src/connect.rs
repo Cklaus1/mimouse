@@ -14,9 +14,10 @@ use std::{
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    sync::Mutex,
+    sync::{Mutex, Notify},
     task::{JoinSet, spawn_local},
 };
+use tokio_util::sync::CancellationToken;
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
@@ -91,31 +92,59 @@ async fn connect_any(
     }
 }
 
-pub(crate) struct MiMouseConnection {
+type ArcConn = Arc<dyn Conn + Send + Sync>;
+
+/// what [`MiMouseConnection::recv`] reports about a client
+#[derive(Debug)]
+pub(crate) enum ConnEvent {
+    /// an event sent by the client
+    Received(ProtoEvent),
+    /// the connection closed: ping timeout, recv or send error
+    Closed,
+}
+
+/// outgoing connection state, shared by [`MiMouseConnection`] (owned by the
+/// capture task) and the service, which keeps active clients connected
+#[derive(Clone)]
+pub(crate) struct Connector {
     cert: Certificate,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    conns: Rc<Mutex<HashMap<SocketAddr, ArcConn>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: Sender<(ClientHandle, ConnEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    /// notified whenever a connection attempt ends or a connection closes
+    changed: Rc<Notify>,
+    /// cancels the reconnect task of each client kept connected
+    keepers: Rc<RefCell<HashMap<ClientHandle, CancellationToken>>>,
+}
+
+pub(crate) struct MiMouseConnection {
+    connector: Connector,
+    recv_rx: Receiver<(ClientHandle, ConnEvent)>,
 }
 
 impl MiMouseConnection {
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
         let (recv_tx, recv_rx) = channel();
-        Self {
+        let connector = Connector {
             cert,
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
-            recv_rx,
             recv_tx,
             ping_response: Default::default(),
-        }
+            changed: Default::default(),
+            keepers: Default::default(),
+        };
+        Self { connector, recv_rx }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) fn connector(&self) -> Connector {
+        self.connector.clone()
+    }
+
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, ConnEvent) {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -124,22 +153,24 @@ impl MiMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), MiMouseConnectionError> {
+        let c = &self.connector;
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
-        if let Some(addr) = self.client_manager.active_addr(handle) {
+        if let Some(addr) = c.client_manager.active_addr(handle) {
             let conn = {
-                let conns = self.conns.lock().await;
+                let conns = c.conns.lock().await;
                 conns.get(&addr).cloned()
             };
             if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
+                if !c.client_manager.alive(handle) {
                     return Err(MiMouseConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        c.disconnect(handle, addr, &conn).await;
+                        let _ = conn.close().await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -147,139 +178,385 @@ impl MiMouseConnection {
             }
         }
 
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
+        // fallback for clients not kept connected (yet): connect in the background
+        c.start_connect(handle).await;
         Err(MiMouseConnectionError::NotConnected)
     }
 }
 
-async fn connect_to_handle(
-    client_manager: ClientManager,
-    cert: Certificate,
-    handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) -> Result<(), MiMouseConnectionError> {
-    log::info!("client {handle} connecting ...");
-    // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = addrs
+/// delay before the next reconnect attempt: 1 s doubling up to 30 s
+#[derive(Debug)]
+struct Backoff(Duration);
+
+impl Backoff {
+    const MIN: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+
+    fn next(&mut self) -> Duration {
+        let delay = self.0;
+        self.0 = (delay * 2).min(Self::MAX);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.0 = Self::MIN;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self(Self::MIN)
+    }
+}
+
+impl Connector {
+    /// connects to `handle` now and reconnects whenever the connection drops
+    /// or an attempt fails (see [`Backoff`]), until [`Connector::stop`]
+    pub(crate) fn keep_connected(&self, handle: ClientHandle) {
+        let token = CancellationToken::new();
+        if let Some(previous) = self.keepers.borrow_mut().insert(handle, token.clone()) {
+            previous.cancel();
+        }
+        spawn_local(self.clone().reconnect_loop(handle, token));
+    }
+
+    /// stops reconnecting to `handle`; an open connection stays open
+    pub(crate) fn stop(&self, handle: ClientHandle) {
+        if let Some(token) = self.keepers.borrow_mut().remove(&handle) {
+            token.cancel();
+        }
+    }
+
+    async fn reconnect_loop(self, handle: ClientHandle, token: CancellationToken) {
+        let mut backoff = Backoff::default();
+        let mut first_attempt = true;
+        loop {
+            // wait while connected or while an attempt is in flight
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.is_connected(handle).await {
+                    backoff.reset();
+                } else if !self.connecting.lock().await.contains(&handle) {
+                    break;
+                }
+                tokio::select! {
+                    _ = changed => {}
+                    _ = token.cancelled() => return,
+                }
+            }
+            if !first_attempt {
+                let delay = backoff.next();
+                log::debug!("client {handle}: reconnecting in {delay:?}");
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = token.cancelled() => return,
+                }
+            }
+            first_attempt = false;
+            // `send` may have connected meanwhile
+            if !self.is_connected(handle).await {
+                self.start_connect(handle).await;
+            }
+        }
+    }
+
+    async fn is_connected(&self, handle: ClientHandle) -> bool {
+        match self.client_manager.active_addr(handle) {
+            Some(addr) => self.conns.lock().await.contains_key(&addr),
+            None => false,
+        }
+    }
+
+    /// starts a connection attempt in the background unless one is running
+    async fn start_connect(&self, handle: ClientHandle) {
+        if self.connecting.lock().await.insert(handle) {
+            spawn_local(self.clone().connect_to_handle(handle));
+        }
+    }
+
+    async fn connect_to_handle(self, handle: ClientHandle) {
+        if let Err(e) = self.establish(handle).await {
+            log::debug!("client {handle}: connection failed: {e}");
+        }
+        self.connecting.lock().await.remove(&handle);
+        self.changed.notify_waiters();
+    }
+
+    async fn establish(&self, handle: ClientHandle) -> Result<(), MiMouseConnectionError> {
+        log::info!("client {handle} connecting ...");
+        let ips = self
+            .client_manager
+            .get_ips(handle)
+            .ok_or(MiMouseConnectionError::NotConnected)?;
+        let port = self.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+        let addrs = ips
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
-        let (conn, addr) = match res {
-            Ok(c) => c,
-            Err(e) => {
-                connecting.lock().await.remove(&handle);
-                return Err(e);
+        let (conn, addr) = connect_any(&addrs, self.cert.clone()).await?;
+        log::info!("client ({handle}) connected @ {addr}");
+        self.client_manager.set_active_addr(handle, Some(addr));
+        let replaced = self.conns.lock().await.insert(addr, conn.clone());
+        if let Some(replaced) = replaced {
+            // e.g. the client was re-added on a config reload; its old
+            // connection task ends once the closed connection fails
+            let _ = replaced.close().await;
+        }
+        spawn_local(self.clone().run_connection(handle, addr, conn));
+        Ok(())
+    }
+
+    /// pings and receives until either fails, then drops the connection
+    async fn run_connection(self, handle: ClientHandle, addr: SocketAddr, conn: ArcConn) {
+        tokio::select! {
+            _ = ping_pong(addr, &conn, &self.ping_response) => {}
+            _ = self.receive_loop(handle, addr, &conn) => {}
+        }
+        self.disconnect(handle, addr, &conn).await;
+        let _ = conn.close().await;
+    }
+
+    async fn receive_loop(&self, handle: ClientHandle, addr: SocketAddr, conn: &ArcConn) {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        loop {
+            let n = match conn.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("{addr}: recv error `{e}`");
+                    return;
+                }
+            };
+            if let Ok(event) = ProtoEvent::decode(&buf[..n]) {
+                log::trace!("{addr} <==<==<== {event}");
+                match event {
+                    ProtoEvent::Pong(b) => {
+                        self.client_manager.set_active_addr(handle, Some(addr));
+                        self.client_manager.set_alive(handle, b);
+                        self.ping_response.borrow_mut().insert(addr);
+                    }
+                    event => self
+                        .recv_tx
+                        .send((handle, ConnEvent::Received(event)))
+                        .expect("channel closed"),
+                }
+            }
+        }
+    }
+
+    /// forgets `conn`, unless it was already replaced or removed
+    async fn disconnect(&self, handle: ClientHandle, addr: SocketAddr, conn: &ArcConn) {
+        let active: Vec<SocketAddr> = {
+            let mut conns = self.conns.lock().await;
+            if !conns.get(&addr).is_some_and(|c| Arc::ptr_eq(c, conn)) {
+                return;
+            }
+            conns.remove(&addr);
+            conns.keys().copied().collect()
+        };
+        log::warn!("client ({handle}) @ {addr} connection closed");
+        if self.client_manager.active_addr(handle) == Some(addr) {
+            self.client_manager.set_active_addr(handle, None);
+        }
+        log::info!("active connections: {active:?}");
+        // the capture task gives control back if this client had it; it is
+        // gone when the service shuts down
+        let _ = self.recv_tx.send((handle, ConnEvent::Closed));
+        self.changed.notify_waiters();
+    }
+}
+
+/// pings go out every `PING_INTERVAL`; the connection is closed only once
+/// `MAX_MISSED_PINGS` in a row went unanswered (4 s), so loss bursts shorter
+/// than that, e.g. 3 of every 4 pings lost, keep it open (lan-mouse#307)
+const PING_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_MISSED_PINGS: u32 = 8;
+
+/// consecutive ping intervals without a Pong
+#[derive(Debug, Default)]
+struct MissedPings(u32);
+
+impl MissedPings {
+    /// records whether a Pong arrived during the last ping interval;
+    /// true once the peer counts as gone
+    fn record(&mut self, answered: bool) -> bool {
+        self.0 = if answered { 0 } else { self.0 + 1 };
+        self.0 >= MAX_MISSED_PINGS
+    }
+}
+
+/// returns once the peer counts as gone
+async fn ping_pong(addr: SocketAddr, conn: &ArcConn, ping_response: &RefCell<HashSet<SocketAddr>>) {
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+    let mut missed = MissedPings::default();
+    loop {
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::warn!("{addr}: send error `{e}`, closing connection");
+            break;
+        }
+        log::trace!("PING >->->->->- {addr}");
+
+        tokio::time::sleep(PING_INTERVAL).await;
+
+        if missed.record(ping_response.borrow_mut().remove(&addr)) {
+            log::warn!(
+                "{addr} did not respond for {:?}, closing connection",
+                PING_INTERVAL * MAX_MISSED_PINGS
+            );
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+    use crate::listen::{ListenEvent, MiMouseListener};
+    use futures::StreamExt;
+    use std::{net::Ipv4Addr, sync::RwLock, time::Instant};
+    use tokio::task::LocalSet;
+
+    /// feeds per-interval Pong results, returns the interval (1-based) at
+    /// which the connection would be closed
+    fn closed_at(answered: impl IntoIterator<Item = bool>) -> Option<usize> {
+        let mut missed = MissedPings::default();
+        answered
+            .into_iter()
+            .position(|a| missed.record(a))
+            .map(|i| i + 1)
+    }
+
+    #[test]
+    fn ping_window_tolerates_loss_bursts() {
+        // 3 of every 4 pings lost for a minute
+        let lossy = [false, false, false, true].repeat(30);
+        assert_eq!(closed_at(lossy), None);
+        // 3.5 s of silence, then a Pong
+        let burst = [true; 4].into_iter().chain([false; 7]).chain([true]);
+        assert_eq!(closed_at(burst.clone().chain(burst)), None);
+    }
+
+    #[test]
+    fn ping_window_closes_after_4_s_of_silence() {
+        let dead = [true; 4].into_iter().chain([false; 20]);
+        assert_eq!(closed_at(dead), Some(4 + 8));
+        // a Pong resets the count
+        let flapping = [false; 7].into_iter().chain([true]).chain([false; 8]);
+        assert_eq!(closed_at(flapping), Some(16));
+    }
+
+    #[test]
+    fn backoff_doubles_to_30_s_and_resets() {
+        let mut backoff = Backoff::default();
+        let secs: Vec<u64> = (0..8).map(|_| backoff.next().as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        backoff.reset();
+        assert_eq!(backoff.next(), Duration::from_secs(1));
+        assert_eq!(backoff.next(), Duration::from_secs(2));
+    }
+
+    /// waits for the listener to accept a DTLS connection
+    async fn accepted(listener: &mut MiMouseListener) -> SocketAddr {
+        let accept = async {
+            loop {
+                match listener.next().await.expect("listener closed") {
+                    ListenEvent::Accept { addr, .. } => return addr,
+                    _ => continue,
+                }
             }
         };
-        log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
-
-        // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
-
-        // receiver
-        spawn_local(receive_loop(
-            client_manager,
-            handle,
-            addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
-        return Ok(());
+        tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("client did not connect")
     }
-    connecting.lock().await.remove(&handle);
-    Err(MiMouseConnectionError::NotConnected)
-}
 
-async fn ping_pong(
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
-    loop {
-        let (buf, len) = ProtoEvent::Ping.into();
-
-        // send 4 pings, at least one must be answered
-        for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
-            }
-            log::trace!("PING >->->->->- {addr}");
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
-            return;
-        }
+    /// a listener on a free localhost port trusting `client`, and a client
+    /// manager with one client pointing at it
+    async fn peer(client: &Certificate) -> (MiMouseListener, ClientManager, ClientHandle) {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("free port")
+            .port();
+        let fingerprint = crypto::certificate_fingerprint(client);
+        let authorized = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
+        let server = Certificate::generate_self_signed(["ignored".to_owned()]).expect("cert");
+        let listener = MiMouseListener::new(port, server, authorized)
+            .await
+            .expect("listener");
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_client();
+        client_manager.set_fix_ips(handle, vec![Ipv4Addr::LOCALHOST.into()]);
+        client_manager.set_port(handle, port);
+        (listener, client_manager, handle)
     }
-}
 
-async fn receive_loop(
-    client_manager: ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while let Ok(n) = conn.recv(&mut buf).await {
-        if let Ok(event) = ProtoEvent::decode(&buf[..n]) {
-            log::trace!("{addr} <==<==<== {event}");
-            match event {
-                ProtoEvent::Pong(b) => {
-                    client_manager.set_active_addr(handle, Some(addr));
-                    client_manager.set_alive(handle, b);
-                    ping_response.borrow_mut().insert(addr);
+    #[tokio::test]
+    async fn keep_connected_connects_without_input_and_reconnects() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, client_manager, handle) = peer(&cert).await;
+                let mut conn = MiMouseConnection::new(cert, client_manager);
+                conn.connector().keep_connected(handle);
+
+                // connected before anything was sent
+                let first = accepted(&mut listener).await;
+                // nobody answers the pings here: the connection is dropped
+                // after 4 s, the capture task is told ...
+                let start = Instant::now();
+                assert_eq!(closed(&mut conn).await, handle);
+                let elapsed = start.elapsed();
+                assert!(
+                    (Duration::from_millis(3500)..Duration::from_millis(5500)).contains(&elapsed),
+                    "closed after {elapsed:?}"
+                );
+                // ... and it is re-established 1 s later
+                let second = accepted(&mut listener).await;
+                assert_ne!(first, second);
+
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn peer_closing_the_connection_is_reported() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, client_manager, handle) = peer(&cert).await;
+                let mut conn = MiMouseConnection::new(cert, client_manager);
+                conn.connector().keep_connected(handle);
+                accepted(&mut listener).await;
+
+                // the peer shuts down (close_notify): reported at once, not
+                // only after the ping window
+                let start = Instant::now();
+                listener.terminate().await;
+                assert_eq!(closed(&mut conn).await, handle);
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "{:?}",
+                    start.elapsed()
+                );
+            })
+            .await;
+    }
+
+    /// waits for a [`ConnEvent::Closed`], skipping received events
+    async fn closed(conn: &mut MiMouseConnection) -> ClientHandle {
+        let closed = async {
+            loop {
+                if let (handle, ConnEvent::Closed) = conn.recv().await {
+                    return handle;
                 }
-                event => tx.send((handle, event)).expect("channel closed"),
             }
-        }
+        };
+        tokio::time::timeout(Duration::from_secs(10), closed)
+            .await
+            .expect("connection not reported closed")
     }
-    log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
-}
-
-async fn disconnect(
-    client_manager: &ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
-    log::info!("active connections: {active:?}");
 }

@@ -8,7 +8,7 @@ use crate::{
     client::ClientManager,
     clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
-    connect::MiMouseConnection,
+    connect::{Connector, MiMouseConnection},
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
@@ -60,6 +60,8 @@ pub struct Service {
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     /// (outgoing) client information
     client_manager: ClientManager,
+    /// keeps active clients connected
+    connector: Connector,
     /// current port
     port: u16,
     /// the public key fingerprint for (D)TLS
@@ -106,6 +108,7 @@ impl Service {
         let listener =
             MiMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
+        let connector = conn.connector();
 
         // after the already-running check, so a second instance never prompts
         #[cfg(target_os = "macos")]
@@ -120,6 +123,7 @@ impl Service {
         let clipboard = Clipboard::new(
             config.clipboard(),
             config.port(),
+            config.max_file_size(),
             &cert,
             authorized_keys.clone(),
             client_manager.clone(),
@@ -142,6 +146,7 @@ impl Service {
             authorized_keys,
             public_key_fingerprint,
             client_manager,
+            connector,
             frontend_event_pending: Default::default(),
             port,
             pending_frontend_events: Default::default(),
@@ -654,6 +659,7 @@ impl Service {
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
         if self.client_manager.deactivate_client(handle) {
+            self.connector.stop(handle);
             self.capture.destroy(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
@@ -681,6 +687,7 @@ impl Service {
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
+            self.connector.keep_connected(handle);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -694,6 +701,7 @@ impl Service {
             .unwrap_or(false)
         {
             self.capture.destroy(handle);
+            self.connector.stop(handle);
         }
         self.notify_frontend(FrontendEvent::Deleted { id: handle });
     }
