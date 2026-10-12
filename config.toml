@@ -8,8 +8,17 @@ release_double_tap_ctrl = true
 # default 4242; UDP for input, TCP for clipboard
 port = 4242
 
-# share clipboard (text, HTML, images); default false
+# share clipboard (text, HTML, images, copied files); default false
 clipboard = true
+# largest total size of copied files sent to a client (bytes, default 100 MiB)
+# max_file_size = 104857600
+
+# show a short notification on each switch of control ("Controlling <host>" / "Back on <this machine>");
+# approval waits and unknown-certificate connection attempts are always announced
+# notify_switch = true
+# keep this machine from idling/locking while it controls another one
+# (GNOME/other: session inhibit, Windows: SetThreadExecutionState + keepalive, macOS: IOPM assertion)
+# idle_inhibit = true
 
 # peers allowed to connect: fingerprint = name
 [authorized_fingerprints]

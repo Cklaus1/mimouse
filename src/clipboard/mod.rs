@@ -22,6 +22,7 @@ mod portal;
 mod windows;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
@@ -36,7 +37,7 @@ use tokio::{
 };
 use webrtc_dtls::crypto::Certificate;
 
-use crate::client::ClientManager;
+use crate::{client::ClientManager, pair};
 use files::FileRef;
 
 // mime types and accessors below are used by the platform backends only;
@@ -159,6 +160,8 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
+    /// Clipboard sharing over TLS. The TLS listener also serves pairing
+    /// requests (to `pair_tx`), so it runs even with sharing disabled.
     pub(crate) fn new(
         enabled: bool,
         port: u16,
@@ -166,24 +169,28 @@ impl Clipboard {
         cert: &Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         client_manager: ClientManager,
+        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
     ) -> Self {
-        let disabled = Self {
-            request_tx: None,
-            event_rx: None,
-            task: None,
-        };
-        if !enabled {
-            log::info!("clipboard sharing disabled (set `clipboard = true` to enable)");
-            return disabled;
-        }
         let tls = match transport::Tls::new(cert, authorized_keys) {
             Ok(tls) => Rc::new(tls),
             Err(e) => {
-                log::warn!("clipboard sharing unavailable: {e}");
-                return disabled;
+                log::warn!("clipboard sharing and pairing unavailable: {e}");
+                return Self {
+                    request_tx: None,
+                    event_rx: None,
+                    task: None,
+                };
             }
         };
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        if !enabled {
+            log::info!("clipboard sharing disabled (set `clipboard = true` to enable)");
+            return Self {
+                request_tx: Some(request_tx),
+                event_rx: None,
+                task: Some(spawn_local(listen_only(port, tls, pair_tx, request_rx))),
+            };
+        }
         let (delivered_tx, delivered_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let task = ClipboardTask {
@@ -196,7 +203,7 @@ impl Clipboard {
             delivered_tx,
             event_tx,
         };
-        let task = spawn_local(task.run(port, request_rx, delivered_rx));
+        let task = spawn_local(task.run(port, request_rx, delivered_rx, pair_tx));
         Self {
             request_tx: Some(request_tx),
             event_rx: Some(event_rx),
@@ -263,10 +270,34 @@ struct ClipboardTask {
     /// digest of the clipboard contents each client is known to have
     delivered: HashMap<ClientHandle, u64>,
     /// per-client sender tasks; a watch channel coalesces rapid updates and
-    /// keeps them in order
-    senders: HashMap<ClientHandle, watch::Sender<Option<Snapshot>>>,
+    /// keeps them in order. The cell holds the digest being sent until it is
+    /// delivered or fails, so a re-enter meanwhile does not send it again
+    senders: HashMap<ClientHandle, (watch::Sender<Option<Snapshot>>, Rc<Cell<Option<u64>>>)>,
     delivered_tx: mpsc::UnboundedSender<Delivered>,
     event_tx: mpsc::UnboundedSender<ClipboardEvent>,
+}
+
+/// serve only pairing on the TLS port, following port changes
+async fn listen_only(
+    mut port: u16,
+    tls: Rc<transport::Tls>,
+    pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+    mut requests: mpsc::UnboundedReceiver<Request>,
+) {
+    // no clipboard receiver: files are never accepted, so no size limit applies
+    let listen = |port| transport::listen(port, tls.clone(), 0, None, pair_tx.clone());
+    let mut listener = listen(port);
+    while let Some(request) = requests.recv().await {
+        match request {
+            Request::PortChanged(p) if p != port => {
+                port = p;
+                listener.abort();
+                listener = listen(port);
+            }
+            Request::PortChanged(_) | Request::ClientEntered(_) => {}
+        }
+    }
+    listener.abort();
 }
 
 impl ClipboardTask {
@@ -275,19 +306,26 @@ impl ClipboardTask {
         mut port: u16,
         mut requests: mpsc::UnboundedReceiver<Request>,
         mut delivered_rx: mpsc::UnboundedReceiver<Delivered>,
+        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
     ) {
         let (local_tx, mut local_rx) = mpsc::unbounded_channel();
         let Some(backend) = spawn_backend(local_tx) else {
             log::warn!("clipboard sharing is not supported on this platform");
-            return;
+            return listen_only(port, self.tls, pair_tx, requests).await;
         };
         let (received_tx, mut received_rx) = mpsc::unbounded_channel();
-        let mut listener = transport::listen(
-            port,
-            self.tls.clone(),
-            self.max_file_size,
-            received_tx.clone(),
-        );
+        let tls = self.tls.clone();
+        let max_file_size = self.max_file_size;
+        let listen = |port| {
+            transport::listen(
+                port,
+                tls.clone(),
+                max_file_size,
+                Some(received_tx.clone()),
+                pair_tx.clone(),
+            )
+        };
+        let mut listener = listen(port);
 
         loop {
             tokio::select! {
@@ -297,18 +335,18 @@ impl ClipboardTask {
                     Some(Request::PortChanged(p)) if p != port => {
                         port = p;
                         listener.abort();
-                        listener = transport::listen(
-                            port,
-                            self.tls.clone(),
-                            self.max_file_size,
-                            received_tx.clone(),
-                        );
+                        listener = listen(port);
                     }
                     Some(Request::PortChanged(_)) => {}
                 },
                 Some(data) = local_rx.recv() => self.local_changed(data),
                 Some((data, ip)) = received_rx.recv() => self.received(data, ip, &backend),
                 Some(delivered) = delivered_rx.recv() => {
+                    if let Some((_, sending)) = self.senders.get(&delivered.handle) {
+                        if sending.get() == Some(delivered.digest) {
+                            sending.set(None);
+                        }
+                    }
                     self.delivered.insert(delivered.handle, delivered.digest);
                     let _ = self.event_tx.send(delivered.event);
                 }
@@ -381,20 +419,30 @@ impl ClipboardTask {
 
     fn update(&mut self, handle: ClientHandle) {
         let snapshot = self.current.clone();
-        if let Some(tx) = self.senders.get(&handle).filter(|tx| !tx.is_closed()) {
-            tx.send_replace(snapshot);
+        if let Some((tx, sending)) = self.senders.get(&handle).filter(|(tx, _)| !tx.is_closed()) {
+            // skip if exactly this clipboard is being sent, with nothing
+            // else queued behind it
+            let digest = snapshot.as_ref().map(|(d, _)| *d);
+            let in_flight = digest.is_some()
+                && sending.get() == digest
+                && tx.borrow().as_ref().map(|(d, _)| *d) == digest;
+            if !in_flight {
+                tx.send_replace(snapshot);
+            }
             return;
         }
         let (tx, rx) = watch::channel(snapshot);
+        let sending = Rc::new(Cell::new(None));
         spawn_local(client_sender(
             handle,
             rx,
+            sending.clone(),
             self.tls.clone(),
             self.client_manager.clone(),
             self.delivered_tx.clone(),
             self.max_file_size,
         ));
-        self.senders.insert(handle, tx);
+        self.senders.insert(handle, (tx, sending));
     }
 }
 
@@ -402,6 +450,7 @@ impl ClipboardTask {
 async fn client_sender(
     handle: ClientHandle,
     mut rx: watch::Receiver<Option<Snapshot>>,
+    sending: Rc<Cell<Option<u64>>>,
     tls: Rc<transport::Tls>,
     client_manager: ClientManager,
     delivered_tx: mpsc::UnboundedSender<Delivered>,
@@ -415,19 +464,28 @@ async fn client_sender(
                 Some(addrs) if addrs.is_empty() => {
                     log::debug!("clipboard: no address known for client {handle}")
                 }
-                Some(addrs) => match transport::send(&tls, &addrs, data.clone(), max_file_size)
-                    .await
-                {
-                    Ok(addr) => {
-                        log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
-                        let _ = delivered_tx.send(Delivered {
-                            handle,
-                            digest,
-                            event: ClipboardEvent::new(ClipboardDirection::Sent, addr.ip(), &data),
-                        });
+                Some(addrs) => {
+                    sending.set(Some(digest));
+                    match transport::send(&tls, &addrs, data.clone(), max_file_size).await {
+                        Ok(addr) => {
+                            log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
+                            let _ = delivered_tx.send(Delivered {
+                                handle,
+                                digest,
+                                event: ClipboardEvent::new(
+                                    ClipboardDirection::Sent,
+                                    addr.ip(),
+                                    &data,
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            // a later re-enter retries
+                            sending.set(None);
+                            log::warn!("could not send clipboard to client {handle}: {e}");
+                        }
                     }
-                    Err(e) => log::warn!("could not send clipboard to client {handle}: {e}"),
-                },
+                }
             }
         }
         if rx.changed().await.is_err() {

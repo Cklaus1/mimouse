@@ -34,6 +34,11 @@ const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
 // fails with OS error 1418 and no further update is posted for that change
 const READ_ATTEMPTS: usize = 10;
 const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
+// writers often update in steps (OleSetClipboard, then OleFlushClipboard
+// right away); opening the clipboard on the first update makes their next
+// step fail (`Set-Clipboard` errors), so read once updates stop for this long
+const SETTLE_DELAY: Duration = Duration::from_millis(100);
+const SETTLE_ROUNDS: usize = 10;
 
 pub(super) fn spawn(changes: BackendTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -88,10 +93,29 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
             Ok(false) => return,
             Err(e) => return log::warn!("clipboard: monitor failed: {e}"),
         }
+        if let Err(e) = settle(&mut monitor) {
+            return log::warn!("clipboard: monitor failed: {e}");
+        }
         if !report() {
             return;
         }
     }
+}
+
+/// wait until no clipboard update arrived for `SETTLE_DELAY` (at most
+/// `SETTLE_ROUNDS` times), consuming the updates seen meanwhile
+fn settle(monitor: &mut Monitor) -> SysResult<()> {
+    for _ in 0..SETTLE_ROUNDS {
+        thread::sleep(SETTLE_DELAY);
+        let mut updated = false;
+        while monitor.try_recv()? {
+            updated = true;
+        }
+        if !updated {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn read_settled() -> SysResult<ClipboardData> {
