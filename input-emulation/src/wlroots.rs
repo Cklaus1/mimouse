@@ -12,8 +12,13 @@ use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1 as XdgOutputManager,
+    zxdg_output_v1::{self, ZxdgOutputV1 as XdgOutput},
+};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1 as VpManager,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1 as Vp,
@@ -25,15 +30,16 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
 
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 
-use super::EmulationHandle;
 use super::error::WaylandBindError;
+use super::geometry::{Rect, entry_point};
+use super::{Edge, EmulationHandle};
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
@@ -42,6 +48,18 @@ struct State {
     qh: QueueHandle<Self>,
     vpm: VpManager,
     vkm: VkManager,
+    /// for the output layout, needed to place the pointer
+    xdg_output_manager: Option<XdgOutputManager>,
+    /// outputs by global name
+    outputs: HashMap<u32, Output>,
+}
+
+/// an output and its logical geometry in the layout
+struct Output {
+    wl_output: WlOutput,
+    xdg_output: XdgOutput,
+    position: (i32, i32),
+    size: (i32, i32),
 }
 
 // App State, implements Dispatch event handlers
@@ -68,6 +86,11 @@ impl WlrootsEmulation {
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
+        let xdg_output_manager: Option<XdgOutputManager> = globals.bind(&qh, 1..=3, ()).ok();
+        if xdg_output_manager.is_none() {
+            log::warn!("no xdg-output-manager: the pointer is not placed where it enters");
+        }
+
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
 
         let mut emulate = WlrootsEmulation {
@@ -79,12 +102,23 @@ impl WlrootsEmulation {
                 vpm,
                 vkm,
                 qh,
+                xdg_output_manager,
+                outputs: HashMap::new(),
             },
             queue,
         };
+        for global in globals.contents().clone_list() {
+            if global.interface == WlOutput::interface().name {
+                emulate
+                    .state
+                    .add_output(globals.registry(), global.name, global.version);
+            }
+        }
         while emulate.state.keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
+        // output geometry
+        emulate.queue.roundtrip(&mut emulate.state)?;
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
         // log::debug!("{:?}", &mmap[..100]);
@@ -111,6 +145,42 @@ impl State {
         };
 
         self.input_for_client.insert(client, vinput);
+    }
+
+    fn add_output(&mut self, registry: &wl_registry::WlRegistry, name: u32, version: u32) {
+        let Some(manager) = self.xdg_output_manager.as_ref() else {
+            return;
+        };
+        let wl_output: WlOutput = registry.bind(name, version.min(4), &self.qh, ());
+        let xdg_output = manager.get_xdg_output(&wl_output, &self.qh, name);
+        let output = Output {
+            wl_output,
+            xdg_output,
+            position: (0, 0),
+            size: (0, 0),
+        };
+        self.outputs.insert(name, output);
+    }
+
+    fn remove_output(&mut self, name: u32) {
+        if let Some(output) = self.outputs.remove(&name) {
+            output.xdg_output.destroy();
+            if output.wl_output.version() >= 3 {
+                output.wl_output.release();
+            }
+        }
+    }
+
+    fn displays(&self) -> Vec<Rect> {
+        self.outputs
+            .values()
+            .map(|o| Rect {
+                x: o.position.0,
+                y: o.position.1,
+                width: o.size.0,
+                height: o.size.1,
+            })
+            .collect()
     }
 
     fn destroy_client(&mut self, handle: EmulationHandle) {
@@ -157,6 +227,61 @@ impl Emulation for WlrootsEmulation {
             }
         }
         Ok(())
+    }
+
+    fn enter_at(
+        &mut self,
+        handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        // pick up output changes without blocking
+        if let Some(guard) = self.queue.prepare_read() {
+            match guard.read() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => {
+                    r?;
+                }
+            }
+        }
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
+            return Ok(None);
+        };
+        let displays = self.state.displays();
+        let Some((x, y)) = entry_point(&displays, edge, fraction) else {
+            return Ok(None);
+        };
+        // absolute motion is relative to the bounding box of the layout
+        let left = displays.iter().map(|d| d.x).min().unwrap_or_default();
+        let top = displays.iter().map(|d| d.y).min().unwrap_or_default();
+        let right = displays
+            .iter()
+            .map(|d| d.x + d.width)
+            .max()
+            .unwrap_or_default();
+        let bottom = displays
+            .iter()
+            .map(|d| d.y + d.height)
+            .max()
+            .unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        virtual_input.pointer.motion_absolute(
+            now,
+            (x - left) as u32,
+            (y - top) as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        );
+        virtual_input.pointer.frame();
+        self.queue.flush()?;
+        Ok(Some((x, y)))
     }
 
     async fn create(&mut self, handle: EmulationHandle) {
@@ -254,16 +379,49 @@ delegate_noop!(State: Vp);
 delegate_noop!(State: Vk);
 delegate_noop!(State: VpManager);
 delegate_noop!(State: VkManager);
+delegate_noop!(State: XdgOutputManager);
+delegate_noop!(State: ignore WlOutput);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
-        _: &mut State,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
+        state: &mut State,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } if interface == WlOutput::interface().name => {
+                state.add_output(registry, name, version);
+            }
+            wl_registry::Event::GlobalRemove { name } => state.remove_output(name),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgOutput, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &XdgOutput,
+        event: zxdg_output_v1::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(output) = state.outputs.get_mut(name) else {
+            return;
+        };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => output.position = (x, y),
+            zxdg_output_v1::Event::LogicalSize { width, height } => output.size = (width, height),
+            _ => {}
+        }
     }
 }
 

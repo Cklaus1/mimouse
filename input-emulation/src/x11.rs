@@ -11,7 +11,8 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::geometry::{Rect, entry_point};
+use super::{Edge, Emulation, EmulationHandle, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
@@ -35,6 +36,21 @@ impl X11Emulation {
     fn relative_motion(&self, dx: i32, dy: i32) {
         unsafe {
             xtest::XTestFakeRelativeMotionEvent(self.display, dx, dy, 0, 0);
+        }
+    }
+
+    /// The screen as one display. Xlib alone does not list monitors
+    /// (that needs Xinerama / RandR); the server keeps the pointer on a
+    /// monitor.
+    fn screen(&self) -> Rect {
+        unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            Rect {
+                x: 0,
+                y: 0,
+                width: xlib::XDisplayWidth(self.display, screen),
+                height: xlib::XDisplayHeight(self.display, screen),
+            }
         }
     }
 
@@ -138,6 +154,23 @@ impl Emulation for X11Emulation {
         }
         // FIXME
         Ok(())
+    }
+
+    fn enter_at(
+        &mut self,
+        _: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let Some((x, y)) = entry_point(&[self.screen()], edge, fraction) else {
+            return Ok(None);
+        };
+        unsafe {
+            // screen -1: the screen the pointer is on
+            xtest::XTestFakeMotionEvent(self.display, -1, x, y, 0);
+            xlib::XFlush(self.display);
+        }
+        Ok(Some((x, y)))
     }
 
     async fn create(&mut self, _: EmulationHandle) {

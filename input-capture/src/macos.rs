@@ -18,6 +18,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use futures_core::Stream;
+use input_event::macos_scroll::MacosScroll;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
@@ -357,48 +358,29 @@ fn get_events(
             })))
         }
         CGEventType::ScrollWheel => {
-            if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
-                let v =
-                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-                let h =
-                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-                if v != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 0, // Vertical
-                        value: v as f64,
-                    })));
-                }
-                if h != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 1, // Horizontal
-                        value: h as f64,
-                    })));
-                }
+            let lines =
+                ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) == 0;
+            let (vertical, horizontal) = if lines {
+                (
+                    EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+                    EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+                )
             } else {
-                // line based scrolling
-                const LINES_PER_STEP: i32 = 3;
-                const V120_STEPS_PER_LINE: i32 = 120 / LINES_PER_STEP;
-                let v = ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-                let h = ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
-                if v != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(
-                        PointerEvent::AxisDiscrete120 {
-                            axis: 0, // Vertical
-                            value: V120_STEPS_PER_LINE * v as i32,
-                        },
-                    )));
-                }
-                if h != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(
-                        PointerEvent::AxisDiscrete120 {
-                            axis: 1, // Horizontal
-                            value: V120_STEPS_PER_LINE * h as i32,
-                        },
-                    )));
-                }
-            }
+                (
+                    EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                    EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                )
+            };
+            let scroll = MacosScroll {
+                lines,
+                vertical: ev.get_integer_value_field(vertical) as i32,
+                horizontal: ev.get_integer_value_field(horizontal) as i32,
+            };
+            result.extend(
+                scroll
+                    .to_wire()
+                    .map(|e| CaptureEvent::Input(Event::Pointer(e))),
+            );
         }
         _ => (),
     }

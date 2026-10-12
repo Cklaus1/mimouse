@@ -18,11 +18,13 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::XdpEmulationCreationError};
+use super::{Edge, Emulation, EmulationHandle, error::XdpEmulationCreationError};
 
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    /// whether the missing absolute placement was logged
+    enter_at_logged: bool,
 }
 
 impl DesktopPortalEmulation {
@@ -49,7 +51,11 @@ impl DesktopPortalEmulation {
         log::debug!("started session");
         let session = session;
 
-        Ok(Self { proxy, session })
+        Ok(Self {
+            proxy,
+            session,
+            enter_at_logged: false,
+        })
     }
 }
 
@@ -149,6 +155,22 @@ impl Emulation for DesktopPortalEmulation {
             }
         }
         Ok(())
+    }
+
+    fn enter_at(
+        &mut self,
+        _client: EmulationHandle,
+        _edge: Edge,
+        _fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        // NotifyPointerMotionAbsolute needs a ScreenCast stream
+        if !self.enter_at_logged {
+            self.enter_at_logged = true;
+            log::info!(
+                "xdg-desktop-portal emulation cannot place the pointer: it stays where it was on enter"
+            );
+        }
+        Ok(None)
     }
 
     async fn create(&mut self, _client: EmulationHandle) {}

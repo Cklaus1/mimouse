@@ -7,6 +7,7 @@ use std::{
 use input_event::{Event, KeyboardEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
+pub use self::geometry::Edge;
 
 #[cfg(windows)]
 mod windows;
@@ -25,10 +26,13 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_logic;
 
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
+mod geometry;
 
 pub type EmulationHandle = u64;
 
@@ -153,6 +157,21 @@ impl InputEmulation {
         }
     }
 
+    /// Places the pointer at `fraction` along `edge` of this desktop, where
+    /// a remote cursor enters (0 = top / left end, `u16::MAX` = the other
+    /// end). Backends that cannot place the pointer absolutely leave it.
+    pub fn enter_at(
+        &mut self,
+        handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<(), EmulationError> {
+        if let Some((x, y)) = self.emulation.enter_at(handle, edge, fraction)? {
+            log::info!("entered at {x},{y} ({edge} edge, fraction {fraction})");
+        }
+        Ok(())
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -234,6 +253,14 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
+    /// Moves the pointer to [`geometry::entry_point`] of this desktop and
+    /// returns the point, `None` if the pointer was not placed.
+    fn enter_at(
+        &mut self,
+        handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError>;
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
