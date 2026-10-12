@@ -61,7 +61,6 @@ impl Notifier {
     }
 
     /// a desktop portal waits for the user to approve `what` (e.g. "input capture")
-    #[allow(dead_code)] // called by the capture task's approval wait (spec R1)
     pub(crate) fn awaiting_approval(&mut self, what: &str) {
         if self.approval.allow(what, Instant::now()) {
             self.backend.show(approval_notice(what));

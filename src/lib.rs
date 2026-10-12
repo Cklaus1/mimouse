@@ -1,3 +1,4 @@
+mod approval;
 mod audit;
 mod capture;
 pub mod capture_test;

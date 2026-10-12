@@ -63,7 +63,10 @@ use wayland_client::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use crate::{CaptureError, CaptureEvent};
+use crate::{
+    CaptureError, CaptureEvent,
+    geometry::{self, Rect},
+};
 
 use super::{
     Capture, Position,
@@ -149,6 +152,8 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    /// desktop (logical) coordinates of the surface's top left corner
+    origin: (f64, f64),
 }
 
 impl Window {
@@ -157,8 +162,9 @@ impl Window {
         qh: &QueueHandle<State>,
         output: &WlOutput,
         pos: Position,
-        size: (i32, i32),
+        info: &OutputInfo,
     ) -> Window {
+        let size = info.size;
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
@@ -166,6 +172,13 @@ impl Window {
             Position::Left | Position::Right => (1, size.1 as u32),
             Position::Top | Position::Bottom => (size.0 as u32, 1),
         };
+        let (x, y) = info.position;
+        let origin = match pos {
+            Position::Left | Position::Top => (x, y),
+            Position::Right => (x + size.0 - 1, y),
+            Position::Bottom => (x, y + size.1 - 1),
+        };
+        let origin = (f64::from(origin.0), f64::from(origin.1));
         let mut file = tempfile::tempfile().unwrap();
         draw(&mut file, (width, height));
         let pool = g
@@ -208,6 +221,7 @@ impl Window {
             buffer,
             surface,
             layer_surface,
+            origin,
         }
     }
 }
@@ -525,7 +539,7 @@ impl State {
         );
         outputs.iter().for_each(|o| {
             if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
+                let window = Window::new(self, &self.qh, &o.wl_output, pos, info);
                 let window = Arc::new(window);
                 self.active_windows.push(window);
             }
@@ -544,6 +558,20 @@ impl State {
         for pos in active_positions {
             self.add_client(pos);
         }
+    }
+
+    /// the outputs, in desktop (logical) coordinates
+    fn displays(&self) -> Vec<Rect> {
+        self.outputs
+            .iter()
+            .filter_map(|o| o.info.as_ref())
+            .map(|info| Rect {
+                x: f64::from(info.position.0),
+                y: f64::from(info.position.1),
+                width: f64::from(info.size.0),
+                height: f64::from(info.size.1),
+            })
+            .collect()
     }
 }
 
@@ -735,25 +763,20 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
-                    .active_windows
-                    .iter()
-                    .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) else {
+                    return;
+                };
+                let window = window.clone();
+                app.focused = Some(window.clone());
+                app.grab(&surface, pointer, serial, qh);
+                let point = (window.origin.0 + surface_x, window.origin.1 + surface_y);
+                let at = geometry::edge_fraction(&app.displays(), window.pos, point);
+                app.pending_events
+                    .push_back((window.pos, CaptureEvent::Begin(at)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -765,6 +788,10 @@ impl Dispatch<WlPointer, ()> for State {
                  */
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
+                    if let Some(window) = app.focused.as_ref() {
+                        let pos = window.pos;
+                        app.pending_events.push_back((pos, CaptureEvent::End));
+                    }
                 }
                 app.ungrab();
             }

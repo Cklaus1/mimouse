@@ -9,7 +9,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 
 use ashpd::desktop::{
     PersistMode, Session,
@@ -28,7 +28,7 @@ use reis::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use crate::error::EmulationError;
+use crate::{PermissionPending, error::EmulationError};
 
 use super::geometry::{Rect, entry_point};
 use super::{Edge, Emulation, EmulationHandle, error::LibeiEmulationCreationError};
@@ -89,7 +89,9 @@ fn write_token(token: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
+async fn get_ei_fd(
+    permission_pending: &watch::Sender<bool>,
+) -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd), ashpd::Error> {
     let remote_desktop = RemoteDesktop::new().await?;
 
     let restore_token = read_token();
@@ -105,10 +107,13 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
     remote_desktop.select_devices(&session, options).await?;
 
     log::info!("requesting permission for input emulation");
-    let start_response = remote_desktop
-        .start(&session, None, Default::default())
-        .await?
-        .response()?;
+    let start_response = {
+        let _pending = PermissionPending::new(permission_pending);
+        remote_desktop
+            .start(&session, None, Default::default())
+            .await?
+            .response()?
+    };
 
     // The restore token is only valid once, we need to re-save it each time
     if let Some(token_str) = start_response.restore_token() {
@@ -124,8 +129,10 @@ async fn get_ei_fd() -> Result<(RemoteDesktop, Session<RemoteDesktop>, OwnedFd),
 }
 
 impl LibeiEmulation {
-    pub(crate) async fn new() -> Result<Self, LibeiEmulationCreationError> {
-        let (_remote_desktop, session, eifd) = get_ei_fd().await?;
+    pub(crate) async fn new(
+        permission_pending: &watch::Sender<bool>,
+    ) -> Result<Self, LibeiEmulationCreationError> {
+        let (_remote_desktop, session, eifd) = get_ei_fd(permission_pending).await?;
         let stream = UnixStream::from(eifd);
         stream.set_nonblocking(true)?;
         let context = ei::Context::new(stream)?;

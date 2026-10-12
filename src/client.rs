@@ -311,3 +311,99 @@ impl ClientManager {
             .map(|(_, s)| s.ips.clone())
     }
 }
+
+/// the capture barrier an active client places
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Barrier {
+    pub(crate) pos: Position,
+}
+
+impl From<&ClientConfig> for Barrier {
+    fn from(c: &ClientConfig) -> Self {
+        Self { pos: c.pos }
+    }
+}
+
+impl From<&ConfigClient> for Barrier {
+    fn from(c: &ConfigClient) -> Self {
+        Self { pos: c.pos }
+    }
+}
+
+/// Pairs the clients of a reloaded config with the running ones, so a reload
+/// that moves no barrier leaves capture alone: rebuilding it re-creates the
+/// portal session, which asks the user again on GNOME 50.
+///
+/// `running`: the active clients and their barriers; `configured`: the
+/// barrier of each configured client (`None`: inactive). Returns, for each
+/// configured client, the running client that already places its barrier,
+/// or `None` when a barrier moves, appears or disappears (capture has to be
+/// rebuilt).
+pub(crate) fn reuse_barriers(
+    running: &[(ClientHandle, Barrier)],
+    configured: &[Option<Barrier>],
+) -> Option<Vec<Option<ClientHandle>>> {
+    if configured.iter().flatten().count() != running.len() {
+        return None;
+    }
+    let mut unused = running.to_vec();
+    configured
+        .iter()
+        .map(|barrier| match barrier {
+            None => Some(None),
+            Some(b) => {
+                let i = unused.iter().position(|(_, r)| r == b)?;
+                Some(Some(unused.swap_remove(i).0))
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(pos: Position) -> Barrier {
+        Barrier { pos }
+    }
+
+    #[test]
+    fn unchanged_barriers_keep_their_clients_in_any_order() {
+        let running = [(4, at(Position::Left)), (7, at(Position::Top))];
+        // the file lists the clients in another order, plus an inactive one
+        let configured = [Some(at(Position::Top)), None, Some(at(Position::Left))];
+        assert_eq!(
+            reuse_barriers(&running, &configured),
+            Some(vec![Some(7), None, Some(4)])
+        );
+    }
+
+    #[test]
+    fn moved_added_or_removed_barriers_rebuild() {
+        let running = [(0, at(Position::Left))];
+        assert_eq!(reuse_barriers(&running, &[Some(at(Position::Right))]), None);
+        assert_eq!(
+            reuse_barriers(
+                &running,
+                &[Some(at(Position::Left)), Some(at(Position::Top))]
+            ),
+            None
+        );
+        // deactivated
+        assert_eq!(reuse_barriers(&running, &[None]), None);
+        assert_eq!(reuse_barriers(&[], &[Some(at(Position::Left))]), None);
+    }
+
+    #[test]
+    fn two_active_clients_on_one_edge_rebuild() {
+        // only one of them can own the barrier; the rebuild path decides which
+        let running = [(0, at(Position::Left)), (1, at(Position::Top))];
+        let configured = [Some(at(Position::Left)), Some(at(Position::Left))];
+        assert_eq!(reuse_barriers(&running, &configured), None);
+    }
+
+    #[test]
+    fn inactive_only_config_needs_no_capture() {
+        assert_eq!(reuse_barriers(&[], &[None, None]), Some(vec![None, None]));
+    }
+}

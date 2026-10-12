@@ -226,10 +226,10 @@ pub enum FrontendEvent {
     Deleted { id: ClientHandle },
     /// listen port, with the reason if changing it failed
     Port { port: u16, error: Option<String> },
-    /// input capture enabled / disabled
-    Capture { enabled: bool },
-    /// input emulation enabled / disabled
-    Emulation { enabled: bool },
+    /// input capture state; `enabled` is `status == "enabled"`
+    Capture { enabled: bool, status: Status },
+    /// input emulation state; `enabled` is `status == "enabled"`
+    Emulation { enabled: bool, status: Status },
     /// authorized certificate fingerprints (fingerprint -> description)
     AuthorizedKeys { keys: HashMap<String, String> },
     /// certificate fingerprint of this machine
@@ -369,17 +369,31 @@ pub struct Peer {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
     Disabled,
     Enabled,
+    /// a permission request (e.g. the portal dialog) waits for the user
+    AwaitingApproval,
 }
 
 impl From<Status> for bool {
+    /// whether it is enabled
     fn from(status: Status) -> Self {
         match status {
             Status::Enabled => true,
-            Status::Disabled => false,
+            Status::Disabled | Status::AwaitingApproval => false,
+        }
+    }
+}
+
+impl Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::Disabled => write!(f, "disabled"),
+            Status::Enabled => write!(f, "enabled"),
+            Status::AwaitingApproval => write!(f, "awaiting approval"),
         }
     }
 }

@@ -1,9 +1,9 @@
 use ashpd::{
     desktop::{
-        Session,
+        PersistMode, Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, Zones,
+            InputCapture, Region, ReleaseOptions, StartOptions, Zones,
         },
     },
     enumflags2::BitFlags,
@@ -18,9 +18,10 @@ use reis::{
 use std::{
     cell::Cell,
     collections::HashMap,
-    io,
+    env, fs, io,
     num::NonZeroU32,
     os::unix::net::UnixStream,
+    path::PathBuf,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -30,6 +31,7 @@ use tokio::{
     sync::{
         Notify,
         mpsc::{self, Receiver, Sender},
+        watch,
     },
     task::JoinHandle,
 };
@@ -39,7 +41,10 @@ use futures_core::Stream;
 
 use input_event::Event;
 
-use crate::CaptureEvent;
+use crate::{
+    CaptureEvent,
+    geometry::{self, Rect},
+};
 
 use super::{
     Capture as MiMouseInputCapture, Position,
@@ -55,6 +60,21 @@ use super::{
 enum LibeiNotifyEvent {
     Create(Position),
     Destroy(Position),
+}
+
+/// why an activated capture ended
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// MiMouse released it
+    Released,
+    /// EI devices changed; the session has to be recreated
+    DevicesChanged,
+    /// the compositor deactivated the capture (e.g. the user pressed Super)
+    Deactivated,
+    /// the compositor disabled the session
+    Disabled,
+    /// barriers are being updated or capture is terminating
+    Cancelled,
 }
 
 #[allow(dead_code)]
@@ -129,17 +149,21 @@ fn select_barriers(
     (barriers, pos_for_barrier)
 }
 
+/// barriers, the client for each barrier id, and the displays (zones)
+type Barriers = (Vec<ICBarrier>, HashMap<BarrierID, Position>, Vec<Rect>);
+
 async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), ashpd::Error> {
+) -> Result<Barriers, ashpd::Error> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
         .response()?;
     log::debug!("zones: {zones:?}");
+    let displays = zones.regions().iter().map(to_rect).collect();
 
     let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
     log::debug!("barriers: {barriers:?}");
@@ -156,19 +180,96 @@ async fn update_barriers(
         .await?;
     let response = response.response()?;
     log::debug!("{response:?}");
-    Ok((barriers, id_map))
+    Ok((barriers, id_map, displays))
 }
 
+fn to_rect(r: &Region) -> Rect {
+    Rect {
+        x: f64::from(r.x_offset()),
+        y: f64::from(r.y_offset()),
+        width: f64::from(r.width()),
+        height: f64::from(r.height()),
+    }
+}
+
+fn capabilities() -> BitFlags<Capabilities> {
+    Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen
+}
+
+/// Creates a session. With InputCapture v2 the portal can remember the
+/// grant (restore token), so only the first session asks the user; v1
+/// (GNOME <= 50) asks for every session.
 async fn create_session(
     input_capture: &InputCapture,
-) -> std::result::Result<(Session<InputCapture>, BitFlags<Capabilities>), ashpd::Error> {
-    log::debug!("creating input capture session");
-    let create_session_options = CreateSessionOptions::default().set_capabilities(
-        Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
-    );
-    input_capture
-        .create_session(None, create_session_options)
-        .await
+    permission_pending: &watch::Sender<bool>,
+) -> std::result::Result<Session<InputCapture>, ashpd::Error> {
+    let version = input_capture.version();
+    log::debug!("creating input capture session (portal version {version})");
+    if version < 2 {
+        let options = CreateSessionOptions::default().set_capabilities(capabilities());
+        let _pending = Pending::new(permission_pending);
+        let (session, _) = input_capture.create_session(None, options).await?;
+        return Ok(session);
+    }
+
+    let session = input_capture.create_session2(Default::default()).await?;
+    let options = StartOptions::default()
+        .set_capabilities(capabilities())
+        .set_persist_mode(PersistMode::ExplicitlyRevoked)
+        .set_restore_token(read_token());
+    let response = {
+        let _pending = Pending::new(permission_pending);
+        input_capture
+            .start(&session, None, options)
+            .await?
+            .response()?
+    };
+    // a restore token is valid once; the portal hands out the next one
+    if let Some(token) = response.restore_token() {
+        if let Err(e) = write_token(token) {
+            log::warn!("failed to save input capture restore token: {e}");
+        }
+    }
+    Ok(session)
+}
+
+/// flags a permission request as pending while alive, also when the
+/// request is cancelled
+struct Pending<'a>(&'a watch::Sender<bool>);
+
+impl<'a> Pending<'a> {
+    fn new(pending: &'a watch::Sender<bool>) -> Self {
+        pending.send_replace(true);
+        Self(pending)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
+/// next to the RemoteDesktop tokens of emulation and clipboard
+fn token_path() -> PathBuf {
+    let cache = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"));
+    cache.join("mimouse").join("input-capture.token")
+}
+
+fn read_token() -> Option<String> {
+    let token = fs::read_to_string(token_path()).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+fn write_token(token: &str) -> io::Result<()> {
+    let path = token_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, token)
 }
 
 async fn connect_to_eis(
@@ -212,10 +313,13 @@ async fn libei_event_handler(
 }
 
 impl LibeiInputCapture {
-    pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
+    pub async fn new(
+        permission_pending: watch::Sender<bool>,
+    ) -> std::result::Result<Self, LibeiCaptureCreationError> {
         let input_capture = Box::pin(InputCapture::new().await?);
         let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session = Some(create_session(unsafe { &*input_capture_ptr }).await?);
+        let first_session =
+            Some(create_session(unsafe { &*input_capture_ptr }, &permission_pending).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
@@ -230,6 +334,7 @@ impl LibeiInputCapture {
             first_session,
             event_tx,
             cancellation_token.clone(),
+            permission_pending,
         );
         let capture_task = tokio::task::spawn_local(capture);
 
@@ -251,12 +356,11 @@ async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
-    session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
+    mut session: Option<Session<InputCapture>>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
+    permission_pending: watch::Sender<bool>,
 ) -> Result<(), CaptureError> {
-    let mut session = session.map(|s| s.0);
-
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
@@ -299,7 +403,7 @@ async fn do_capture(
             // create session
             let mut session = match session.take() {
                 Some(s) => s,
-                None => create_session(input_capture).await?.0,
+                None => create_session(input_capture, &permission_pending).await?,
             };
 
             let capture_session = do_capture_session(
@@ -362,7 +466,7 @@ async fn do_capture_session(
     let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
 
     // set barriers
-    let (barriers, pos_for_barrier_id) =
+    let (barriers, pos_for_barrier_id, displays) =
         update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
 
     log::debug!("enabling session");
@@ -398,7 +502,8 @@ async fn do_capture_session(
     let capture_session_task = async {
         // receiver for activation tokens
         let mut activated = input_capture.receive_activated().await?;
-        let mut ei_devices_changed = false;
+        let mut deactivated = input_capture.receive_deactivated().await?;
+        let mut disabled = input_capture.receive_disabled().await?;
         loop {
             tokio::select! {
                 activated = activated.next() => {
@@ -417,42 +522,60 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    let at = activated.cursor_position().and_then(|(x, y)| {
+                        geometry::edge_fraction(&displays, pos, (f64::from(x), f64::from(y)))
+                    });
+                    event_tx.send((pos, CaptureEvent::Begin(at))).await.expect("no channel");
 
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
-                            log::debug!("release session requested");
-                        },
-                        _ = release_session.notified() => { /* release session */
-                            log::debug!("ei devices changed");
-                            ei_devices_changed = true;
-                        },
-                        _ = cancel_session.cancelled() => { /* kill session notify */
-                            log::debug!("session cancel requested");
-                            break
-                        },
+                    let end = loop {
+                        tokio::select! {
+                            _ = notify_release.notified() => break SessionEnd::Released,
+                            _ = release_session.notified() => break SessionEnd::DevicesChanged,
+                            Some(d) = deactivated.next() => {
+                                // a late signal for an earlier activation is not ours
+                                if d.activation_id().is_none() || d.activation_id() == activated.activation_id() {
+                                    break SessionEnd::Deactivated;
+                                }
+                            }
+                            Some(_) = disabled.next() => break SessionEnd::Disabled,
+                            _ = cancel_session.cancelled() => break SessionEnd::Cancelled,
+                        }
+                    };
+                    log::debug!("capture ended: {end:?}");
+                    current_pos.replace(None);
+                    if end != SessionEnd::Released {
+                        // the remote side must get its key-ups, so capture is told
+                        event_tx.send((pos, CaptureEvent::End)).await.expect("no channel");
                     }
-
-                    release_capture(input_capture, session, activated, pos).await?;
-
+                    match end {
+                        SessionEnd::Released => release_capture(input_capture, session, activated, pos).await?,
+                        SessionEnd::Deactivated => {}
+                        SessionEnd::DevicesChanged => {
+                            release_capture(input_capture, session, activated, pos).await?;
+                            /* for whatever reason, GNOME seems to kill the session
+                             * as soon as devices are added or removed, so we need
+                             * to cancel */
+                            break;
+                        }
+                        SessionEnd::Disabled | SessionEnd::Cancelled => break,
+                    }
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
                 },
                 _ = release_session.notified() => { /* release session */
                     log::debug!("ei devices changed");
-                    ei_devices_changed = true;
+                    break;
+                },
+                Some(_) = deactivated.next() => { /* signal for an activation we already released */ },
+                Some(_) = disabled.next() => {
+                    log::info!("input capture session disabled by the compositor, recreating it");
+                    break;
                 },
                 _ = cancel_session.cancelled() => { /* kill session notify */
                     log::debug!("session cancel requested");
                     break
                 },
-            }
-            if ei_devices_changed {
-                /* for whatever reason, GNOME seems to kill the session
-                 * as soon as devices are added or removed, so we need
-                 * to cancel */
-                break;
             }
         }
         // cancel libei task

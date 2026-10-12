@@ -3,9 +3,10 @@ use crate::ipc::{
     IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
 };
 use crate::{
+    approval::reported_status,
     audit::AuditLog,
     capture::{Capture, CaptureType, ICaptureEvent},
-    client::ClientManager,
+    client::{Barrier, ClientManager, reuse_barriers},
     clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
     connect::{Connector, MiMouseConnection},
@@ -74,8 +75,12 @@ pub struct Service {
     pending_frontend_events: VecDeque<(Option<ConnId>, FrontendEvent)>,
     /// status of input capture (enabled / disabled)
     capture_status: Status,
+    /// the capture backend waits for the user to approve a permission request
+    capture_awaiting: bool,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
+    /// the emulation backend waits for the user to approve a permission request
+    emulation_awaiting: bool,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -159,7 +164,9 @@ impl Service {
             port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
+            capture_awaiting: false,
             emulation_status: Default::default(),
+            emulation_awaiting: false,
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
@@ -388,20 +395,24 @@ impl Service {
     }
 
     fn handle_config_change(&mut self) {
-        for h in self.client_manager.registered_clients() {
-            self.remove_client(h);
-        }
-        for c in self.config.clients() {
-            let handle = self.client_manager.add_with_config(c);
-            log::info!("added client {handle}");
-            let (_, s) = self.client_manager.get_state(handle).unwrap();
-            if s.active {
-                self.client_manager.deactivate_client(handle);
-                self.activate_client(handle);
+        let clients = self.config.clients();
+        let running: Vec<_> = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter(|(_, _, s)| s.active)
+            .map(|(h, c, _)| (h, Barrier::from(&c)))
+            .collect();
+        let configured: Vec<_> = clients
+            .iter()
+            .map(|c| c.active.then(|| Barrier::from(c)))
+            .collect();
+        match reuse_barriers(&running, &configured) {
+            Some(reuse) => {
+                log::info!("config changed, capture barriers unchanged");
+                self.update_clients(clients, reuse);
             }
-            if let Some(client) = self.client_info(handle) {
-                self.notify_frontend(FrontendEvent::Created { client });
-            }
+            None => self.replace_clients(clients),
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
@@ -415,6 +426,54 @@ impl Service {
             .clone_from(&authorized_keys);
         for event in self.sync_events() {
             self.notify_frontend(event);
+        }
+    }
+
+    /// applies reloaded clients without touching capture: active clients keep
+    /// their handle and barrier (`reuse`), inactive ones are re-added
+    fn update_clients(&mut self, clients: Vec<ConfigClient>, reuse: Vec<Option<ClientHandle>>) {
+        let kept: HashSet<_> = reuse.iter().flatten().copied().collect();
+        for h in self.client_manager.registered_clients() {
+            if !kept.contains(&h) {
+                self.remove_client(h);
+            }
+        }
+        for (c, handle) in clients.into_iter().zip(reuse) {
+            let Some(h) = handle else {
+                let h = self.client_manager.add_with_config(c);
+                log::info!("added client {h}");
+                if let Some(client) = self.client_info(h) {
+                    self.notify_frontend(FrontendEvent::Created { client });
+                }
+                continue;
+            };
+            self.client_manager
+                .set_fix_ips(h, c.ips.into_iter().collect());
+            if self.client_manager.set_hostname(h, c.hostname) {
+                self.resolve(h);
+            }
+            self.client_manager.set_port(h, c.port);
+            self.client_manager.set_enter_hook(h, c.enter_hook);
+            self.broadcast_client(h);
+        }
+    }
+
+    /// re-creates every client, and with them the capture barriers
+    fn replace_clients(&mut self, clients: Vec<ConfigClient>) {
+        for h in self.client_manager.registered_clients() {
+            self.remove_client(h);
+        }
+        for c in clients {
+            let handle = self.client_manager.add_with_config(c);
+            log::info!("added client {handle}");
+            let (_, s) = self.client_manager.get_state(handle).unwrap();
+            if s.active {
+                self.client_manager.deactivate_client(handle);
+                self.activate_client(handle);
+            }
+            if let Some(client) = self.client_info(handle) {
+                self.notify_frontend(FrontendEvent::Created { client });
+            }
         }
     }
 
@@ -488,11 +547,18 @@ impl Service {
             }
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::Emulation { enabled: false });
+                self.notify_frontend(self.emulation_event());
             }
             EmulationEvent::EmulationEnabled => {
                 self.emulation_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::Emulation { enabled: true });
+                self.notify_frontend(self.emulation_event());
+            }
+            EmulationEvent::AwaitingApproval(awaiting) => {
+                self.emulation_awaiting = awaiting;
+                if awaiting {
+                    self.notifier.awaiting_approval("input emulation");
+                }
+                self.notify_frontend(self.emulation_event());
             }
             EmulationEvent::ReleaseNotify => {
                 // a peer took control of this machine
@@ -516,12 +582,19 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
-                self.notify_frontend(FrontendEvent::Capture { enabled: false });
+                self.notify_frontend(self.capture_event());
                 self.control_switched(None);
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
-                self.notify_frontend(FrontendEvent::Capture { enabled: true });
+                self.notify_frontend(self.capture_event());
+            }
+            ICaptureEvent::AwaitingApproval(awaiting) => {
+                self.capture_awaiting = awaiting;
+                if awaiting {
+                    self.notifier.awaiting_approval("input capture");
+                }
+                self.notify_frontend(self.capture_event());
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
@@ -564,12 +637,8 @@ impl Service {
             FrontendEvent::Clients {
                 clients: self.client_infos(),
             },
-            FrontendEvent::Emulation {
-                enabled: self.emulation_status.into(),
-            },
-            FrontendEvent::Capture {
-                enabled: self.capture_status.into(),
-            },
+            self.emulation_event(),
+            self.capture_event(),
             FrontendEvent::Port {
                 port: self.port,
                 error: None,
@@ -581,6 +650,22 @@ impl Service {
                 keys: self.authorized_keys.read().expect("lock").clone(),
             },
         ]
+    }
+
+    fn capture_event(&self) -> FrontendEvent {
+        let status = reported_status(self.capture_status, self.capture_awaiting);
+        FrontendEvent::Capture {
+            enabled: status.into(),
+            status,
+        }
+    }
+
+    fn emulation_event(&self) -> FrontendEvent {
+        let status = reported_status(self.emulation_status, self.emulation_awaiting);
+        FrontendEvent::Emulation {
+            enabled: status.into(),
+            status,
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

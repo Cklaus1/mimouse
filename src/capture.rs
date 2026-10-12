@@ -11,13 +11,17 @@ use input_capture::{
 };
 use input_event::{
     Event, KeyboardEvent, PointerEvent,
-    scancode::Linux::{KeyLeftCtrl, KeyRightCtrl},
+    scancode::Linux::{self, KeyLeftCtrl, KeyRightCtrl},
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::{
+    sync::watch,
+    task::{JoinHandle, spawn_local},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    approval,
     config::ReleaseBind,
     connect::{ConnEvent, MiMouseConnection},
 };
@@ -46,6 +50,9 @@ pub(crate) enum ICaptureEvent {
     /// The capture of the entered client was released: control is back on
     /// this machine.
     Released,
+    /// the backend waits for the user to approve capturing input (or no
+    /// longer does)
+    AwaitingApproval(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +87,21 @@ impl Capture {
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (permission_pending, pending_rx) = watch::channel(false);
+        let approval_tx = event_tx.clone();
+        // ends with the capture task, which owns the sender
+        spawn_local(async move {
+            approval::forward(
+                pending_rx,
+                "input capture",
+                approval::GRACE,
+                approval::WARN_EVERY,
+                |waiting| {
+                    let _ = approval_tx.send(ICaptureEvent::AwaitingApproval(waiting));
+                },
+            )
+            .await
+        });
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
@@ -88,9 +110,11 @@ impl Capture {
             captures: Default::default(),
             conn,
             event_tx,
+            permission_pending,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             ctrl_taps: Default::default(),
+            enter_at: None,
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -173,8 +197,12 @@ struct CaptureTask {
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
+    /// `true` while the backend waits for a permission request
+    permission_pending: watch::Sender<bool>,
     release_bind: Rc<RefCell<ReleaseBind>>,
     ctrl_taps: CtrlDoubleTap,
+    /// where the cursor crossed into the active client, if the backend knows
+    enter_at: Option<u16>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -235,7 +263,7 @@ impl CaptureTask {
     async fn do_capture(&mut self) -> Result<(), InputCaptureError> {
         /* allow cancelling capture request */
         let mut capture = tokio::select! {
-            r = InputCapture::new(self.backend) => r?,
+            r = InputCapture::new(self.backend, self.permission_pending.clone()) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
@@ -253,6 +281,10 @@ impl CaptureTask {
         }
 
         let r = self.do_capture_session(&mut capture).await;
+
+        // capture ended by an error, the end of the stream or termination:
+        // the peer must not keep keys held
+        self.leave_client(&mut capture).await;
 
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;
@@ -338,12 +370,19 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
+        if event == CaptureEvent::End {
+            if self.active_client.is_some() {
+                log::info!("releasing capture: ended by the compositor");
+            }
+            return self.release_capture(capture).await;
+        }
+
         if capture.keys_pressed(&self.release_bind.borrow().keys) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
         }
 
-        if event == CaptureEvent::Begin {
+        if matches!(event, CaptureEvent::Begin(_)) {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -362,7 +401,7 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if matches!(event, CaptureEvent::Begin(_)) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -373,7 +412,8 @@ impl CaptureTask {
         // checked before sending, applied after: the final Ctrl release must
         // reach the peer or Ctrl stays held there
         let double_tapped = match event {
-            CaptureEvent::Begin => {
+            CaptureEvent::Begin(at) => {
+                self.enter_at = at;
                 self.ctrl_taps = Default::default();
                 false
             }
@@ -381,23 +421,25 @@ impl CaptureTask {
                 self.release_bind.borrow().double_tap_ctrl
                     && self.ctrl_taps.feed(&e, Instant::now())
             }
+            CaptureEvent::End => unreachable!("handled above"),
         };
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin(_) => enter_event(opposite_pos, self.enter_at),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                State::WaitingForAck => enter_event(opposite_pos, self.enter_at),
                 State::Sending => ProtoEvent::Input(e),
             },
+            CaptureEvent::End => unreachable!("handled above"),
         };
 
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            return capture.release().await;
+            return self.release_capture(capture).await;
         }
 
         if double_tapped {
@@ -407,54 +449,64 @@ impl CaptureTask {
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        // If we have an active client, notify them we're leaving
+    /// Key-ups for every key still held, a modifier reset and `Leave` for
+    /// the active client. Every path that ends capturing goes through here.
+    async fn leave_client(&mut self, capture: &mut InputCapture) {
         if let Some(handle) = self.active_client.take() {
-            // Synthesize key-up events for every key still held in the
-            // capture's pressed_keys set BEFORE sending Leave. Without
-            // this, pressing the release-bind chord (typically all four
-            // modifiers) leaves the peer with phantom held modifiers:
-            // the down events were forwarded while capture was active,
-            // but the matching up events arrive after the local tap
-            // flips to passthrough and never reach the peer. The peer
-            // then runs every subsequent keystroke through those held
-            // mods until its watchdog times out (1+ s) or our Leave
-            // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key: key as u32,
-                    state: 0,
-                }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
-                    log::warn!("failed to send key-up to client {handle}: {e}");
-                }
-            }
-            // Reset the modifier mask too. The peer's input-emulation
-            // layer keeps a separate XKB-style modifier state that's
-            // updated by KeyboardEvent::Modifiers, distinct from the
-            // pressed_keys set drained above. Without this, an
-            // already-locked CapsLock would survive the release.
-            let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                depressed: 0,
-                latched: 0,
-                locked: 0,
-                group: 0,
-            }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
-                log::warn!("failed to reset modifiers on client {handle}: {e}");
-            }
-
-            log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
-                log::warn!("failed to send Leave to client {handle}: {e}");
-            }
+            self.send_leave(handle, capture.take_pressed_keys()).await;
+            // control is local again, even if the peer was unreachable
             self.event_tx
                 .send(ICaptureEvent::Released)
                 .expect("channel closed");
         }
+    }
+
+    async fn send_leave(&self, handle: CaptureHandle, pressed: impl IntoIterator<Item = Linux>) {
+        log::info!("sending Leave event to client {handle}");
+        for event in leave_events(pressed) {
+            if let Err(e) = self.conn.send(event, handle).await {
+                // the remaining events would fail the same way
+                log::warn!("failed to send {event} to client {handle}: {e}");
+                return;
+            }
+        }
+    }
+
+    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.leave_client(capture).await;
         capture.release().await
     }
+}
+
+/// `Enter`, with the crossing point when the backend reported it; Lan Mouse
+/// peers read both as `Enter`
+fn enter_event(pos: crate::proto::Position, at: Option<u16>) -> ProtoEvent {
+    match at {
+        Some(at) => ProtoEvent::EnterAt(pos, at),
+        None => ProtoEvent::Enter(pos),
+    }
+}
+
+/// What a peer needs to stop being controlled: key-ups for every key that
+/// was forwarded as pressed (the release-bind chord, or keys held when the
+/// compositor ended capture, would otherwise stay held there until its
+/// watchdog fires), then a modifier reset (its XKB state is separate from
+/// pressed keys, e.g. a locked CapsLock), then `Leave`, which may be lost.
+fn leave_events(pressed: impl IntoIterator<Item = Linux>) -> Vec<ProtoEvent> {
+    let key_ups = pressed.into_iter().map(|key| {
+        ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: key as u32,
+            state: 0,
+        }))
+    });
+    let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+        depressed: 0,
+        latched: 0,
+        locked: 0,
+        group: 0,
+    }));
+    key_ups.chain([mods_zero, ProtoEvent::Leave(0)]).collect()
 }
 
 thread_local! {
@@ -676,5 +728,37 @@ mod tests {
             (401, ctrl(false)),
         ];
         assert!(fired(&held).is_empty());
+    }
+
+    #[test]
+    fn leaving_releases_every_held_key_before_leave() {
+        let held = [KeyLeftCtrl, Linux::KeyLeftShift, Linux::KeyA];
+        let events = leave_events(held);
+        assert_eq!(events.len(), held.len() + 2);
+        let mut released: Vec<u32> = events[..held.len()]
+            .iter()
+            .map(|e| match e {
+                ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    key, state: 0, ..
+                })) => *key,
+                e => panic!("expected a key-up, got {e}"),
+            })
+            .collect();
+        released.sort();
+        let mut expected: Vec<u32> = held.iter().map(|&k| k as u32).collect();
+        expected.sort();
+        assert_eq!(released, expected);
+        assert!(matches!(
+            events[held.len()],
+            ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0
+            }))
+        ));
+        assert!(matches!(events[held.len() + 1], ProtoEvent::Leave(_)));
+        // nothing held: still reset modifiers and leave
+        assert_eq!(leave_events([]).len(), 2);
     }
 }

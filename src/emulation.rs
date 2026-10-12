@@ -1,3 +1,4 @@
+use crate::approval;
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
@@ -13,6 +14,7 @@ use std::{
 };
 use tokio::{
     select,
+    sync::watch,
     task::{JoinHandle, spawn_local},
 };
 
@@ -52,6 +54,9 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// the backend waits for the user to approve emulating input (or no
+    /// longer does)
+    AwaitingApproval(bool),
 }
 
 enum EmulationRequest {
@@ -250,6 +255,21 @@ impl EmulationProxy {
     fn new(backend: Option<input_emulation::Backend>) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (permission_pending, pending_rx) = watch::channel(false);
+        let approval_tx = event_tx.clone();
+        // ends with the emulation task, which owns the sender
+        spawn_local(async move {
+            approval::forward(
+                pending_rx,
+                "input emulation",
+                approval::GRACE,
+                approval::WARN_EVERY,
+                |waiting| {
+                    let _ = approval_tx.send(EmulationEvent::AwaitingApproval(waiting));
+                },
+            )
+            .await
+        });
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
@@ -257,6 +277,7 @@ impl EmulationProxy {
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
+            permission_pending,
             handles: Default::default(),
             next_id: 0,
         };
@@ -324,6 +345,8 @@ struct EmulationTask {
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// `true` while the backend waits for a permission request
+    permission_pending: watch::Sender<bool>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
 }
@@ -353,7 +376,7 @@ impl EmulationTask {
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = InputEmulation::new(self.backend, self.permission_pending.clone()) => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };

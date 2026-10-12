@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::ipc::{
     AsyncFrontendEventReader, ClientHandle, ClientInfo, ClipboardDirection, ConnectionError,
-    DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, connect_async,
+    DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, Status, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -98,9 +98,10 @@ pub async fn run(args: CliArgs) -> Result<(), CliError> {
         cmd => request(cmd),
     };
     let seq = tx.request(request).await?;
-    match wait_for_reply(rx, seq).await? {
+    let (result, state) = wait_for_reply(rx, seq).await?;
+    match result {
         Ok(reply) => {
-            print_reply(&reply, args.json);
+            print_reply(&reply, &state, args.json);
             Ok(())
         }
         Err(e) => {
@@ -159,32 +160,50 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
     }
 }
 
+/// capture / emulation state from the events the service sends first
+#[derive(Debug, Default)]
+struct ServiceState {
+    capture: Status,
+    emulation: Status,
+}
+
 /// skip state events until the reply to `seq` arrives
 async fn wait_for_reply(
     mut rx: AsyncFrontendEventReader,
     seq: u64,
-) -> Result<Result<Reply, String>, CliError> {
+) -> Result<(Result<Reply, String>, ServiceState), CliError> {
+    let mut state = ServiceState::default();
     while let Some(event) = rx.next().await {
-        if let FrontendEvent::Reply { seq: s, result } = event? {
-            if s == seq {
-                return Ok(result);
-            }
+        match event? {
+            FrontendEvent::Reply { seq: s, result } if s == seq => return Ok((result, state)),
+            FrontendEvent::Capture { status, .. } => state.capture = status,
+            FrontendEvent::Emulation { status, .. } => state.emulation = status,
+            _ => {}
         }
     }
     Err(CliError::Closed)
 }
 
-fn print_reply(reply: &Reply, json: bool) {
+fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
     match (reply, json) {
         (Reply::Done, true) => println!("{}", serde_json::json!({ "ok": true })),
         (Reply::Done, false) => {}
         (Reply::Client(client), true) => println!("{}", to_json(client)),
         (Reply::Client(client), false) => println!("{}", client_line(client)),
-        (Reply::Clients(clients), true) => println!("{}", to_json(clients)),
+        (Reply::Clients(clients), true) => println!(
+            "{}",
+            serde_json::json!({
+                "clients": clients,
+                "capture": state.capture,
+                "emulation": state.emulation,
+            })
+        ),
         (Reply::Clients(clients), false) => {
             for client in clients {
                 println!("{}", client_line(client));
             }
+            println!("capture: {}", state.capture);
+            println!("emulation: {}", state.emulation);
         }
     }
 }
@@ -218,8 +237,8 @@ fn print_event(event: &FrontendEvent) {
             port,
             error: Some(e),
         } => println!("port change failed, still on {port}: {e}"),
-        FrontendEvent::Capture { enabled } => println!("capture enabled: {enabled}"),
-        FrontendEvent::Emulation { enabled } => println!("emulation enabled: {enabled}"),
+        FrontendEvent::Capture { status, .. } => println!("capture: {status}"),
+        FrontendEvent::Emulation { status, .. } => println!("emulation: {status}"),
         FrontendEvent::AuthorizedKeys { keys } => {
             for (fingerprint, description) in keys {
                 println!("authorized: {description} {fingerprint}");

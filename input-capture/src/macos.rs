@@ -1,4 +1,5 @@
 use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use crate::geometry::{self, Rect};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -116,6 +117,18 @@ impl InputCaptureState {
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
+    }
+
+    /// where `location` lies along the `pos` edge of the display bounds
+    fn edge_fraction(&self, location: CGPoint, pos: Position) -> Option<u16> {
+        let b = &self.bounds;
+        let desktop = [Rect {
+            x: b.xmin,
+            y: b.ymin,
+            width: b.xmax - b.xmin,
+            height: b.ymax - b.ymin,
+        }];
+        geometry::edge_fraction(&desktop, pos, (location.x, location.y))
     }
 
     /// start the input capture by
@@ -462,9 +475,9 @@ fn create_event_tap<'a>(
             // notify the producer loop so the service can tear
             // down cleanly.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
+            if let Some(pos) = state.current_pos.take() {
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
+                let _ = event_tx.blocking_send((pos, CaptureEvent::End));
             }
             notify_tx
                 .blocking_send(ProducerEvent::EventTapDisabled)
@@ -501,10 +514,11 @@ fn create_event_tap<'a>(
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
+                let at = state.edge_fraction(cg_ev.location(), new_pos);
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
+                res_events.push(CaptureEvent::Begin(at));
                 notify_tx
                     .blocking_send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");
