@@ -554,12 +554,24 @@ impl Config {
 
     pub fn write_back(&mut self) -> Result<(), io::Error> {
         log::info!("writing config to {:?}", &self.config_path);
-        /* the new config */
         let new_config = self.config_toml.clone().unwrap_or_default();
-        let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
-
-        // TODO merge with the current config file to preserve comments;
-        // for now `save-config` overwrites it.
+        let current = match fs::read_to_string(self.config_path()) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        let mut doc = match current.parse::<DocumentMut>() {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!("{:?}: {e}, rewriting it", self.config_path());
+                DocumentMut::new()
+            }
+        };
+        merge_config(&mut doc, &new_config);
+        let new_config = doc.to_string();
+        if new_config == current {
+            return Ok(());
+        }
 
         let _ = self.unwatch();
         /* write new config to file */
@@ -575,5 +587,240 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+/// update `doc` in place so it describes `config`: only keys whose value
+/// differs are touched, so comments, ordering and unknown keys survive
+fn merge_config(doc: &mut DocumentMut, config: &ConfigToml) {
+    let old = toml_edit::de::from_document::<ConfigToml>(doc.clone()).unwrap_or_default();
+    let mut old = to_table(&old);
+    let mut new = to_table(config);
+    let old_clients = old.remove("clients");
+    let new_clients = new.remove("clients");
+    merge_table(doc.as_table_mut(), &old, &new);
+    if semantic(old_clients.as_ref()) != semantic(new_clients.as_ref()) {
+        merge_clients(
+            doc.as_table_mut(),
+            config.clients.as_deref().unwrap_or_default(),
+        );
+    }
+}
+
+/// `[[clients]]`: an existing entry with the same hostname and position is
+/// edited in place, unmatched entries are removed, new ones appended
+fn merge_clients(doc: &mut toml_edit::Table, clients: &[TomlClient]) {
+    let mut existing = match doc.remove("clients") {
+        Some(toml_edit::Item::ArrayOfTables(a)) => a.into_iter().map(Some).collect(),
+        Some(toml_edit::Item::Value(toml_edit::Value::Array(a))) => a
+            .into_iter()
+            .map(|v| match v {
+                toml_edit::Value::InlineTable(t) => Some(t.into_table()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::<Option<toml_edit::Table>>::new(),
+    };
+    if clients.is_empty() {
+        return;
+    }
+    let key = |c: &TomlClient| (c.hostname.clone(), c.position.unwrap_or_default());
+    let mut result = toml_edit::ArrayOfTables::new();
+    for client in clients {
+        let found = existing.iter_mut().find(|t| {
+            t.as_ref()
+                .and_then(table_client)
+                .is_some_and(|c| key(&c) == key(client))
+        });
+        let new = to_table(client);
+        match found.and_then(Option::take) {
+            Some(mut table) => {
+                let old = table_client(&table).expect("matched above");
+                let old = TomlClient::from(ConfigClient::from(old));
+                merge_table(&mut table, &to_table(&old), &new);
+                result.push(table);
+            }
+            None => result.push(new),
+        }
+    }
+    doc.insert("clients", toml_edit::Item::ArrayOfTables(result));
+}
+
+fn table_client(t: &toml_edit::Table) -> Option<TomlClient> {
+    toml_edit::de::from_document(DocumentMut::from(t.clone())).ok()
+}
+
+/// apply the difference between the known keys `old` and `new` to `dst`;
+/// keys known to neither are left alone
+fn merge_table(dst: &mut toml_edit::Table, old: &toml_edit::Table, new: &toml_edit::Table) {
+    let keys = old
+        .iter()
+        .chain(new.iter())
+        .map(|(k, _)| k.to_owned())
+        .collect::<Vec<_>>();
+    for k in keys {
+        let (old, new) = (old.get(&k), new.get(&k));
+        if semantic(old) == semantic(new) {
+            continue;
+        }
+        let Some(new) = new else {
+            dst.remove(&k);
+            continue;
+        };
+        match (dst.get_mut(&k), new) {
+            (Some(toml_edit::Item::Table(d)), n) if n.is_table_like() => {
+                let n = n.clone().into_table().expect("table like");
+                let o = old.cloned().and_then(|o| o.into_table().ok());
+                merge_table(d, &o.unwrap_or_default(), &n);
+            }
+            (Some(toml_edit::Item::Value(d)), toml_edit::Item::Value(n)) => {
+                let decor = d.decor().clone();
+                *d = n.clone();
+                *d.decor_mut() = decor;
+            }
+            (Some(d), n) => *d = n.clone(),
+            (None, n) => {
+                dst.insert(&k, n.clone());
+            }
+        }
+    }
+}
+
+/// serialize into a standalone table
+fn to_table<T: Serialize>(value: &T) -> toml_edit::Table {
+    toml_edit::ser::to_document(value)
+        .expect("config serialization")
+        .as_table()
+        .clone()
+}
+
+/// value of an item independent of formatting
+fn semantic(item: Option<&toml_edit::Item>) -> Option<toml::Value> {
+    let mut doc = DocumentMut::new();
+    doc.insert("v", item?.clone());
+    toml::from_str::<toml::Table>(&doc.to_string())
+        .ok()?
+        .remove("v")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMENTED: &str = r#"# my mimouse config
+port = 4242 # not the default
+release_bind = ["KeyA", "KeyB"]
+unknown_key = "kept"
+
+[authorized_fingerprints]
+# the laptop
+"aa:bb" = "laptop"
+
+# the desktop on the left
+[[clients]]
+hostname = "desk"
+position = "left"
+ips = ["192.168.0.2"]
+activate_on_startup = true
+
+# right screen
+[[clients]]
+hostname = "lap" # trailing
+position = "right"
+port = 4243
+"#;
+
+    fn parsed(s: &str) -> (DocumentMut, ConfigToml) {
+        let doc = s.parse::<DocumentMut>().unwrap();
+        let cfg = toml_edit::de::from_document::<ConfigToml>(doc.clone()).unwrap();
+        (doc, cfg)
+    }
+
+    /// what the service does: clients go through ConfigClient
+    fn normalized(mut cfg: ConfigToml) -> ConfigToml {
+        cfg.clients = cfg.clients.map(|c| {
+            c.into_iter()
+                .map(|c| TomlClient::from(ConfigClient::from(c)))
+                .collect()
+        });
+        cfg
+    }
+
+    #[test]
+    fn noop_save_is_identical() {
+        let (mut doc, cfg) = parsed(COMMENTED);
+        merge_config(&mut doc, &normalized(cfg));
+        assert_eq!(doc.to_string(), COMMENTED);
+    }
+
+    #[test]
+    fn changing_one_client_keeps_rest() {
+        let (mut doc, cfg) = parsed(COMMENTED);
+        let mut cfg = normalized(cfg);
+        cfg.clients.as_mut().unwrap()[1].port = Some(5000);
+        merge_config(&mut doc, &cfg);
+        let out = doc.to_string();
+        assert_eq!(out, COMMENTED.replace("port = 4243", "port = 5000"));
+        assert_eq!(normalized(parsed(&out).1), cfg);
+    }
+
+    #[test]
+    fn add_and_remove_client() {
+        let (mut doc, cfg) = parsed(COMMENTED);
+        let mut cfg = normalized(cfg);
+        let clients = cfg.clients.as_mut().unwrap();
+        clients.remove(0);
+        clients.push(TomlClient {
+            hostname: Some("new".into()),
+            host_name: None,
+            ips: Some(vec!["10.0.0.1".parse().unwrap()]),
+            port: None,
+            position: Some(Position::Top),
+            activate_on_startup: None,
+            enter_hook: None,
+        });
+        merge_config(&mut doc, &cfg);
+        let out = doc.to_string();
+        assert!(!out.contains("desk"), "{out}");
+        assert!(out.contains("# my mimouse config\nport = 4242 # not the default"));
+        assert!(out.contains("# right screen\n[[clients]]\nhostname = \"lap\" # trailing"));
+        assert!(out.contains("unknown_key = \"kept\""));
+        assert!(out.contains("# the laptop\n\"aa:bb\" = \"laptop\""));
+        let (_, back) = parsed(&out);
+        assert_eq!(normalized(back), cfg);
+
+        // and removing every client drops the section
+        cfg.clients = None;
+        merge_config(&mut doc, &cfg);
+        assert!(!doc.to_string().contains("clients"));
+    }
+
+    #[test]
+    fn top_level_change_keeps_decor() {
+        let (mut doc, mut cfg) = parsed(COMMENTED);
+        cfg.port = Some(1234);
+        cfg.authorized_fingerprints
+            .as_mut()
+            .unwrap()
+            .insert("cc:dd".into(), "phone".into());
+        merge_config(&mut doc, &normalized(cfg.clone()));
+        let out = doc.to_string();
+        assert!(out.contains("port = 1234 # not the default"), "{out}");
+        assert!(
+            out.contains("# the laptop\n\"aa:bb\" = \"laptop\"\n"),
+            "{out}"
+        );
+        assert_eq!(normalized(parsed(&out).1), normalized(cfg));
+    }
+
+    #[test]
+    fn fresh_file() {
+        let (_, cfg) = parsed(COMMENTED);
+        let cfg = normalized(cfg);
+        let mut doc = DocumentMut::new();
+        merge_config(&mut doc, &cfg);
+        let out = doc.to_string();
+        assert!(out.contains("[[clients]]"), "{out}");
+        assert_eq!(normalized(parsed(&out).1), cfg);
     }
 }
