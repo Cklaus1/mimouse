@@ -58,6 +58,8 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     clipboard: Option<bool>,
+    notify_switch: Option<bool>,
+    idle_inhibit: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -452,6 +454,23 @@ impl Config {
             .as_ref()
             .and_then(|c| c.clipboard)
             .unwrap_or(false)
+    }
+
+    /// whether a notification announces each switch of control (default: enabled)
+    pub fn notify_switch(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.notify_switch)
+            .unwrap_or(true)
+    }
+
+    /// whether idle/lock is inhibited while this machine controls another one
+    /// (default: enabled)
+    pub fn idle_inhibit(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.idle_inhibit)
+            .unwrap_or(true)
     }
 
     /// path to certificate

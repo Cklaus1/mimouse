@@ -13,6 +13,7 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{ListenerCreationError, MiMouseListener},
+    notify::Notifier,
 };
 use hickory_resolver::ResolveError;
 use log;
@@ -77,6 +78,8 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// desktop notifications (switches, unauthorized peers)
+    notifier: Notifier,
 }
 
 #[derive(Debug)]
@@ -130,6 +133,7 @@ impl Service {
 
         let port = config.port();
         let audit = AuditLog::new(config.config_dir());
+        let notifier = Notifier::new(config.notify_switch());
         let service = Self {
             config,
             audit,
@@ -150,6 +154,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            notifier,
         };
         Ok(service)
     }
@@ -390,6 +395,7 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        self.notifier.set_switch_enabled(self.config.notify_switch());
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -421,6 +427,7 @@ impl Service {
                 log::warn!(
                     "connection attempt from unauthorized fingerprint {fingerprint}; approve with `mimouse cli authorize-key <name> {fingerprint}`"
                 );
+                self.notifier.unauthorized(&fingerprint);
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
             EmulationEvent::Entered {
@@ -475,7 +482,11 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::Emulation { enabled: true });
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify => {
+                // a peer took control of this machine
+                self.capture.release();
+                self.control_switched(None);
+            }
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::Connection { addr, fingerprint });
             }
@@ -494,6 +505,7 @@ impl Service {
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::Capture { enabled: false });
+                self.control_switched(None);
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
@@ -503,7 +515,9 @@ impl Service {
                 log::info!("entering client {handle} ...");
                 self.clipboard.client_entered(handle);
                 self.spawn_hook_command(handle);
+                self.control_switched(Some(handle));
             }
+            ICaptureEvent::Released => self.control_switched(None),
         }
     }
 
@@ -734,6 +748,16 @@ impl Service {
         if let Some(client) = self.client_info(handle) {
             self.notify_frontend(FrontendEvent::State { client });
         }
+    }
+
+    /// control moved to the remote client `to`, or back to this machine (`None`)
+    fn control_switched(&mut self, to: Option<ClientHandle>) {
+        let host = to.map(|h| {
+            self.client_manager
+                .get_hostname(h)
+                .unwrap_or_else(|| format!("client {h}"))
+        });
+        self.notifier.switched(host.as_deref());
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle) {
