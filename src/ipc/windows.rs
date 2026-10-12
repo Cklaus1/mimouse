@@ -139,7 +139,8 @@ pub(super) fn verify_owner(pipe: &NamedPipeClient) -> Result<(), ConnectionError
     Ok(())
 }
 
-fn current_user_sid() -> io::Result<String> {
+/// string SID of the user running this process
+pub(crate) fn current_user_sid() -> io::Result<String> {
     process_user_sid(unsafe { GetCurrentProcess() })
 }
 

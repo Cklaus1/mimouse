@@ -20,6 +20,8 @@ mod connect_async;
 mod listen;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::current_user_sid;
 
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::{AsyncFrontendListener, ConnId, IpcEvent};
