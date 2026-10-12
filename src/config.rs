@@ -596,14 +596,20 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        let mut doc = match current.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(e) => {
-                log::warn!("{:?}: {e}, rewriting it", self.config_path());
-                DocumentMut::new()
-            }
-        };
-        merge_config(&mut doc, &new_config);
+        // a file the user is editing may not parse yet: rewriting it from
+        // memory would drop their edits
+        let mut doc = current.parse::<DocumentMut>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{:?} has errors, fix it first: {e}", self.config_path()),
+            )
+        })?;
+        merge_config(&mut doc, &new_config).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{:?} has errors, fix it first: {e}", self.config_path()),
+            )
+        })?;
         let new_config = doc.to_string();
         if new_config == current {
             return Ok(());
@@ -627,9 +633,10 @@ impl Config {
 }
 
 /// update `doc` in place so it describes `config`: only keys whose value
-/// differs are touched, so comments, ordering and unknown keys survive
-fn merge_config(doc: &mut DocumentMut, config: &ConfigToml) {
-    let old = toml_edit::de::from_document::<ConfigToml>(doc.clone()).unwrap_or_default();
+/// differs are touched, so comments, ordering and unknown keys survive.
+/// Fails if `doc` is not a valid config: every key would count as changed
+fn merge_config(doc: &mut DocumentMut, config: &ConfigToml) -> Result<(), toml_edit::de::Error> {
+    let old = toml_edit::de::from_document::<ConfigToml>(doc.clone())?;
     let mut old = to_table(&old);
     let mut new = to_table(config);
     let old_clients = old.remove("clients");
@@ -641,10 +648,13 @@ fn merge_config(doc: &mut DocumentMut, config: &ConfigToml) {
             config.clients.as_deref().unwrap_or_default(),
         );
     }
+    Ok(())
 }
 
 /// `[[clients]]`: an existing entry with the same hostname and position is
-/// edited in place, unmatched entries are removed, new ones appended
+/// edited in place; failing that, one with the same hostname, ips or
+/// position (a moved or renamed client keeps its comments and unknown
+/// keys). Unmatched entries are removed, new ones appended
 fn merge_clients(doc: &mut toml_edit::Table, clients: &[TomlClient]) {
     let mut existing = match doc.remove("clients") {
         Some(toml_edit::Item::ArrayOfTables(a)) => a.into_iter().map(Some).collect(),
@@ -660,18 +670,36 @@ fn merge_clients(doc: &mut toml_edit::Table, clients: &[TomlClient]) {
     if clients.is_empty() {
         return;
     }
-    let key = |c: &TomlClient| (c.hostname.clone(), c.position.unwrap_or_default());
+    let parsed: Vec<Option<TomlClient>> = existing
+        .iter()
+        .map(|t| t.as_ref().and_then(table_client))
+        .collect();
+    let position = |c: &TomlClient| c.position.unwrap_or_default();
+    let same: [&dyn Fn(&TomlClient, &TomlClient) -> bool; 4] = [
+        &|a, b| a.hostname == b.hostname && position(a) == position(b),
+        &|a, b| a.hostname.is_some() && a.hostname == b.hostname,
+        &|a, b| a.ips.as_ref().is_some_and(|ips| !ips.is_empty()) && a.ips == b.ips,
+        &|a, b| position(a) == position(b),
+    ];
+    let mut matched: Vec<Option<usize>> = vec![None; clients.len()];
+    let mut taken = vec![false; existing.len()];
+    for same in same {
+        for (client, m) in clients.iter().zip(&mut matched) {
+            if m.is_some() {
+                continue;
+            }
+            *m = (0..existing.len())
+                .find(|&i| !taken[i] && parsed[i].as_ref().is_some_and(|old| same(client, old)));
+            if let Some(i) = *m {
+                taken[i] = true;
+            }
+        }
+    }
     let mut result = toml_edit::ArrayOfTables::new();
-    for client in clients {
-        let found = existing.iter_mut().find(|t| {
-            t.as_ref()
-                .and_then(table_client)
-                .is_some_and(|c| key(&c) == key(client))
-        });
+    for (client, m) in clients.iter().zip(matched) {
         let new = to_table(client);
-        match found.and_then(Option::take) {
-            Some(mut table) => {
-                let old = table_client(&table).expect("matched above");
+        match m.and_then(|i| Some((existing[i].take()?, parsed[i].clone()?))) {
+            Some((mut table, old)) => {
                 let old = TomlClient::from(ConfigClient::from(old));
                 merge_table(&mut table, &to_table(&old), &new);
                 result.push(table);
@@ -785,7 +813,7 @@ port = 4243
     #[test]
     fn noop_save_is_identical() {
         let (mut doc, cfg) = parsed(COMMENTED);
-        merge_config(&mut doc, &normalized(cfg));
+        merge_config(&mut doc, &normalized(cfg)).unwrap();
         assert_eq!(doc.to_string(), COMMENTED);
     }
 
@@ -794,7 +822,7 @@ port = 4243
         let (mut doc, cfg) = parsed(COMMENTED);
         let mut cfg = normalized(cfg);
         cfg.clients.as_mut().unwrap()[1].port = Some(5000);
-        merge_config(&mut doc, &cfg);
+        merge_config(&mut doc, &cfg).unwrap();
         let out = doc.to_string();
         assert_eq!(out, COMMENTED.replace("port = 4243", "port = 5000"));
         assert_eq!(normalized(parsed(&out).1), cfg);
@@ -815,7 +843,7 @@ port = 4243
             activate_on_startup: None,
             enter_hook: None,
         });
-        merge_config(&mut doc, &cfg);
+        merge_config(&mut doc, &cfg).unwrap();
         let out = doc.to_string();
         assert!(!out.contains("desk"), "{out}");
         assert!(out.contains("# my mimouse config\nport = 4242 # not the default"));
@@ -827,7 +855,7 @@ port = 4243
 
         // and removing every client drops the section
         cfg.clients = None;
-        merge_config(&mut doc, &cfg);
+        merge_config(&mut doc, &cfg).unwrap();
         assert!(!doc.to_string().contains("clients"));
     }
 
@@ -839,7 +867,7 @@ port = 4243
             .as_mut()
             .unwrap()
             .insert("cc:dd".into(), "phone".into());
-        merge_config(&mut doc, &normalized(cfg.clone()));
+        merge_config(&mut doc, &normalized(cfg.clone())).unwrap();
         let out = doc.to_string();
         assert!(out.contains("port = 1234 # not the default"), "{out}");
         assert!(
@@ -854,9 +882,48 @@ port = 4243
         let (_, cfg) = parsed(COMMENTED);
         let cfg = normalized(cfg);
         let mut doc = DocumentMut::new();
-        merge_config(&mut doc, &cfg);
+        merge_config(&mut doc, &cfg).unwrap();
         let out = doc.to_string();
         assert!(out.contains("[[clients]]"), "{out}");
         assert_eq!(normalized(parsed(&out).1), cfg);
+    }
+
+    /// set-position / set-host edit the client's table in place
+    #[test]
+    fn moved_or_renamed_client_keeps_its_table() {
+        let commented = COMMENTED.replace(
+            "activate_on_startup = true\n",
+            "activate_on_startup = true\nfuture_key = 1\n",
+        );
+        let (mut doc, cfg) = parsed(&commented);
+        let mut cfg = normalized(cfg);
+        cfg.clients.as_mut().unwrap()[0].position = Some(Position::Top);
+        merge_config(&mut doc, &cfg).unwrap();
+        let out = doc.to_string();
+        assert_eq!(
+            out,
+            commented.replace("position = \"left\"", "position = \"top\"")
+        );
+
+        cfg.clients.as_mut().unwrap()[0].hostname = Some("desk2".into());
+        merge_config(&mut doc, &cfg).unwrap();
+        let out = doc.to_string();
+        assert_eq!(
+            out,
+            commented
+                .replace("position = \"left\"", "position = \"top\"")
+                .replace("\"desk\"", "\"desk2\"")
+        );
+        assert_eq!(normalized(parsed(&out).1), cfg);
+    }
+
+    /// a file that does not deserialize (e.g. mid-edit) is not overwritten
+    #[test]
+    fn invalid_file_is_not_merged() {
+        let (_, cfg) = parsed(COMMENTED);
+        let broken = COMMENTED.replace("port = 4242", "port = \"4242\"");
+        let mut doc = broken.parse::<DocumentMut>().unwrap();
+        assert!(merge_config(&mut doc, &normalized(cfg)).is_err());
+        assert_eq!(doc.to_string(), broken);
     }
 }
