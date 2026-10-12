@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
 };
+use tokio::sync::watch;
 
 use input_event::{Event, KeyboardEvent};
 
@@ -80,16 +81,24 @@ pub struct InputEmulation {
 }
 
 impl InputEmulation {
-    async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
+    async fn with_backend(
+        backend: Backend,
+        permission_pending: &watch::Sender<bool>,
+    ) -> Result<InputEmulation, EmulationCreationError> {
+        // only the portals ask for permission
+        #[cfg(not(any(libei, rdp)))]
+        let _ = permission_pending;
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
             Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new()?),
             #[cfg(libei)]
-            Backend::Libei => Box::new(libei::LibeiEmulation::new().await?),
+            Backend::Libei => Box::new(libei::LibeiEmulation::new(permission_pending).await?),
             #[cfg(x11)]
             Backend::X11 => Box::new(x11::X11Emulation::new()?),
             #[cfg(rdp)]
-            Backend::Xdp => Box::new(xdg_desktop_portal::DesktopPortalEmulation::new().await?),
+            Backend::Xdp => {
+                Box::new(xdg_desktop_portal::DesktopPortalEmulation::new(permission_pending).await?)
+            }
             #[cfg(windows)]
             Backend::Windows => Box::new(windows::WindowsEmulation::new()?),
             #[cfg(target_os = "macos")]
@@ -103,9 +112,14 @@ impl InputEmulation {
         })
     }
 
-    pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
+    /// `permission_pending` is `true` while the backend waits for a
+    /// permission request (e.g. the portal dialog)
+    pub async fn new(
+        backend: Option<Backend>,
+        permission_pending: watch::Sender<bool>,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
-            let b = Self::with_backend(backend).await;
+            let b = Self::with_backend(backend, &permission_pending).await;
             if b.is_ok() {
                 log::info!("using emulation backend: {backend}");
             }
@@ -127,7 +141,7 @@ impl InputEmulation {
             Backend::MacOs,
             Backend::Dummy,
         ] {
-            match Self::with_backend(backend).await {
+            match Self::with_backend(backend, &permission_pending).await {
                 Ok(b) => {
                     log::info!("using emulation backend: {backend}");
                     return Ok(b);
@@ -243,6 +257,26 @@ impl InputEmulation {
             // currently not pressed => can press
             pressed_keys.insert(key)
         }
+    }
+}
+
+/// flags a permission request as pending while alive, also when the request
+/// is cancelled
+#[cfg(any(libei, rdp))]
+struct PermissionPending<'a>(&'a watch::Sender<bool>);
+
+#[cfg(any(libei, rdp))]
+impl<'a> PermissionPending<'a> {
+    fn new(pending: &'a watch::Sender<bool>) -> Self {
+        pending.send_replace(true);
+        Self(pending)
+    }
+}
+
+#[cfg(any(libei, rdp))]
+impl Drop for PermissionPending<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
     }
 }
 

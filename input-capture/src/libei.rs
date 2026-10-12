@@ -1,9 +1,9 @@
 use ashpd::{
     desktop::{
-        Session,
+        PersistMode, Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, Zones,
+            InputCapture, Region, ReleaseOptions, StartOptions, Zones,
         },
     },
     enumflags2::BitFlags,
@@ -18,9 +18,10 @@ use reis::{
 use std::{
     cell::Cell,
     collections::HashMap,
-    io,
+    env, fs, io,
     num::NonZeroU32,
     os::unix::net::UnixStream,
+    path::PathBuf,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -30,6 +31,7 @@ use tokio::{
     sync::{
         Notify,
         mpsc::{self, Receiver, Sender},
+        watch,
     },
     task::JoinHandle,
 };
@@ -174,16 +176,84 @@ async fn update_barriers(
     Ok((barriers, id_map))
 }
 
+fn capabilities() -> BitFlags<Capabilities> {
+    Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen
+}
+
+/// Creates a session. With InputCapture v2 the portal can remember the
+/// grant (restore token), so only the first session asks the user; v1
+/// (GNOME <= 50) asks for every session.
 async fn create_session(
     input_capture: &InputCapture,
-) -> std::result::Result<(Session<InputCapture>, BitFlags<Capabilities>), ashpd::Error> {
-    log::debug!("creating input capture session");
-    let create_session_options = CreateSessionOptions::default().set_capabilities(
-        Capabilities::Keyboard | Capabilities::Pointer | Capabilities::Touchscreen,
-    );
-    input_capture
-        .create_session(None, create_session_options)
-        .await
+    permission_pending: &watch::Sender<bool>,
+) -> std::result::Result<Session<InputCapture>, ashpd::Error> {
+    let version = input_capture.version();
+    log::debug!("creating input capture session (portal version {version})");
+    if version < 2 {
+        let options = CreateSessionOptions::default().set_capabilities(capabilities());
+        let _pending = Pending::new(permission_pending);
+        let (session, _) = input_capture.create_session(None, options).await?;
+        return Ok(session);
+    }
+
+    let session = input_capture.create_session2(Default::default()).await?;
+    let options = StartOptions::default()
+        .set_capabilities(capabilities())
+        .set_persist_mode(PersistMode::ExplicitlyRevoked)
+        .set_restore_token(read_token());
+    let response = {
+        let _pending = Pending::new(permission_pending);
+        input_capture
+            .start(&session, None, options)
+            .await?
+            .response()?
+    };
+    // a restore token is valid once; the portal hands out the next one
+    if let Some(token) = response.restore_token() {
+        if let Err(e) = write_token(token) {
+            log::warn!("failed to save input capture restore token: {e}");
+        }
+    }
+    Ok(session)
+}
+
+/// flags a permission request as pending while alive, also when the
+/// request is cancelled
+struct Pending<'a>(&'a watch::Sender<bool>);
+
+impl<'a> Pending<'a> {
+    fn new(pending: &'a watch::Sender<bool>) -> Self {
+        pending.send_replace(true);
+        Self(pending)
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
+/// next to the RemoteDesktop tokens of emulation and clipboard
+fn token_path() -> PathBuf {
+    let cache = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"));
+    cache.join("mimouse").join("input-capture.token")
+}
+
+fn read_token() -> Option<String> {
+    let token = fs::read_to_string(token_path()).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+fn write_token(token: &str) -> io::Result<()> {
+    let path = token_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, token)
 }
 
 async fn connect_to_eis(
@@ -227,10 +297,13 @@ async fn libei_event_handler(
 }
 
 impl LibeiInputCapture {
-    pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
+    pub async fn new(
+        permission_pending: watch::Sender<bool>,
+    ) -> std::result::Result<Self, LibeiCaptureCreationError> {
         let input_capture = Box::pin(InputCapture::new().await?);
         let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session = Some(create_session(unsafe { &*input_capture_ptr }).await?);
+        let first_session =
+            Some(create_session(unsafe { &*input_capture_ptr }, &permission_pending).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
@@ -245,6 +318,7 @@ impl LibeiInputCapture {
             first_session,
             event_tx,
             cancellation_token.clone(),
+            permission_pending,
         );
         let capture_task = tokio::task::spawn_local(capture);
 
@@ -266,12 +340,11 @@ async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
-    session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
+    mut session: Option<Session<InputCapture>>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
+    permission_pending: watch::Sender<bool>,
 ) -> Result<(), CaptureError> {
-    let mut session = session.map(|s| s.0);
-
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
     let mut active_clients: Vec<Position> = vec![];
@@ -314,7 +387,7 @@ async fn do_capture(
             // create session
             let mut session = match session.take() {
                 Some(s) => s,
-                None => create_session(input_capture).await?.0,
+                None => create_session(input_capture, &permission_pending).await?,
             };
 
             let capture_session = do_capture_session(

@@ -198,9 +198,13 @@ impl InputCapture {
         self.capture.terminate().await
     }
 
-    /// creates a new [`InputCapture`]
-    pub async fn new(backend: Option<Backend>) -> Result<Self, CaptureCreationError> {
-        let capture = create(backend).await?;
+    /// creates a new [`InputCapture`]; `permission_pending` is `true` while
+    /// the backend waits for a permission request (e.g. the portal dialog)
+    pub async fn new(
+        backend: Option<Backend>,
+        permission_pending: tokio::sync::watch::Sender<bool>,
+    ) -> Result<Self, CaptureCreationError> {
+        let capture = create(backend, permission_pending).await?;
         Ok(Self {
             capture,
             id_map: Default::default(),
@@ -302,13 +306,19 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
 async fn create_backend(
     backend: Backend,
+    permission_pending: tokio::sync::watch::Sender<bool>,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
+    // only the portal asks for permission per session
+    #[cfg(not(libei))]
+    drop(permission_pending);
     match backend {
         #[cfg(libei)]
-        Backend::InputCapturePortal => Ok(Box::new(libei::LibeiInputCapture::new().await?)),
+        Backend::InputCapturePortal => Ok(Box::new(
+            libei::LibeiInputCapture::new(permission_pending).await?,
+        )),
         #[cfg(layer_shell)]
         Backend::LayerShell => Ok(Box::new(layer_shell::LayerShellInputCapture::new()?)),
         #[cfg(x11)]
@@ -323,12 +333,13 @@ async fn create_backend(
 
 async fn create(
     backend: Option<Backend>,
+    permission_pending: tokio::sync::watch::Sender<bool>,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
-        let b = create_backend(backend).await;
+        let b = create_backend(backend, permission_pending).await;
         if b.is_ok() {
             log::info!("using capture backend: {backend}");
         }
@@ -347,7 +358,7 @@ async fn create(
         #[cfg(target_os = "macos")]
         Backend::MacOs,
     ] {
-        match create_backend(backend).await {
+        match create_backend(backend, permission_pending.clone()).await {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");
                 return Ok(b);

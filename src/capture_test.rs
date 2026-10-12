@@ -12,7 +12,8 @@ pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCapt
     log::info!("creating input capture");
     let backend = config.capture_backend().map(|b| b.into());
     loop {
-        let mut input_capture = InputCapture::new(backend).await?;
+        let (permission_pending, _) = tokio::sync::watch::channel(false);
+        let mut input_capture = InputCapture::new(backend, permission_pending).await?;
         log::info!("creating clients");
         input_capture.create(0, Position::Left).await?;
         input_capture.create(4, Position::Left).await?;

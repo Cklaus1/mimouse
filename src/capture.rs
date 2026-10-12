@@ -14,10 +14,14 @@ use input_event::{
     scancode::Linux::{self, KeyLeftCtrl, KeyRightCtrl},
 };
 use local_channel::mpsc::{Receiver, Sender, channel};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::{
+    sync::watch,
+    task::{JoinHandle, spawn_local},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    approval,
     config::ReleaseBind,
     connect::{ConnEvent, MiMouseConnection},
 };
@@ -46,6 +50,9 @@ pub(crate) enum ICaptureEvent {
     /// The capture of the entered client was released: control is back on
     /// this machine.
     Released,
+    /// the backend waits for the user to approve capturing input (or no
+    /// longer does)
+    AwaitingApproval(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +87,21 @@ impl Capture {
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (permission_pending, pending_rx) = watch::channel(false);
+        let approval_tx = event_tx.clone();
+        // ends with the capture task, which owns the sender
+        spawn_local(async move {
+            approval::forward(
+                pending_rx,
+                "input capture",
+                approval::GRACE,
+                approval::WARN_EVERY,
+                |waiting| {
+                    let _ = approval_tx.send(ICaptureEvent::AwaitingApproval(waiting));
+                },
+            )
+            .await
+        });
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
@@ -88,6 +110,7 @@ impl Capture {
             captures: Default::default(),
             conn,
             event_tx,
+            permission_pending,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             ctrl_taps: Default::default(),
@@ -173,6 +196,8 @@ struct CaptureTask {
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
+    /// `true` while the backend waits for a permission request
+    permission_pending: watch::Sender<bool>,
     release_bind: Rc<RefCell<ReleaseBind>>,
     ctrl_taps: CtrlDoubleTap,
     request_rx: Receiver<CaptureRequest>,
@@ -235,7 +260,7 @@ impl CaptureTask {
     async fn do_capture(&mut self) -> Result<(), InputCaptureError> {
         /* allow cancelling capture request */
         let mut capture = tokio::select! {
-            r = InputCapture::new(self.backend) => r?,
+            r = InputCapture::new(self.backend, self.permission_pending.clone()) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
@@ -468,9 +493,7 @@ fn leave_events(pressed: impl IntoIterator<Item = Linux>) -> Vec<ProtoEvent> {
         locked: 0,
         group: 0,
     }));
-    key_ups
-        .chain([mods_zero, ProtoEvent::Leave(0)])
-        .collect()
+    key_ups.chain([mods_zero, ProtoEvent::Leave(0)]).collect()
 }
 
 thread_local! {
@@ -702,9 +725,9 @@ mod tests {
         let mut released: Vec<u32> = events[..held.len()]
             .iter()
             .map(|e| match e {
-                ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state: 0, .. })) => {
-                    *key
-                }
+                ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    key, state: 0, ..
+                })) => *key,
                 e => panic!("expected a key-up, got {e}"),
             })
             .collect();
