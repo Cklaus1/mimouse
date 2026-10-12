@@ -43,6 +43,9 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// The capture of the entered client was released: control is back on
+    /// this machine.
+    Released,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +449,9 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+            self.event_tx
+                .send(ICaptureEvent::Released)
+                .expect("channel closed");
         }
         capture.release().await
     }

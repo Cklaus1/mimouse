@@ -59,6 +59,8 @@ struct ConfigToml {
     authorized_fingerprints: Option<HashMap<String, String>>,
     clipboard: Option<bool>,
     max_file_size: Option<u64>,
+    notify_switch: Option<bool>,
+    idle_inhibit: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -464,6 +466,23 @@ impl Config {
             .as_ref()
             .and_then(|c| c.max_file_size)
             .unwrap_or(DEFAULT_MAX_FILE_SIZE)
+    }
+
+    /// whether a notification announces each switch of control (default: enabled)
+    pub fn notify_switch(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.notify_switch)
+            .unwrap_or(true)
+    }
+
+    /// whether idle/lock is inhibited while this machine controls another one
+    /// (default: enabled)
+    pub fn idle_inhibit(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.idle_inhibit)
+            .unwrap_or(true)
     }
 
     /// path to certificate

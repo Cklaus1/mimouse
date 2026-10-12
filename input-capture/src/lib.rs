@@ -35,6 +35,11 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+/// `dwExtraInfo` of the zero-length mouse move that mimouse injects on
+/// Windows every 30 s while capturing, to reset the idle timer. The capture
+/// hook passes these moves through instead of swallowing them.
+pub const IDLE_KEEPALIVE_TAG: usize = 0x4D69_4D6F; // "MiMo"
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
