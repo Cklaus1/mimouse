@@ -482,15 +482,27 @@ impl Service {
                 }
                 continue;
             };
+            let before = self.connection_target(h);
             self.client_manager
                 .set_fix_ips(h, c.ips.into_iter().collect());
             if self.client_manager.set_hostname(h, c.hostname) {
                 self.resolve(h);
             }
             self.client_manager.set_port(h, c.port);
+            self.reconnect_if_moved(h, before);
             self.client_manager.set_enter_hook(h, c.enter_hook);
             self.broadcast_client(h);
         }
+    }
+
+    /// the configured fields a connection to `handle` is dialed from
+    fn connection_target(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<(Vec<IpAddr>, Option<String>, u16)> {
+        self.client_manager
+            .get_state(handle)
+            .map(|(c, _)| (c.fix_ips, c.hostname, c.port))
     }
 
     /// re-creates every client, and with them the capture barriers
@@ -923,7 +935,9 @@ impl Service {
     }
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
+        let before = self.connection_target(handle);
         self.client_manager.set_fix_ips(handle, fix_ips);
+        self.reconnect_if_moved(handle, before);
         self.broadcast_client(handle);
     }
 
@@ -931,13 +945,27 @@ impl Service {
         log::info!("hostname changed: {hostname:?}");
         if self.client_manager.set_hostname(handle, hostname.clone()) {
             self.resolve(handle);
+            self.connector.reconnect(handle);
         }
         self.broadcast_client(handle);
     }
 
     fn update_port(&mut self, handle: ClientHandle, port: u16) {
+        let before = self.connection_target(handle);
         self.client_manager.set_port(handle, port);
+        self.reconnect_if_moved(handle, before);
         self.broadcast_client(handle);
+    }
+
+    /// the open connection still goes to the old address
+    fn reconnect_if_moved(
+        &self,
+        handle: ClientHandle,
+        before: Option<(Vec<IpAddr>, Option<String>, u16)>,
+    ) {
+        if self.connection_target(handle) != before {
+            self.connector.reconnect(handle);
+        }
     }
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {

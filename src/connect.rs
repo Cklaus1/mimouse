@@ -109,7 +109,8 @@ pub(crate) enum ConnEvent {
 pub(crate) struct Connector {
     cert: Certificate,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, ArcConn>>>,
+    /// open connections by peer address, with the client each belongs to
+    conns: Rc<Mutex<HashMap<SocketAddr, (ClientHandle, ArcConn)>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_tx: Sender<(ClientHandle, ConnEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
@@ -159,7 +160,10 @@ impl MiMouseConnection {
         if let Some(addr) = c.client_manager.active_addr(handle) {
             let conn = {
                 let conns = c.conns.lock().await;
-                conns.get(&addr).cloned()
+                conns
+                    .get(&addr)
+                    .filter(|(owner, _)| *owner == handle)
+                    .map(|(_, conn)| conn.clone())
             };
             if let Some(conn) = conn {
                 if !c.client_manager.alive(handle) {
@@ -220,11 +224,32 @@ impl Connector {
         spawn_local(self.clone().reconnect_loop(handle, token));
     }
 
-    /// stops reconnecting to `handle`; an open connection stays open
+    /// stops reconnecting to `handle` and closes its connection
     pub(crate) fn stop(&self, handle: ClientHandle) {
         if let Some(token) = self.keepers.borrow_mut().remove(&handle) {
             token.cancel();
         }
+        self.reconnect(handle);
+    }
+
+    /// closes the connection of `handle`, e.g. after its addresses changed;
+    /// the reconnect loop then dials the current addresses
+    pub(crate) fn reconnect(&self, handle: ClientHandle) {
+        let this = self.clone();
+        spawn_local(async move {
+            let owned: Vec<_> = this
+                .conns
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, (owner, _))| *owner == handle)
+                .map(|(addr, (_, conn))| (*addr, conn.clone()))
+                .collect();
+            for (addr, conn) in owned {
+                this.disconnect(handle, addr, &conn).await;
+                let _ = conn.close().await;
+            }
+        });
     }
 
     async fn reconnect_loop(self, handle: ClientHandle, token: CancellationToken) {
@@ -264,7 +289,12 @@ impl Connector {
 
     async fn is_connected(&self, handle: ClientHandle) -> bool {
         match self.client_manager.active_addr(handle) {
-            Some(addr) => self.conns.lock().await.contains_key(&addr),
+            Some(addr) => self
+                .conns
+                .lock()
+                .await
+                .get(&addr)
+                .is_some_and(|(owner, _)| *owner == handle),
             None => false,
         }
     }
@@ -297,10 +327,20 @@ impl Connector {
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
         let (conn, addr) = connect_any(&addrs, self.cert.clone()).await?;
+        // the client may have been removed or moved while connecting
+        let current = self
+            .client_manager
+            .get_ips(handle)
+            .is_some_and(|ips| ips.contains(&addr.ip()))
+            && self.client_manager.get_port(handle) == Some(addr.port());
+        if !current {
+            let _ = conn.close().await;
+            return Err(MiMouseConnectionError::NotConnected);
+        }
         log::info!("client ({handle}) connected @ {addr}");
         self.client_manager.set_active_addr(handle, Some(addr));
-        let replaced = self.conns.lock().await.insert(addr, conn.clone());
-        if let Some(replaced) = replaced {
+        let replaced = self.conns.lock().await.insert(addr, (handle, conn.clone()));
+        if let Some((_, replaced)) = replaced {
             // e.g. the client was re-added on a config reload; its old
             // connection task ends once the closed connection fails
             let _ = replaced.close().await;
@@ -331,6 +371,17 @@ impl Connector {
             };
             if let Ok(event) = ProtoEvent::decode(&buf[..n]) {
                 log::trace!("{addr} <==<==<== {event}");
+                // a connection closed by `stop` or replaced must not speak
+                // for `handle`, which may belong to another client by now
+                let current = self
+                    .conns
+                    .lock()
+                    .await
+                    .get(&addr)
+                    .is_some_and(|(owner, c)| *owner == handle && Arc::ptr_eq(c, conn));
+                if !current {
+                    return;
+                }
                 match event {
                     ProtoEvent::Pong(b) => {
                         self.client_manager.set_active_addr(handle, Some(addr));
@@ -350,7 +401,7 @@ impl Connector {
     async fn disconnect(&self, handle: ClientHandle, addr: SocketAddr, conn: &ArcConn) {
         let active: Vec<SocketAddr> = {
             let mut conns = self.conns.lock().await;
-            if !conns.get(&addr).is_some_and(|c| Arc::ptr_eq(c, conn)) {
+            if !conns.get(&addr).is_some_and(|(_, c)| Arc::ptr_eq(c, conn)) {
                 return;
             }
             conns.remove(&addr);
@@ -542,6 +593,32 @@ mod tests {
                     "{:?}",
                     start.elapsed()
                 );
+            })
+            .await;
+    }
+
+    /// `stop` closes the connection and reports it, instead of leaving it
+    /// open for a handle that may be reused
+    #[tokio::test]
+    async fn stop_closes_the_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, client_manager, handle) = peer(&cert).await;
+                let mut conn = MiMouseConnection::new(cert, client_manager.clone());
+                let connector = conn.connector();
+                connector.keep_connected(handle);
+                accepted(&mut listener).await;
+                while !connector.is_connected(handle).await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let start = Instant::now();
+                connector.stop(handle);
+                assert_eq!(closed(&mut conn).await, handle);
+                assert!(start.elapsed() < Duration::from_secs(2));
+                assert!(!connector.is_connected(handle).await);
+                assert_eq!(client_manager.active_addr(handle), None);
+                listener.terminate().await;
             })
             .await;
     }
