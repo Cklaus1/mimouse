@@ -584,16 +584,16 @@ impl Config {
             .and_then(|c| c.local_hotkey.clone())
     }
 
-    /// set configured clients
+    /// set configured clients; an empty list drops the `[[clients]]` section
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
+        let clients = (!clients.is_empty())
+            .then(|| clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        if clients.is_none() && self.config_toml.is_none() {
             return;
         }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clients = clients;
     }
 
     /// set authorized keys
