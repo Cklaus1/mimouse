@@ -480,9 +480,9 @@ fn create_event_tap<'a>(
             // notify the producer loop so the service can tear
             // down cleanly.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
+            if let Some(pos) = state.current_pos.take() {
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
+                let _ = event_tx.blocking_send((pos, CaptureEvent::End));
             }
             notify_tx
                 .blocking_send(ProducerEvent::EventTapDisabled)

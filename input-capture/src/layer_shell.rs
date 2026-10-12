@@ -765,6 +765,10 @@ impl Dispatch<WlPointer, ()> for State {
                  */
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
+                    if let Some(window) = app.focused.as_ref() {
+                        let pos = window.pos;
+                        app.pending_events.push_back((pos, CaptureEvent::End));
+                    }
                 }
                 app.ungrab();
             }

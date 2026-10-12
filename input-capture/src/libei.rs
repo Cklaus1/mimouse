@@ -57,6 +57,21 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
+/// why an activated capture ended
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// MiMouse released it
+    Released,
+    /// EI devices changed; the session has to be recreated
+    DevicesChanged,
+    /// the compositor deactivated the capture (e.g. the user pressed Super)
+    Deactivated,
+    /// the compositor disabled the session
+    Disabled,
+    /// barriers are being updated or capture is terminating
+    Cancelled,
+}
+
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
@@ -398,7 +413,8 @@ async fn do_capture_session(
     let capture_session_task = async {
         // receiver for activation tokens
         let mut activated = input_capture.receive_activated().await?;
-        let mut ei_devices_changed = false;
+        let mut deactivated = input_capture.receive_deactivated().await?;
+        let mut disabled = input_capture.receive_disabled().await?;
         loop {
             tokio::select! {
                 activated = activated.next() => {
@@ -419,40 +435,55 @@ async fn do_capture_session(
                     // client entered => send event
                     event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
 
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
-                            log::debug!("release session requested");
-                        },
-                        _ = release_session.notified() => { /* release session */
-                            log::debug!("ei devices changed");
-                            ei_devices_changed = true;
-                        },
-                        _ = cancel_session.cancelled() => { /* kill session notify */
-                            log::debug!("session cancel requested");
-                            break
-                        },
+                    let end = loop {
+                        tokio::select! {
+                            _ = notify_release.notified() => break SessionEnd::Released,
+                            _ = release_session.notified() => break SessionEnd::DevicesChanged,
+                            Some(d) = deactivated.next() => {
+                                // a late signal for an earlier activation is not ours
+                                if d.activation_id().is_none() || d.activation_id() == activated.activation_id() {
+                                    break SessionEnd::Deactivated;
+                                }
+                            }
+                            Some(_) = disabled.next() => break SessionEnd::Disabled,
+                            _ = cancel_session.cancelled() => break SessionEnd::Cancelled,
+                        }
+                    };
+                    log::debug!("capture ended: {end:?}");
+                    current_pos.replace(None);
+                    if end != SessionEnd::Released {
+                        // the remote side must get its key-ups, so capture is told
+                        event_tx.send((pos, CaptureEvent::End)).await.expect("no channel");
                     }
-
-                    release_capture(input_capture, session, activated, pos).await?;
-
+                    match end {
+                        SessionEnd::Released => release_capture(input_capture, session, activated, pos).await?,
+                        SessionEnd::Deactivated => {}
+                        SessionEnd::DevicesChanged => {
+                            release_capture(input_capture, session, activated, pos).await?;
+                            /* for whatever reason, GNOME seems to kill the session
+                             * as soon as devices are added or removed, so we need
+                             * to cancel */
+                            break;
+                        }
+                        SessionEnd::Disabled | SessionEnd::Cancelled => break,
+                    }
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
                 },
                 _ = release_session.notified() => { /* release session */
                     log::debug!("ei devices changed");
-                    ei_devices_changed = true;
+                    break;
+                },
+                Some(_) = deactivated.next() => { /* signal for an activation we already released */ },
+                Some(_) = disabled.next() => {
+                    log::info!("input capture session disabled by the compositor, recreating it");
+                    break;
                 },
                 _ = cancel_session.cancelled() => { /* kill session notify */
                     log::debug!("session cancel requested");
                     break
                 },
-            }
-            if ei_devices_changed {
-                /* for whatever reason, GNOME seems to kill the session
-                 * as soon as devices are added or removed, so we need
-                 * to cancel */
-                break;
             }
         }
         // cancel libei task

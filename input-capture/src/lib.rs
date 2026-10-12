@@ -41,6 +41,9 @@ pub enum CaptureEvent {
     Begin,
     /// input event coming from capture handle
     Input(Event),
+    /// the compositor or OS ended an active capture without a release
+    /// request (e.g. GNOME deactivated the session)
+    End,
 }
 
 impl Display for CaptureEvent {
@@ -48,6 +51,7 @@ impl Display for CaptureEvent {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
+            CaptureEvent::End => write!(f, "capture ended"),
         }
     }
 }
