@@ -120,6 +120,7 @@ impl Service {
         let clipboard = Clipboard::new(
             config.clipboard(),
             config.port(),
+            config.max_file_size(),
             &cert,
             authorized_keys.clone(),
             client_manager.clone(),

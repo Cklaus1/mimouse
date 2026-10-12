@@ -1,8 +1,9 @@
 //! Windows clipboard backend.
 //!
 //! A monitor thread receives `WM_CLIPBOARDUPDATE` and reads text
-//! (`CF_UNICODETEXT`), HTML (`HTML Format`) and images (`PNG`, falling back to
-//! `CF_BITMAP` converted to PNG). A writer thread sets remote contents.
+//! (`CF_UNICODETEXT`), HTML (`HTML Format`), images (`PNG`, falling back to
+//! `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`). A writer
+//! thread sets remote contents.
 //! Our own writes are recognized by their clipboard sequence number.
 
 use std::{
@@ -14,14 +15,17 @@ use std::{
 
 use clipboard_win::{
     Clipboard, Getter, Monitor, SysResult,
-    formats::{CF_DIB, CF_UNICODETEXT, Html, RawData, Unicode},
+    formats::{CF_DIB, CF_HDROP, CF_UNICODETEXT, FileList, Html, RawData, Unicode},
     options::NoClear,
     raw,
 };
 use image::ImageFormat;
 use tokio::sync::mpsc;
 
-use super::{BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT};
+use super::{
+    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT,
+    files::local_files,
+};
 
 const OPEN_ATTEMPTS: usize = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -107,6 +111,7 @@ fn read_settled() -> SysResult<ClipboardData> {
 fn read() -> SysResult<ClipboardData> {
     let mut data = ClipboardData::default();
     let mut bitmap = None;
+    let mut paths: Vec<String> = Vec::new();
     {
         let _clipboard = open()?;
         if raw::is_format_avail(CF_UNICODETEXT) {
@@ -132,6 +137,9 @@ fn read() -> SysResult<ClipboardData> {
             RawData(CF_DIB).read_clipboard(&mut dib)?;
             bitmap = dib_to_bmp(dib);
         }
+        if raw::is_format_avail(CF_HDROP) {
+            FileList.read_clipboard(&mut paths)?;
+        }
     }
     if let Some(bmp) = bitmap {
         match convert(&bmp, ImageFormat::Bmp, ImageFormat::Png) {
@@ -143,6 +151,8 @@ fn read() -> SysResult<ClipboardData> {
         log::warn!("clipboard: contents too large ({} bytes)", data.size());
         return Ok(ClipboardData::default());
     }
+    // stat outside the clipboard lock: paths may be on slow network shares
+    data.set_files(local_files(paths.into_iter().map(Into::into).collect()));
     Ok(data)
 }
 
@@ -160,6 +170,17 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
                 }
             },
         );
+        let files: Vec<&str> = data
+            .files()
+            .iter()
+            .filter_map(|f| {
+                let path = f.path.to_str();
+                if path.is_none() {
+                    log::warn!("clipboard: cannot offer {}", f.path.display());
+                }
+                path
+            })
+            .collect();
 
         let mut seq = own_seq.lock().expect("lock");
         let result = (|| -> SysResult<()> {
@@ -176,6 +197,9 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
             }
             if let Some(bmp) = &bmp {
                 raw::set_bitmap_with(bmp, NoClear)?;
+            }
+            if !files.is_empty() {
+                raw::set_file_list_with(&files, NoClear)?;
             }
             Ok(())
         })();
