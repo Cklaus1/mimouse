@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+
+PackageIdentifier: Cklaus1.MiMouse
+PackageVersion: 0.11.0
+PackageLocale: en-US
+Publisher: Cklaus1
+PublisherUrl: https://github.com/Cklaus1
+PublisherSupportUrl: https://github.com/Cklaus1/mimouse/issues
+PackageName: MiMouse
+PackageUrl: https://github.com/Cklaus1/mimouse
+License: GPL-3.0-or-later
+LicenseUrl: https://github.com/Cklaus1/mimouse/blob/main/LICENSE
+ShortDescription: Software KVM switch - share one mouse and keyboard between computers on a LAN
+Description: |-
+  MiMouse shares one mouse and keyboard between Linux, Windows and macOS machines over the local network.
+  A single background binary runs the service (mimouse daemon); mimouse cli controls it.
+  Fork of Lan Mouse; interoperates with Lan Mouse 0.11.
+Moniker: mimouse
+Tags:
+- kvm
+- keyboard
+- mouse
+- input-sharing
+- clipboard
+ReleaseNotesUrl: https://github.com/Cklaus1/mimouse/releases/tag/v0.11.0
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

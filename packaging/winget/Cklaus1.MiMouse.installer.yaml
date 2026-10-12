@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+
+PackageIdentifier: Cklaus1.MiMouse
+PackageVersion: 0.11.0
+InstallerType: portable
+Commands:
+- mimouse
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/Cklaus1/mimouse/releases/download/v0.11.0/mimouse-windows-x86_64.exe
+  InstallerSha256: '@SHA256_WINDOWS_X86_64@'
+ManifestType: installer
+ManifestVersion: 1.10.0
