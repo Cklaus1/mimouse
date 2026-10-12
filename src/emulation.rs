@@ -426,7 +426,11 @@ impl EmulationTask {
                     },
                     ProxyRequest::EnterAt(addr, edge, fraction) => {
                         let handle = self.handle(emulation, addr).await;
-                        emulation.enter_at(handle, edge, fraction)?;
+                        // placement is best effort: the motion that follows
+                        // still works from wherever the cursor is
+                        if let Err(e) = emulation.enter_at(handle, edge, fraction) {
+                            log::warn!("could not place the cursor for {addr}: {e}");
+                        }
                     }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
