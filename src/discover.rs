@@ -335,7 +335,12 @@ mod tests {
             ]
         );
         // relayed peers have no direct path
-        assert!(peers.iter().filter(|p| p.name != "megapc").all(|p| p.lan.is_none()));
+        assert!(
+            peers
+                .iter()
+                .filter(|p| p.name != "megapc")
+                .all(|p| p.lan.is_none())
+        );
     }
 
     #[test]
@@ -399,14 +404,15 @@ mod tests {
         let megapc = peers.iter().find(|p| p.name == "megapc").unwrap();
         let lan = megapc.lan.unwrap();
         // WSL on megapc (mirrored networking) reports the host's LAN path
-        let mut wsl = peers.iter().find(|p| p.name == "wsl-chris").unwrap().clone();
+        let mut wsl = peers
+            .iter()
+            .find(|p| p.name == "wsl-chris")
+            .unwrap()
+            .clone();
         wsl.lan = Some(lan);
         let ts = megapc.tailscale_ips[0];
 
-        let found = select(
-            vec![probed(megapc, &[lan, ts]), probed(&wsl, &[lan])],
-            4242,
-        );
+        let found = select(vec![probed(megapc, &[lan, ts]), probed(&wsl, &[lan])], 4242);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].peer.name, "megapc");
         assert_eq!(found[0].address, lan);
