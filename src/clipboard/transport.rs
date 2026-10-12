@@ -6,6 +6,9 @@
 //!
 //! One connection carries one update: the client sends a frame
 //! (`len: u32 BE | payload`), the server answers with a single ack byte.
+//!
+//! Pairing connections (`crate::pair`) arrive on the same listener and are
+//! told apart by their ALPN protocol before the handshake completes.
 
 use std::{
     collections::HashMap,
@@ -31,11 +34,11 @@ use tokio::{
     task::{JoinHandle, spawn_local},
     time::timeout,
 };
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::{LazyConfigAcceptor, StartHandshake, TlsAcceptor, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
 
 use super::{ClipboardData, MAX_CLIPBOARD_SIZE, wire};
-use crate::crypto;
+use crate::{crypto, pair};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -255,11 +258,14 @@ async fn send_to(tls: &Tls, addr: SocketAddr, payload: &[u8]) -> Result<(), Tran
     .await?
 }
 
-/// accept clipboard updates on `port`; received updates are forwarded to `tx`
+/// Accept TLS connections on `port`: pairing requests (by ALPN) go to
+/// `pair_tx`, clipboard updates to `tx`; without `tx` (clipboard sharing
+/// off) only pairing is served.
 pub(crate) fn listen(
     port: u16,
     tls: Rc<Tls>,
-    tx: mpsc::UnboundedSender<(Arc<ClipboardData>, IpAddr)>,
+    tx: Option<mpsc::UnboundedSender<(Arc<ClipboardData>, IpAddr)>>,
+    pair_tx: mpsc::UnboundedSender<pair::Incoming>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
@@ -267,7 +273,10 @@ pub(crate) fn listen(
             Ok(l) => l,
             Err(e) => return log::warn!("clipboard: could not listen on tcp {addr}: {e}"),
         };
-        log::info!("clipboard: listening on tcp {addr}");
+        match tx {
+            Some(_) => log::info!("clipboard: listening on tcp {addr}"),
+            None => log::info!("listening on tcp {addr} for pairing"),
+        }
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(c) => c,
@@ -278,8 +287,21 @@ pub(crate) fn listen(
             };
             let tls = tls.clone();
             let tx = tx.clone();
+            let pair_tx = pair_tx.clone();
             spawn_local(async move {
-                match receive(&tls, stream).await {
+                let start = match client_hello(stream).await {
+                    Ok(start) => start,
+                    // also reachability probes (`cli discover`, `cli doctor`)
+                    Err(e) => return log::debug!("tcp {peer}: {e}"),
+                };
+                if pair::is_pairing(&start) {
+                    let _ = pair_tx.send((start, peer));
+                    return;
+                }
+                let Some(tx) = tx else {
+                    return log::debug!("tcp {peer}: clipboard sharing is disabled");
+                };
+                match receive(&tls, start).await {
                     Ok((data, from)) => {
                         log::info!(
                             "clipboard received from {from} ({} bytes: {})",
@@ -295,9 +317,18 @@ pub(crate) fn listen(
     })
 }
 
-async fn receive(tls: &Tls, stream: TcpStream) -> Result<(ClipboardData, String), TransportError> {
+async fn client_hello(stream: TcpStream) -> Result<StartHandshake<TcpStream>, TransportError> {
     stream.set_nodelay(true)?;
-    let mut stream = timeout(HANDSHAKE_TIMEOUT, tls.acceptor.accept(stream)).await??;
+    let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+    Ok(timeout(HANDSHAKE_TIMEOUT, acceptor).await??)
+}
+
+async fn receive(
+    tls: &Tls,
+    start: StartHandshake<TcpStream>,
+) -> Result<(ClipboardData, String), TransportError> {
+    let config = tls.acceptor.config().clone();
+    let mut stream = timeout(HANDSHAKE_TIMEOUT, start.into_stream(config)).await??;
     let from = tls.describe(
         stream
             .get_ref()

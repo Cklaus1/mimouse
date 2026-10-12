@@ -16,5 +16,6 @@ pub mod ipc;
 mod listen;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
+mod pair;
 mod proto;
 pub mod service;

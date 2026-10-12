@@ -13,6 +13,7 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{ListenerCreationError, MiMouseListener},
+    pair::{self, PairEvent, Pairing},
 };
 use hickory_resolver::ResolveError;
 use log;
@@ -21,6 +22,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -77,6 +79,8 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// pairing with other machines (`mimouse cli pair`)
+    pairing: Pairing,
 }
 
 #[derive(Debug)]
@@ -117,12 +121,14 @@ impl Service {
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 
+        let (pairing, pair_tx) = Pairing::new(&cert).map_err(io::Error::other)?;
         let clipboard = Clipboard::new(
             config.clipboard(),
             config.port(),
             &cert,
             authorized_keys.clone(),
             client_manager.clone(),
+            pair_tx,
         );
 
         // create dns resolver
@@ -150,6 +156,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            pairing,
         };
         Ok(service)
     }
@@ -175,6 +182,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.pairing.event() => self.handle_pair_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -317,6 +325,33 @@ impl Service {
                 self.save_config()?;
                 Reply::Done
             }
+            FrontendRequest::Pair {
+                host,
+                ips,
+                port,
+                position,
+            } => {
+                let target = pair::Target {
+                    host,
+                    ips,
+                    port,
+                    position,
+                };
+                self.pairing.start(target, self.port)?;
+                Reply::Done
+            }
+            FrontendRequest::PairAccept { timeout } => {
+                self.pairing.accept(Duration::from_secs(timeout))?;
+                Reply::Done
+            }
+            FrontendRequest::PairConfirm { code } => {
+                self.pairing.confirm(&code)?;
+                Reply::Done
+            }
+            FrontendRequest::PairCancel => {
+                self.pairing.cancel()?;
+                Reply::Done
+            }
         };
         Ok(reply)
     }
@@ -413,6 +448,81 @@ impl Service {
             mime: event.mime,
             size: event.size,
         });
+    }
+
+    fn handle_pair_event(&mut self, event: PairEvent) {
+        let event = match event {
+            PairEvent::Code {
+                code,
+                peer,
+                fingerprint,
+                position,
+            } => {
+                log::info!("pairing with {peer}: waiting for both users to confirm the code");
+                FrontendEvent::PairCode {
+                    code,
+                    peer,
+                    fingerprint,
+                    position,
+                }
+            }
+            PairEvent::Trusted(trusted) => match self.paired(trusted) {
+                Ok(event) => event,
+                Err(reason) => FrontendEvent::PairFailed { reason },
+            },
+            PairEvent::Failed(reason) => {
+                log::warn!("pairing failed: {reason}");
+                FrontendEvent::PairFailed { reason }
+            }
+        };
+        self.notify_frontend(event);
+    }
+
+    /// trust a paired machine and configure it as a client, reusing a client
+    /// with the same host name or address
+    fn paired(&mut self, peer: pair::Trusted) -> Result<FrontendEvent, String> {
+        log::info!(
+            "paired with {} ({}), fingerprint {}",
+            peer.name,
+            peer.position,
+            peer.fingerprint
+        );
+        self.add_authorized_key(peer.name.clone(), peer.fingerprint.clone());
+        let existing = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .find(|(_, config, _)| {
+                let same_host = matches!(
+                    (&config.hostname, &peer.hostname),
+                    (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
+                );
+                same_host || config.fix_ips.iter().any(|ip| peer.ips.contains(ip))
+            })
+            .map(|(handle, _, _)| handle);
+        let handle = existing.unwrap_or_else(|| self.add_client());
+        // the address pairing used first, then previously known ones
+        let known = self
+            .client_manager
+            .get_state(handle)
+            .map(|(config, _)| config.fix_ips)
+            .unwrap_or_default();
+        let mut ips = peer.ips;
+        let known: Vec<IpAddr> = known.into_iter().filter(|ip| !ips.contains(ip)).collect();
+        ips.extend(known);
+        if peer.hostname.is_some() {
+            self.update_hostname(handle, peer.hostname);
+        }
+        self.update_port(handle, peer.port);
+        self.update_fix_ips(handle, ips);
+        self.update_pos(handle, peer.position);
+        self.activate_client(handle);
+        self.save_config()?;
+        Ok(FrontendEvent::Paired {
+            id: handle,
+            peer: peer.name,
+            fingerprint: peer.fingerprint,
+        })
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {

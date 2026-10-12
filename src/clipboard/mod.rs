@@ -30,7 +30,7 @@ use tokio::{
 };
 use webrtc_dtls::crypto::Certificate;
 
-use crate::client::ClientManager;
+use crate::{client::ClientManager, pair};
 
 // mime types and accessors below are used by the platform backends only;
 // macOS has no clipboard backend yet
@@ -129,30 +129,36 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
+    /// Clipboard sharing over TLS. The TLS listener also serves pairing
+    /// requests (to `pair_tx`), so it runs even with sharing disabled.
     pub(crate) fn new(
         enabled: bool,
         port: u16,
         cert: &Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         client_manager: ClientManager,
+        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
     ) -> Self {
-        let disabled = Self {
-            request_tx: None,
-            event_rx: None,
-            task: None,
-        };
-        if !enabled {
-            log::info!("clipboard sharing disabled (set `clipboard = true` to enable)");
-            return disabled;
-        }
         let tls = match transport::Tls::new(cert, authorized_keys) {
             Ok(tls) => Rc::new(tls),
             Err(e) => {
-                log::warn!("clipboard sharing unavailable: {e}");
-                return disabled;
+                log::warn!("clipboard sharing and pairing unavailable: {e}");
+                return Self {
+                    request_tx: None,
+                    event_rx: None,
+                    task: None,
+                };
             }
         };
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        if !enabled {
+            log::info!("clipboard sharing disabled (set `clipboard = true` to enable)");
+            return Self {
+                request_tx: Some(request_tx),
+                event_rx: None,
+                task: Some(spawn_local(listen_only(port, tls, pair_tx, request_rx))),
+            };
+        }
         let (delivered_tx, delivered_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let task = ClipboardTask {
@@ -164,7 +170,7 @@ impl Clipboard {
             delivered_tx,
             event_tx,
         };
-        let task = spawn_local(task.run(port, request_rx, delivered_rx));
+        let task = spawn_local(task.run(port, request_rx, delivered_rx, pair_tx));
         Self {
             request_tx: Some(request_tx),
             event_rx: Some(event_rx),
@@ -235,20 +241,51 @@ struct ClipboardTask {
     event_tx: mpsc::UnboundedSender<ClipboardEvent>,
 }
 
+/// serve only pairing on the TLS port, following port changes
+async fn listen_only(
+    mut port: u16,
+    tls: Rc<transport::Tls>,
+    pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+    mut requests: mpsc::UnboundedReceiver<Request>,
+) {
+    let mut listener = transport::listen(port, tls.clone(), None, pair_tx.clone());
+    while let Some(request) = requests.recv().await {
+        match request {
+            Request::PortChanged(p) if p != port => {
+                port = p;
+                listener.abort();
+                listener = transport::listen(port, tls.clone(), None, pair_tx.clone());
+            }
+            Request::PortChanged(_) | Request::ClientEntered(_) => {}
+        }
+    }
+    listener.abort();
+}
+
 impl ClipboardTask {
     async fn run(
         mut self,
         mut port: u16,
         mut requests: mpsc::UnboundedReceiver<Request>,
         mut delivered_rx: mpsc::UnboundedReceiver<Delivered>,
+        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
     ) {
         let (local_tx, mut local_rx) = mpsc::unbounded_channel();
         let Some(backend) = spawn_backend(local_tx) else {
             log::warn!("clipboard sharing is not supported on this platform");
-            return;
+            return listen_only(port, self.tls, pair_tx, requests).await;
         };
         let (received_tx, mut received_rx) = mpsc::unbounded_channel();
-        let mut listener = transport::listen(port, self.tls.clone(), received_tx.clone());
+        let tls = self.tls.clone();
+        let listen = |port| {
+            transport::listen(
+                port,
+                tls.clone(),
+                Some(received_tx.clone()),
+                pair_tx.clone(),
+            )
+        };
+        let mut listener = listen(port);
 
         loop {
             tokio::select! {
@@ -258,7 +295,7 @@ impl ClipboardTask {
                     Some(Request::PortChanged(p)) if p != port => {
                         port = p;
                         listener.abort();
-                        listener = transport::listen(port, self.tls.clone(), received_tx.clone());
+                        listener = listen(port);
                     }
                     Some(Request::PortChanged(_)) => {}
                 },

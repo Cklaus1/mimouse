@@ -277,6 +277,36 @@ pub async fn discover(config: &Config, port: u16) -> Result<Vec<Discovered>, Dis
     Ok(select(probe(config, peers, port).await, port))
 }
 
+/// candidate addresses of the online tailnet machine called `name`, preferred
+/// first; empty without Tailscale or such a machine. LAN addresses several
+/// peers claim are left out (see `select`): without probing, they may lead to
+/// another machine.
+pub async fn addresses(config: &Config, name: &str) -> Vec<IpAddr> {
+    let Ok(status) = tailscale_status().await else {
+        return vec![];
+    };
+    let Ok(peers) = parse_status(&status) else {
+        return vec![];
+    };
+    let candidates: Vec<Vec<IpAddr>> = peers
+        .iter()
+        .map(|p| p.candidates(&known_addrs(config, p)))
+        .collect();
+    let mut claims = HashMap::<IpAddr, usize>::new();
+    for ip in candidates.iter().flatten().filter(|ip| is_lan(ip)) {
+        *claims.entry(*ip).or_default() += 1;
+    }
+    let Some(mut addrs) = peers
+        .iter()
+        .zip(candidates)
+        .find_map(|(p, c)| p.matches(name).then_some(c))
+    else {
+        return vec![];
+    };
+    addrs.retain(|ip| claims.get(ip).is_none_or(|n| *n == 1));
+    addrs
+}
+
 /// `mimouse cli discover`
 pub async fn run(config: &Config, port: Option<u16>, json: bool) -> Result<(), DiscoverError> {
     let port = port.unwrap_or(config.port());

@@ -256,6 +256,24 @@ pub enum FrontendEvent {
         mime: Vec<String>,
         size: usize,
     },
+    /// a pairing reached the code comparison: compare `code` with the one
+    /// the other machine shows, then confirm or cancel
+    PairCode {
+        code: String,
+        /// host name the peer reported, or its address
+        peer: String,
+        fingerprint: String,
+        /// where the peer will be placed relative to this machine
+        position: Position,
+    },
+    /// both sides confirmed: the peer is trusted and configured as client `id`
+    Paired {
+        id: ClientHandle,
+        peer: String,
+        fingerprint: String,
+    },
+    /// the pairing ended without trusting anyone
+    PairFailed { reason: String },
 }
 
 /// successful result of a request
@@ -330,6 +348,24 @@ pub enum FrontendRequest {
         fingerprint: String,
     },
     SaveConfig,
+    /// pair with the machine at `host` (running `pair --accept`), placing it
+    /// at `position`; `ips` are tried before resolving `host`
+    Pair {
+        host: String,
+        ips: Vec<IpAddr>,
+        port: u16,
+        position: Position,
+    },
+    /// accept one pairing request during the next `timeout` seconds
+    PairAccept {
+        timeout: u64,
+    },
+    /// the user compared the pairing code and it matches
+    PairConfirm {
+        code: String,
+    },
+    /// abort the current pairing
+    PairCancel,
 }
 
 impl FrontendRequest {

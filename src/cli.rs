@@ -1,15 +1,17 @@
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use std::{net::IpAddr, time::Duration};
+use std::{io::BufRead, net::IpAddr, time::Duration};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
     discover::{self, DiscoverError},
     doctor,
     ipc::{
-        AsyncFrontendEventReader, ClientHandle, ClientInfo, ClipboardDirection, ConnectionError,
-        DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, connect_async,
+        AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ClientInfo,
+        ClipboardDirection, ConnectionError, DEFAULT_PORT, FrontendEvent, FrontendRequest,
+        IpcError, Position, Reply, connect_async,
     },
 };
 
@@ -51,6 +53,35 @@ struct Client {
     ips: Option<Vec<IpAddr>>,
     #[arg(long)]
     enter_hook: Option<String>,
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
+struct Pair {
+    /// host name, Tailscale name or address of the machine running `pair --accept`
+    #[arg(
+        required_unless_present_any = ["accept", "confirm", "cancel"],
+        conflicts_with_all = ["accept", "confirm", "cancel"],
+        requires = "position"
+    )]
+    host: Option<String>,
+    /// where that machine is, relative to this one
+    #[arg(long, requires = "host")]
+    position: Option<Position>,
+    /// its MiMouse port (default: the port of this machine)
+    #[arg(long, requires = "host")]
+    port: Option<u16>,
+    /// wait for a pairing request from another machine
+    #[arg(long, conflicts_with_all = ["confirm", "cancel"])]
+    accept: bool,
+    /// seconds to wait for the request (with --accept)
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+    /// confirm the code of a running pairing (instead of answering its prompt)
+    #[arg(long, value_name = "CODE", conflicts_with = "cancel")]
+    confirm: Option<String>,
+    /// abort a running pairing
+    #[arg(long)]
+    cancel: bool,
 }
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
@@ -106,6 +137,9 @@ enum CliSubcommand {
     },
     /// check the service, config, key, firewall and every active client
     Doctor,
+    /// pair with another machine: `pair --accept` there, `pair <host>
+    /// --position <side>` here, then confirm the code both show
+    Pair(Pair),
 }
 
 pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
@@ -124,6 +158,40 @@ pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
     let (rx, mut tx) = connect_async(Some(Duration::from_millis(500))).await?;
     let request = match args.command {
         CliSubcommand::Watch => return watch(rx, args.json).await,
+        CliSubcommand::Pair(Pair {
+            confirm: Some(code),
+            ..
+        }) => FrontendRequest::PairConfirm { code },
+        CliSubcommand::Pair(Pair { cancel: true, .. }) => FrontendRequest::PairCancel,
+        CliSubcommand::Pair(Pair {
+            accept: true,
+            timeout,
+            ..
+        }) => {
+            eprintln!(
+                "waiting {timeout} s for `mimouse cli pair <this machine> --position <side>` on the other machine"
+            );
+            return pair(rx, tx, FrontendRequest::PairAccept { timeout }, args.json).await;
+        }
+        CliSubcommand::Pair(Pair {
+            host: Some(host),
+            position: Some(position),
+            port,
+            ..
+        }) => {
+            let ips = match host.parse::<IpAddr>() {
+                Ok(_) => vec![],
+                Err(_) => discover::addresses(&config, &host).await,
+            };
+            let port = port.unwrap_or(config.port());
+            let request = FrontendRequest::Pair {
+                host,
+                ips,
+                port,
+                position,
+            };
+            return pair(rx, tx, request, args.json).await;
+        }
         cmd => request(cmd),
     };
     let seq = tx.request(request).await?;
@@ -184,8 +252,108 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
             }
         }
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
-        CliSubcommand::Watch | CliSubcommand::Discover { .. } | CliSubcommand::Doctor => {
+        CliSubcommand::Watch
+        | CliSubcommand::Discover { .. }
+        | CliSubcommand::Doctor
+        | CliSubcommand::Pair(_) => {
             unreachable!("handled in `run`")
+        }
+    }
+}
+
+/// lines typed on stdin; a dedicated thread, because a blocking read must not
+/// keep the runtime from shutting down
+fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Start a pairing with `request` and follow it: show the code, ask whether
+/// the other machine shows the same, report the outcome. Without terminal
+/// input the code can be confirmed with `pair --confirm`.
+async fn pair(
+    mut rx: AsyncFrontendEventReader,
+    mut tx: AsyncFrontendRequestWriter,
+    request: FrontendRequest,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut pending = vec![tx.request(request).await?];
+    let mut answers = stdin_lines();
+    let mut stdin_open = true;
+    // the code waiting for the user's answer
+    let mut asking: Option<String> = None;
+    loop {
+        tokio::select! {
+            event = rx.next() => {
+                let event = event.ok_or(CliError::Closed)??;
+                match &event {
+                    FrontendEvent::Reply { seq, result } if pending.contains(seq) => {
+                        pending.retain(|s| s != seq);
+                        if let Err(e) = result {
+                            if json {
+                                println!("{}", serde_json::json!({ "error": e }));
+                            }
+                            return Err(CliError::Request(e.clone()));
+                        }
+                    }
+                    FrontendEvent::PairCode { code, peer, fingerprint, position } => {
+                        if json {
+                            println!("{}", to_json(&event));
+                        } else {
+                            println!("pairing with {peer}");
+                            println!("  fingerprint: {fingerprint}");
+                            println!("  it will be the {position} neighbour of this machine");
+                            println!("  code: {code}");
+                        }
+                        if stdin_open {
+                            eprint!("Does {peer} show the code {code}? [y/N] ");
+                        } else {
+                            eprintln!("confirm with `mimouse cli pair --confirm {code}` or abort with `mimouse cli pair --cancel`");
+                        }
+                        asking = Some(code.clone());
+                    }
+                    FrontendEvent::Paired { id, peer, .. } => {
+                        if json {
+                            println!("{}", to_json(&event));
+                        } else {
+                            println!("paired with {peer}; it is client {id} (`mimouse cli list`)");
+                        }
+                        return Ok(());
+                    }
+                    FrontendEvent::PairFailed { reason } => {
+                        if json {
+                            println!("{}", to_json(&event));
+                        }
+                        return Err(CliError::Request(format!("pairing failed: {reason}")));
+                    }
+                    _ => {}
+                }
+            }
+            answer = answers.recv(), if stdin_open && asking.is_some() => {
+                let code = asking.take().expect("asking");
+                let request = match answer {
+                    Some(answer) if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") => {
+                        eprintln!("waiting for the other machine to confirm ...");
+                        FrontendRequest::PairConfirm { code }
+                    }
+                    Some(_) => FrontendRequest::PairCancel,
+                    None => {
+                        stdin_open = false;
+                        eprintln!();
+                        eprintln!("no terminal input: confirm with `mimouse cli pair --confirm {code}` or abort with `mimouse cli pair --cancel`");
+                        continue;
+                    }
+                };
+                pending.push(tx.request(request).await?);
+            }
         }
     }
 }
@@ -280,6 +448,18 @@ fn print_event(event: &FrontendEvent) {
                 mime.join(", ")
             )
         }
+        FrontendEvent::PairCode {
+            code,
+            peer,
+            fingerprint,
+            position,
+        } => println!("pairing with {peer} ({position}, {fingerprint}): code {code}"),
+        FrontendEvent::Paired {
+            id,
+            peer,
+            fingerprint,
+        } => println!("paired with {peer} ({fingerprint}): client {id}"),
+        FrontendEvent::PairFailed { reason } => println!("pairing failed: {reason}"),
     }
 }
 
