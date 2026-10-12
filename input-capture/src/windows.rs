@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
 
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
 
 mod display_util;
 mod event_thread;
@@ -19,8 +19,12 @@ pub struct WindowsInputCapture {
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.create(pos);
+    async fn create(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        self.event_thread.create(pos, range);
         Ok(())
     }
 

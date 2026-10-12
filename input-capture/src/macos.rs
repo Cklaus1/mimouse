@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::MacosCaptureCreationError,
+};
 use crate::geometry::{self, Rect};
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -27,7 +29,7 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -50,8 +52,8 @@ struct Bounds {
 
 #[derive(Debug)]
 struct InputCaptureState {
-    /// active capture positions
-    active_clients: Lazy<HashSet<Position>>,
+    /// active capture positions and the part of their edge that activates them
+    active_clients: Lazy<HashMap<Position, Option<EdgeRange>>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
     /// position where the cursor was captured
@@ -65,7 +67,7 @@ struct InputCaptureState {
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
-    Create(Position),
+    Create(Position, Option<EdgeRange>),
     Destroy(Position),
     Grab(Position),
     EventTapDisabled,
@@ -75,7 +77,7 @@ enum ProducerEvent {
 impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
-            active_clients: Lazy::new(HashSet::new),
+            active_clients: Lazy::new(HashMap::new),
             current_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
@@ -89,13 +91,24 @@ impl InputCaptureState {
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+        let desktop = [self.desktop()];
 
-        for &position in self.active_clients.iter() {
+        for (&position, &range) in self.active_clients.iter() {
             if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
                 || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
                 || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
                 || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
             {
+                // a crossing outside the client's range does not activate it
+                let point = geometry::along((location.x, location.y), position);
+                let in_range = match geometry::edge_extent(&desktop, position) {
+                    Some(extent) => geometry::in_range(extent, point, range),
+                    None => range.is_none(),
+                };
+                if !in_range {
+                    log::trace!("crossing at {point} outside the range of {position}");
+                    continue;
+                }
                 log::debug!("Crossed barrier into position: {position:?}");
                 return Some(position);
             }
@@ -119,16 +132,20 @@ impl InputCaptureState {
         Ok(())
     }
 
-    /// where `location` lies along the `pos` edge of the display bounds
-    fn edge_fraction(&self, location: CGPoint, pos: Position) -> Option<u16> {
+    /// the bounding box of all displays
+    fn desktop(&self) -> Rect {
         let b = &self.bounds;
-        let desktop = [Rect {
+        Rect {
             x: b.xmin,
             y: b.ymin,
             width: b.xmax - b.xmin,
             height: b.ymax - b.ymin,
-        }];
-        geometry::edge_fraction(&desktop, pos, (location.x, location.y))
+        }
+    }
+
+    /// where `location` lies along the `pos` edge of the display bounds
+    fn edge_fraction(&self, location: CGPoint, pos: Position) -> Option<u16> {
+        geometry::edge_fraction(&[self.desktop()], pos, (location.x, location.y))
     }
 
     /// start the input capture by
@@ -179,8 +196,8 @@ impl InputCaptureState {
                     self.current_pos = Some(pos);
                 }
             }
-            ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
+            ProducerEvent::Create(p, range) => {
+                self.active_clients.insert(p, range);
             }
             ProducerEvent::Destroy(p) => {
                 if let Some(current) = self.current_pos {
@@ -748,11 +765,15 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
+            let _ = notify_tx.send(ProducerEvent::Create(pos, range)).await;
             log::debug!("done !");
         });
         Ok(())

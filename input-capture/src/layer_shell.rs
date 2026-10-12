@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env,
     fmt::{self, Display},
     io::{self, ErrorKind},
@@ -64,7 +64,7 @@ use wayland_client::{
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use crate::{
-    CaptureError, CaptureEvent,
+    CaptureError, CaptureEvent, EdgeRange,
     geometry::{self, Rect},
 };
 
@@ -115,8 +115,21 @@ struct OutputInfo {
     size: (i32, i32),
 }
 
+impl OutputInfo {
+    /// the output in desktop (logical) coordinates
+    fn rect(&self) -> Rect {
+        Rect {
+            x: f64::from(self.position.0),
+            y: f64::from(self.position.1),
+            width: f64::from(self.size.0),
+            height: f64::from(self.size.1),
+        }
+    }
+}
+
 struct State {
-    active_positions: HashSet<Position>,
+    /// barrier positions and the part of the edge each covers
+    active_positions: HashMap<Position, Option<EdgeRange>>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -157,26 +170,31 @@ struct Window {
 }
 
 impl Window {
+    /// a surface on `output`'s `pos` side covering `[first, end)` along it
+    /// (desktop coordinates)
     fn new(
         state: &State,
         qh: &QueueHandle<State>,
         output: &WlOutput,
         pos: Position,
         info: &OutputInfo,
+        (first, end): (i32, i32),
     ) -> Window {
         let size = info.size;
-        log::debug!("creating window output: {output:?}, size: {size:?}");
+        log::debug!("creating window output: {output:?}, size: {size:?}, along: {first}..{end}");
         let g = &state.globals;
 
+        let length = (end - first) as u32;
         let (width, height) = match pos {
-            Position::Left | Position::Right => (1, size.1 as u32),
-            Position::Top | Position::Bottom => (size.0 as u32, 1),
+            Position::Left | Position::Right => (1, length),
+            Position::Top | Position::Bottom => (length, 1),
         };
         let (x, y) = info.position;
         let origin = match pos {
-            Position::Left | Position::Top => (x, y),
-            Position::Right => (x + size.0 - 1, y),
-            Position::Bottom => (x, y + size.1 - 1),
+            Position::Left => (x, first),
+            Position::Right => (x + size.0 - 1, first),
+            Position::Top => (first, y),
+            Position::Bottom => (first, y + size.1 - 1),
         };
         let origin = (f64::from(origin.0), f64::from(origin.1));
         let mut file = tempfile::tempfile().unwrap();
@@ -203,17 +221,19 @@ impl Window {
             qh,
             (),
         );
-        let anchor = match pos {
-            Position::Left => Anchor::Left,
-            Position::Right => Anchor::Right,
-            Position::Top => Anchor::Top,
-            Position::Bottom => Anchor::Bottom,
+        // anchored to the edge and the top / left corner, so the margin
+        // places the surface at the start of the range
+        let (anchor, top, left) = match pos {
+            Position::Left => (Anchor::Left | Anchor::Top, first - y, 0),
+            Position::Right => (Anchor::Right | Anchor::Top, first - y, 0),
+            Position::Top => (Anchor::Top | Anchor::Left, 0, first - x),
+            Position::Bottom => (Anchor::Bottom | Anchor::Left, 0, first - x),
         };
 
         layer_surface.set_anchor(anchor);
         layer_surface.set_size(width, height);
         layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_margin(0, 0, 0, 0);
+        layer_surface.set_margin(top, 0, 0, left);
         surface.set_input_region(None);
         surface.commit();
         Window {
@@ -376,18 +396,14 @@ impl LayerShellInputCapture {
         Ok(LayerShellInputCapture(inner))
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.0.get_mut().state.add_client(pos);
+    fn add_client(&mut self, pos: Position, range: Option<EdgeRange>) {
+        let state = &mut self.0.get_mut().state;
+        state.remove_client(pos);
+        state.add_client(pos, range);
     }
 
     fn delete_client(&mut self, pos: Position) {
-        let inner = self.0.get_mut();
-        inner.state.active_positions.remove(&pos);
-        // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
-            inner.state.active_windows.remove(i);
-            inner.state.focused = None;
-        }
+        self.0.get_mut().state.remove_client(pos);
     }
 }
 
@@ -522,8 +538,8 @@ impl State {
         }
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.active_positions.insert(pos);
+    fn add_client(&mut self, pos: Position, range: Option<EdgeRange>) {
+        self.active_positions.insert(pos, range);
         let outputs = get_output_configuration(self, pos);
 
         log::info!(
@@ -537,13 +553,29 @@ impl State {
                     .unwrap_or("unknown output".to_owned()))
                 .collect::<Vec<_>>()
         );
+        let displays = self.displays();
         outputs.iter().for_each(|o| {
-            if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info);
-                let window = Arc::new(window);
-                self.active_windows.push(window);
-            }
+            let Some(info) = o.info.as_ref() else {
+                return;
+            };
+            // a range shortens the surfaces; outputs it misses get none
+            let Some((first, end)) = geometry::barrier_segment(&displays, &info.rect(), pos, range)
+            else {
+                return;
+            };
+            let along = (first as i32, end as i32);
+            let window = Window::new(self, &self.qh, &o.wl_output, pos, info, along);
+            self.active_windows.push(Arc::new(window));
         });
+    }
+
+    fn remove_client(&mut self, pos: Position) {
+        self.active_positions.remove(&pos);
+        // remove all windows corresponding to this client
+        while let Some(i) = self.active_windows.iter().position(|w| w.pos == pos) {
+            self.active_windows.remove(i);
+            self.focused = None;
+        }
     }
 
     fn update_windows(&mut self) {
@@ -554,9 +586,13 @@ impl State {
 
         self.active_windows.clear();
 
-        let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
-        for pos in active_positions {
-            self.add_client(pos);
+        let active_positions = self
+            .active_positions
+            .iter()
+            .map(|(&pos, &range)| (pos, range))
+            .collect::<Vec<_>>();
+        for (pos, range) in active_positions {
+            self.add_client(pos, range);
         }
     }
 
@@ -565,12 +601,7 @@ impl State {
         self.outputs
             .iter()
             .filter_map(|o| o.info.as_ref())
-            .map(|info| Rect {
-                x: f64::from(info.position.0),
-                y: f64::from(info.position.1),
-                width: f64::from(info.size.0),
-                height: f64::from(info.size.1),
-            })
+            .map(OutputInfo::rect)
             .collect()
     }
 }
@@ -644,8 +675,12 @@ impl Inner {
 
 #[async_trait]
 impl Capture for LayerShellInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.add_client(pos);
+    async fn create(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        self.add_client(pos, range);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
     }

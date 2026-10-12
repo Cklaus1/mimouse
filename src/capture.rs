@@ -7,7 +7,7 @@ use std::{
 use crate::proto::ProtoEvent;
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, EdgeRange, InputCapture, InputCaptureError, Position,
 };
 use input_event::{
     Event, KeyboardEvent, PointerEvent,
@@ -70,7 +70,7 @@ enum CaptureRequest {
     /// capture must release the mouse
     Release,
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    Create(CaptureHandle, Position, CaptureType, Option<EdgeRange>),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -140,15 +140,18 @@ impl Capture {
         }
     }
 
+    /// `range`: `[start, end]` percent of the edge that activates the client
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
         pos: crate::ipc::Position,
         capture_type: CaptureType,
+        range: Option<[u8; 2]>,
     ) {
         let pos = to_capture_pos(pos);
+        let range = range.and_then(|[start, end]| EdgeRange::new(start, end));
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, pos, capture_type, range))
             .expect("channel closed");
     }
 
@@ -194,7 +197,7 @@ struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<(CaptureHandle, Position, CaptureType, Option<EdgeRange>)>,
     conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     /// `true` while the backend waits for a permission request
@@ -208,8 +211,14 @@ struct CaptureTask {
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        pos: Position,
+        capture_type: CaptureType,
+        range: Option<EdgeRange>,
+    ) {
+        self.captures.push((handle, pos, capture_type, range));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
@@ -219,7 +228,7 @@ impl CaptureTask {
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|&(_, p, t, _)| p == pos && t == CaptureType::Default)
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
@@ -247,7 +256,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t, r) => self.add_capture(h, p, t, r),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
@@ -294,9 +303,9 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, _type, range) in captures {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = capture.create(handle, pos, range) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -344,9 +353,9 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
-                        capture.create(h, p).await?;
+                    CaptureRequest::Create(h, p, t, r) => {
+                        self.add_capture(h, p, t, r);
+                        capture.create(h, p, r).await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         self.remove_capture(h);

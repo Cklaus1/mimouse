@@ -61,6 +61,7 @@ struct ConfigToml {
     max_file_size: Option<u64>,
     notify_switch: Option<bool>,
     idle_inhibit: Option<bool>,
+    local_hotkey: Option<Vec<scancode::Linux>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -72,12 +73,34 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    range: Option<[u8; 2]>,
+    hotkey: Option<Vec<scancode::Linux>>,
 }
 
 impl ConfigToml {
     fn new(path: &Path) -> Result<ConfigToml, ConfigError> {
         let config = fs::read_to_string(path)?;
-        Ok(toml::from_str::<_>(&config)?)
+        let config: ConfigToml = toml::from_str(&config)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// checks what serde can't: each client's `range`
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (i, c) in self.clients.iter().flatten().enumerate() {
+            let Some(range) = c.range else {
+                continue;
+            };
+            if input_capture::EdgeRange::new(range[0], range[1]).is_none() {
+                let client = c
+                    .hostname
+                    .clone()
+                    .or(c.host_name.clone())
+                    .unwrap_or_else(|| format!("#{i}"));
+                return Err(ConfigError::Range { client, range });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,12 +290,18 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    /// the part of the edge that switches to this client, in percent
+    pub range: Option<[u8; 2]>,
+    /// chord that switches control to this client
+    pub hotkey: Option<Vec<scancode::Linux>>,
 }
 
 impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
+        let range = toml.range;
+        let hotkey = toml.hotkey;
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -284,6 +313,8 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            range,
+            hotkey,
         }
     }
 }
@@ -303,6 +334,8 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
+        let range = client.range;
+        let hotkey = client.hotkey;
         Self {
             hostname,
             host_name,
@@ -311,6 +344,8 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            range,
+            hotkey,
         }
     }
 }
@@ -325,6 +360,8 @@ pub enum ConfigError {
     Var(#[from] VarError),
     #[error(transparent)]
     Watcher(#[from] notify::Error),
+    #[error("client {client}: invalid range {range:?}: need [start, end] with start < end <= 100")]
+    Range { client: String, range: [u8; 2] },
 }
 
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
@@ -535,6 +572,13 @@ impl Config {
         }
     }
 
+    /// chord that returns control to this machine from any client
+    pub fn local_hotkey(&self) -> Option<Vec<scancode::Linux>> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.local_hotkey.clone())
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -571,13 +615,16 @@ impl Config {
         };
         let mut changed = false;
         match toml_edit::de::from_document::<ConfigToml>(current_config) {
-            Ok(current_config) => {
-                changed = self
-                    .config_toml
-                    .as_ref()
-                    .is_none_or(|c| c != &current_config);
-                self.config_toml.replace(current_config);
-            }
+            Ok(current_config) => match current_config.validate() {
+                Ok(()) => {
+                    changed = self
+                        .config_toml
+                        .as_ref()
+                        .is_none_or(|c| c != &current_config);
+                    self.config_toml.replace(current_config);
+                }
+                Err(e) => log::warn!("{:?}: {e}", self.config_path()),
+            },
             Err(e) => log::warn!("{:?} {e}", self.config_path()),
         };
         Ok(changed)
@@ -809,6 +856,8 @@ port = 4243
             position: Some(Position::Top),
             activate_on_startup: None,
             enter_hook: None,
+            range: Some([0, 100]),
+            hotkey: Some(vec![KeyLeftCtrl, KeyLeftAlt, scancode::Linux::Key1]),
         });
         merge_config(&mut doc, &cfg);
         let out = doc.to_string();
@@ -853,5 +902,30 @@ port = 4243
         let out = doc.to_string();
         assert!(out.contains("[[clients]]"), "{out}");
         assert_eq!(normalized(parsed(&out).1), cfg);
+    }
+
+    fn with_range(range: &str) -> Result<ConfigToml, ConfigError> {
+        let s =
+            format!("[[clients]]\nhostname = \"megapc\"\nposition = \"left\"\nrange = {range}\n");
+        let cfg: ConfigToml = toml::from_str(&s)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn range_bounds() {
+        for ok in ["[0, 100]", "[0, 1]", "[99, 100]", "[20, 80]"] {
+            assert!(with_range(ok).is_ok(), "{ok}");
+        }
+        let cfg = with_range("[20, 80]").unwrap();
+        let client = ConfigClient::from(cfg.clients.unwrap()[0].clone());
+        assert_eq!(client.range, Some([20, 80]));
+        for bad in ["[50, 50]", "[80, 20]", "[0, 101]"] {
+            let e = with_range(bad).unwrap_err().to_string();
+            assert!(e.contains("client megapc: invalid range"), "{bad}: {e}");
+        }
+        // not a percentage at all: rejected by serde
+        assert!(with_range("[-1, 50]").is_err());
+        assert!(with_range("[0, 300]").is_err());
     }
 }

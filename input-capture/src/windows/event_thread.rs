@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
@@ -31,7 +31,7 @@ use input_event::{
     scancode::{self, Linux},
 };
 
-use super::{CaptureEvent, Position, display_util};
+use super::{CaptureEvent, EdgeRange, Position, display_util};
 use crate::geometry::{self, Rect};
 
 pub(crate) struct EventThread {
@@ -55,8 +55,8 @@ impl EventThread {
         self.signal(RequestType::Release);
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, pos: Position, range: Option<EdgeRange>) {
+        self.client_update(ClientUpdate::Create(pos, range));
     }
 
     pub(crate) fn destroy(&self, pos: Position) {
@@ -95,7 +95,7 @@ enum RequestType {
 }
 
 enum ClientUpdate {
-    Create(Position),
+    Create(Position, Option<EdgeRange>),
     Destroy(Position),
 }
 
@@ -111,8 +111,8 @@ fn try_send_event(
 }
 
 thread_local! {
-    /// all configured clients
-    static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
+    /// all configured clients and the part of their edge that activates them
+    static CLIENTS: RefCell<HashMap<Position, Option<EdgeRange>>> = RefCell::new(HashMap::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
@@ -286,18 +286,30 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     };
 
     /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+    let Some(range) = CLIENTS.with_borrow(|clients| clients.get(&pos).copied()) else {
+        return ret;
+    };
+
+    let (entry_point, fraction, in_range) = DISPLAYS.with_borrow(|(displays, _)| {
+        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
+        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
+        let point = (f64::from(entry_point.0), f64::from(entry_point.1));
+        let in_range = match geometry::edge_extent(&rects, pos) {
+            Some(extent) => geometry::in_range(extent, geometry::along(point, pos), range),
+            None => range.is_none(),
+        };
+        let fraction = geometry::edge_fraction(&rects, pos, point);
+        (entry_point, fraction, in_range)
+    });
+
+    /* a crossing outside the client's range does not activate it */
+    if !in_range {
+        log::trace!("crossing at {entry_point:?} outside the range of {pos}");
         return ret;
     }
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
-    let (entry_point, fraction) = DISPLAYS.with_borrow(|(displays, _)| {
-        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
-        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
-        let point = (f64::from(entry_point.0), f64::from(entry_point.1));
-        (entry_point, geometry::edge_fraction(&rects, pos, point))
-    });
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
@@ -430,8 +442,8 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
-        ClientUpdate::Create(pos) => {
-            CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
+        ClientUpdate::Create(pos, range) => {
+            CLIENTS.with_borrow_mut(|clients| clients.insert(pos, range));
         }
         ClientUpdate::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {

@@ -383,6 +383,8 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                range: c.range,
+                hotkey: c.hotkey,
             })
             .collect();
         self.config.set_clients(clients);
@@ -454,6 +456,7 @@ impl Service {
             }
             self.client_manager.set_port(h, c.port);
             self.client_manager.set_enter_hook(h, c.enter_hook);
+            self.client_manager.set_hotkey(h, c.hotkey);
             self.broadcast_client(h);
         }
     }
@@ -673,7 +676,8 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        self.capture
+            .create(handle, pos, CaptureType::EnterOnly, None);
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -792,7 +796,12 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            let range = self
+                .client_manager
+                .get_state(handle)
+                .and_then(|(c, _)| c.range);
+            self.capture
+                .create(handle, pos, CaptureType::Default, range);
             self.connector.keep_connected(handle);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");

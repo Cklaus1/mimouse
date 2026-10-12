@@ -97,6 +97,39 @@ impl Display for Position {
     }
 }
 
+/// The part of an edge that switches to a client, in percent of the edge's
+/// length (the desktop's bounding box along that side): `start < end <= 100`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct EdgeRange {
+    start: u8,
+    end: u8,
+}
+
+impl EdgeRange {
+    /// `None` unless `start < end <= 100`
+    pub fn new(start: u8, end: u8) -> Option<Self> {
+        (start < end && end <= 100).then_some(Self { start, end })
+    }
+
+    pub fn start(&self) -> u8 {
+        self.start
+    }
+
+    pub fn end(&self) -> u8 {
+        self.end
+    }
+
+    /// The smallest range covering both; `None` (the whole edge) covers all.
+    /// Clients sharing an edge share one barrier, which covers all of them.
+    fn hull(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        let (a, b) = (a?, b?);
+        Some(Self {
+            start: a.start.min(b.start),
+            end: a.end.max(b.end),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(libei)]
@@ -137,34 +170,41 @@ pub struct InputCapture {
     pressed_keys: HashSet<scancode::Linux>,
     /// map from position to ids
     position_map: HashMap<Position, Vec<CaptureHandle>>,
-    /// map from id to position
-    id_map: HashMap<CaptureHandle, Position>,
+    /// map from id to position and range
+    id_map: HashMap<CaptureHandle, (Position, Option<EdgeRange>)>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
 }
 
 impl InputCapture {
-    /// create a new client with the given id
-    pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
+    /// create a new client with the given id; `range`: the part of the edge
+    /// that activates it (`None`: all of it)
+    pub async fn create(
+        &mut self,
+        id: CaptureHandle,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         assert!(!self.id_map.contains_key(&id));
 
-        self.id_map.insert(id, pos);
-
-        if let Some(v) = self.position_map.get_mut(&pos) {
-            v.push(id);
-            Ok(())
-        } else {
-            self.position_map.insert(pos, vec![id]);
-            self.capture.create(pos).await
+        let old = self
+            .position_map
+            .contains_key(&pos)
+            .then(|| self.barrier_range(pos));
+        self.id_map.insert(id, (pos, range));
+        self.position_map.entry(pos).or_default().push(id);
+        let new = self.barrier_range(pos);
+        if old != Some(new) {
+            self.capture.create(pos, new).await?;
         }
+        Ok(())
     }
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        let (pos, _) = *self.id_map.get(&id).expect("no position for this handle");
+        let old = self.barrier_range(pos);
+        self.id_map.remove(&id);
 
         log::debug!("destroying capture {id} @ {pos}");
         let remaining = self.position_map.get_mut(&pos).expect("id vector");
@@ -175,8 +215,25 @@ impl InputCapture {
             log::debug!("destroying capture @ {pos} - no remaining ids");
             self.position_map.remove(&pos);
             self.capture.destroy(pos).await?;
+        } else {
+            let new = self.barrier_range(pos);
+            if new != old {
+                self.capture.create(pos, new).await?;
+            }
         }
         Ok(())
+    }
+
+    /// the range of the barrier at `pos`: covers every client there
+    fn barrier_range(&self, pos: Position) -> Option<EdgeRange> {
+        let mut ranges = self
+            .position_map
+            .get(&pos)
+            .into_iter()
+            .flatten()
+            .map(|id| self.id_map.get(id).and_then(|&(_, range)| range));
+        let first = ranges.next()?;
+        ranges.fold(first, EdgeRange::hull)
     }
 
     /// release mouse
@@ -296,8 +353,10 @@ impl Stream for InputCapture {
 
 #[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
-    /// create a new client with the given id
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
+    /// create a barrier at `pos`, covering `range` of the edge (`None`: all);
+    /// replaces the barrier already at `pos`
+    async fn create(&mut self, pos: Position, range: Option<EdgeRange>)
+    -> Result<(), CaptureError>;
 
     /// destroy the client with the given id, if it exists
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;

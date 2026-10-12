@@ -42,7 +42,7 @@ use futures_core::Stream;
 use input_event::Event;
 
 use crate::{
-    CaptureEvent,
+    CaptureEvent, EdgeRange,
     geometry::{self, Rect},
 };
 
@@ -58,7 +58,7 @@ use super::{
 /// events that necessitate restarting the capture session
 #[derive(Clone, Copy, Debug)]
 enum LibeiNotifyEvent {
-    Create(Position),
+    Create(Position, Option<EdgeRange>),
     Destroy(Position),
 }
 
@@ -88,15 +88,16 @@ pub struct LibeiInputCapture {
     terminated: bool,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
+/// The barrier on `r`'s `pos` side covering pixels `[first, end)` along it:
+/// (start pos, end pos), inclusive
+fn pos_to_barrier(r: &Region, pos: Position, (first, end): (i32, i32)) -> (i32, i32, i32, i32) {
     let (x, y) = (r.x_offset(), r.y_offset());
     let (w, h) = (r.width() as i32, r.height() as i32);
     match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
+        Position::Left => (x, first, x, end - 1),
+        Position::Right => (x + w, first, x + w, end - 1),
+        Position::Top => (first, y, end - 1, y),
+        Position::Bottom => (first, y + h, end - 1, y + h),
     }
 }
 
@@ -124,27 +125,28 @@ impl From<ICBarrier> for Barrier {
 
 fn select_barriers(
     zones: &Zones,
-    clients: &[Position],
+    clients: &[(Position, Option<EdgeRange>)],
     next_barrier_id: &mut NonZeroU32,
 ) -> (Vec<ICBarrier>, HashMap<BarrierID, Position>) {
     let mut pos_for_barrier = HashMap::new();
     let mut barriers: Vec<ICBarrier> = vec![];
+    let displays: Vec<Rect> = zones.regions().iter().map(to_rect).collect();
 
-    for pos in clients {
-        let mut client_barriers = zones
-            .regions()
-            .iter()
-            .map(|r| {
-                let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
-                let position = pos_to_barrier(r, *pos);
-                pos_for_barrier.insert(id, *pos);
-                ICBarrier::new(id, position)
-            })
-            .collect();
-        barriers.append(&mut client_barriers);
+    for &(pos, range) in clients {
+        for (r, display) in zones.regions().iter().zip(&displays) {
+            // a range shortens the barriers; displays it misses get none
+            let Some((first, end)) = geometry::barrier_segment(&displays, display, pos, range)
+            else {
+                continue;
+            };
+            let id = *next_barrier_id;
+            *next_barrier_id = next_barrier_id
+                .checked_add(1)
+                .expect("barrier id out of range");
+            let position = pos_to_barrier(r, pos, (first as i32, end as i32));
+            pos_for_barrier.insert(id, pos);
+            barriers.push(ICBarrier::new(id, position));
+        }
     }
     (barriers, pos_for_barrier)
 }
@@ -155,7 +157,7 @@ type Barriers = (Vec<ICBarrier>, HashMap<BarrierID, Position>, Vec<Rect>);
 async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
-    active_clients: &[Position],
+    active_clients: &[(Position, Option<EdgeRange>)],
     next_barrier_id: &mut NonZeroU32,
 ) -> Result<Barriers, ashpd::Error> {
     let zones = input_capture
@@ -363,7 +365,7 @@ async fn do_capture(
 ) -> Result<(), CaptureError> {
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
-    let mut active_clients: Vec<Position> = vec![];
+    let mut active_clients: Vec<(Position, Option<EdgeRange>)> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
     let mut zones_changed = input_capture.receive_zones_changed().await?;
@@ -437,8 +439,11 @@ async fn do_capture(
         // update clients if requested
         if let Some(event) = capture_event_occured.take() {
             match event {
-                LibeiNotifyEvent::Create(p) => active_clients.push(p),
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
+                LibeiNotifyEvent::Create(p, range) => {
+                    active_clients.retain(|&(pos, _)| pos != p);
+                    active_clients.push((p, range));
+                }
+                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&(pos, _)| pos != p),
             }
         }
 
@@ -453,7 +458,7 @@ async fn do_capture_session(
     input_capture: &InputCapture,
     session: &mut Session<InputCapture>,
     event_tx: &Sender<(Position, CaptureEvent)>,
-    active_clients: &[Position],
+    active_clients: &[(Position, Option<EdgeRange>)],
     next_barrier_id: &mut NonZeroU32,
     notify_release: &Notify,
     cancel: (CancellationToken, CancellationToken),
@@ -696,10 +701,14 @@ async fn handle_ei_event(
 
 #[async_trait]
 impl MiMouseInputCapture for LibeiInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
-            .send(LibeiNotifyEvent::Create(pos))
+            .send(LibeiNotifyEvent::Create(pos, range))
             .await;
         Ok(())
     }
