@@ -114,6 +114,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             ctrl_taps: Default::default(),
+            enter_at: None,
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -200,6 +201,8 @@ struct CaptureTask {
     permission_pending: watch::Sender<bool>,
     release_bind: Rc<RefCell<ReleaseBind>>,
     ctrl_taps: CtrlDoubleTap,
+    /// where the cursor crossed into the active client, if the backend knows
+    enter_at: Option<u16>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -379,7 +382,7 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        if event == CaptureEvent::Begin {
+        if matches!(event, CaptureEvent::Begin(_)) {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -398,7 +401,7 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if matches!(event, CaptureEvent::Begin(_)) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -409,7 +412,8 @@ impl CaptureTask {
         // checked before sending, applied after: the final Ctrl release must
         // reach the peer or Ctrl stays held there
         let double_tapped = match event {
-            CaptureEvent::Begin => {
+            CaptureEvent::Begin(at) => {
+                self.enter_at = at;
                 self.ctrl_taps = Default::default();
                 false
             }
@@ -423,10 +427,10 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin(_) => enter_event(opposite_pos, self.enter_at),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                State::WaitingForAck => enter_event(opposite_pos, self.enter_at),
                 State::Sending => ProtoEvent::Input(e),
             },
             CaptureEvent::End => unreachable!("handled above"),
@@ -471,6 +475,15 @@ impl CaptureTask {
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         self.leave_client(capture).await;
         capture.release().await
+    }
+}
+
+/// `Enter`, with the crossing point when the backend reported it; Lan Mouse
+/// peers read both as `Enter`
+fn enter_event(pos: crate::proto::Position, at: Option<u16>) -> ProtoEvent {
+    match at {
+        Some(at) => ProtoEvent::EnterAt(pos, at),
+        None => ProtoEvent::Enter(pos),
     }
 }
 

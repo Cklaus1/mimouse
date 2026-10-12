@@ -41,7 +41,10 @@ use futures_core::Stream;
 
 use input_event::Event;
 
-use crate::CaptureEvent;
+use crate::{
+    CaptureEvent,
+    geometry::{self, Rect},
+};
 
 use super::{
     Capture as MiMouseInputCapture, Position,
@@ -146,17 +149,21 @@ fn select_barriers(
     (barriers, pos_for_barrier)
 }
 
+/// barriers, the client for each barrier id, and the displays (zones)
+type Barriers = (Vec<ICBarrier>, HashMap<BarrierID, Position>, Vec<Rect>);
+
 async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), ashpd::Error> {
+) -> Result<Barriers, ashpd::Error> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
         .response()?;
     log::debug!("zones: {zones:?}");
+    let displays = zones.regions().iter().map(to_rect).collect();
 
     let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
     log::debug!("barriers: {barriers:?}");
@@ -173,7 +180,16 @@ async fn update_barriers(
         .await?;
     let response = response.response()?;
     log::debug!("{response:?}");
-    Ok((barriers, id_map))
+    Ok((barriers, id_map, displays))
+}
+
+fn to_rect(r: &Region) -> Rect {
+    Rect {
+        x: f64::from(r.x_offset()),
+        y: f64::from(r.y_offset()),
+        width: f64::from(r.width()),
+        height: f64::from(r.height()),
+    }
 }
 
 fn capabilities() -> BitFlags<Capabilities> {
@@ -450,7 +466,7 @@ async fn do_capture_session(
     let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
 
     // set barriers
-    let (barriers, pos_for_barrier_id) =
+    let (barriers, pos_for_barrier_id, displays) =
         update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
 
     log::debug!("enabling session");
@@ -506,7 +522,10 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    let at = activated.cursor_position().and_then(|(x, y)| {
+                        geometry::edge_fraction(&displays, pos, (f64::from(x), f64::from(y)))
+                    });
+                    event_tx.send((pos, CaptureEvent::Begin(at))).await.expect("no channel");
 
                     let end = loop {
                         tokio::select! {

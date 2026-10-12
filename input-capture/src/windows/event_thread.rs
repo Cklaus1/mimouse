@@ -32,6 +32,7 @@ use input_event::{
 };
 
 use super::{CaptureEvent, Position, display_util};
+use crate::geometry::{self, Rect};
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -291,15 +292,18 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
-    let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
-        display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
+    let (entry_point, fraction) = DISPLAYS.with_borrow(|(displays, _)| {
+        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
+        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
+        let point = (f64::from(entry_point.0), f64::from(entry_point.1));
+        (entry_point, geometry::edge_fraction(&rects, pos, point))
     });
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    blocking_send_event(active, CaptureEvent::Begin(fraction));
 
     ret
 }
@@ -437,6 +441,15 @@ fn update_clients(request: ClientUpdate) {
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
+    }
+}
+
+fn to_rect(display: &RECT) -> Rect {
+    Rect {
+        x: f64::from(display.left),
+        y: f64::from(display.top),
+        width: f64::from(display.right - display.left),
+        height: f64::from(display.bottom - display.top),
     }
 }
 

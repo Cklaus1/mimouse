@@ -32,6 +32,8 @@ mod x11;
 
 /// fallback input capture (does not produce events)
 mod dummy;
+#[cfg(any(libei, layer_shell, windows, target_os = "macos", test))]
+mod geometry;
 
 pub type CaptureHandle = u64;
 
@@ -42,8 +44,10 @@ pub const IDLE_KEEPALIVE_TAG: usize = 0x4D69_4D6F; // "MiMo"
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
-    /// capture on this capture handle is now active
-    Begin,
+    /// capture on this capture handle is now active; where the cursor
+    /// crossed the edge (0 = top / left end, `u16::MAX` = the other end),
+    /// if the backend knows
+    Begin(Option<u16>),
     /// input event coming from capture handle
     Input(Event),
     /// the compositor or OS ended an active capture without a release
@@ -54,7 +58,8 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin(None) => write!(f, "begin capture"),
+            CaptureEvent::Begin(Some(at)) => write!(f, "begin capture at {at}"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
             CaptureEvent::End => write!(f, "capture ended"),
         }
