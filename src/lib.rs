@@ -9,6 +9,7 @@ mod connect;
 mod crypto;
 mod discover;
 mod dns;
+mod doctor;
 mod emulation;
 pub mod emulation_test;
 pub mod ipc;

@@ -78,6 +78,11 @@ impl ConfigToml {
     }
 }
 
+/// whether the config file at `path` parses; the service runs without it if not
+pub fn check_file(path: &Path) -> Result<(), ConfigError> {
+    ConfigToml::new(path).map(|_| ())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
 struct Args {

@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::{
     config::Config,
     discover::{self, DiscoverError},
+    doctor,
     ipc::{
         AsyncFrontendEventReader, ClientHandle, ClientInfo, ClipboardDirection, ConnectionError,
         DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, connect_async,
@@ -26,6 +27,8 @@ pub enum CliError {
     Closed,
     #[error(transparent)]
     Discover(#[from] DiscoverError),
+    #[error("{0} check(s) failed")]
+    ChecksFailed(usize),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -101,11 +104,22 @@ enum CliSubcommand {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// check the service, config, key, firewall and every active client
+    Doctor,
 }
 
 pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
-    if let CliSubcommand::Discover { port } = args.command {
-        return Ok(discover::run(&config, port, args.json).await?);
+    match args.command {
+        CliSubcommand::Discover { port } => {
+            return Ok(discover::run(&config, port, args.json).await?);
+        }
+        CliSubcommand::Doctor => {
+            return match doctor::run(&config, args.json).await {
+                0 => Ok(()),
+                failed => Err(CliError::ChecksFailed(failed)),
+            };
+        }
+        _ => {}
     }
     let (rx, mut tx) = connect_async(Some(Duration::from_millis(500))).await?;
     let request = match args.command {
@@ -170,7 +184,7 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
             }
         }
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
-        CliSubcommand::Watch | CliSubcommand::Discover { .. } => {
+        CliSubcommand::Watch | CliSubcommand::Discover { .. } | CliSubcommand::Doctor => {
             unreachable!("handled in `run`")
         }
     }
