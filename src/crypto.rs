@@ -84,18 +84,29 @@ fn create_private(path: &Path) -> io::Result<File> {
 }
 
 /// restrict `path` to the current user; true if it had to be repaired
-#[cfg(unix)]
 fn ensure_private(path: &Path) -> io::Result<bool> {
-    let mode = fs::metadata(path)?.permissions().mode();
-    if mode & 0o077 == 0 {
+    if key_file_is_private(path)? {
         return Ok(false);
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    restrict(path)?;
     Ok(true)
 }
 
+/// whether nobody but the current user can access `path`
+#[cfg(unix)]
+pub(crate) fn key_file_is_private(path: &Path) -> io::Result<bool> {
+    Ok(fs::metadata(path)?.permissions().mode() & 0o077 == 0)
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
 #[cfg(windows)]
-use windows_acl::{create_private, ensure_private};
+pub(crate) use windows_acl::key_file_is_private;
+#[cfg(windows)]
+use windows_acl::{create_private, restrict};
 
 #[cfg(not(any(unix, windows)))]
 fn create_private(path: &Path) -> io::Result<File> {
@@ -103,8 +114,13 @@ fn create_private(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_private(_path: &Path) -> io::Result<bool> {
-    Ok(false)
+pub(crate) fn key_file_is_private(_path: &Path) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restrict(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// whether the DACL in `sddl` (as returned for DACL_SECURITY_INFORMATION) is
@@ -207,12 +223,13 @@ mod windows_acl {
         // Safety: freshly opened handle, owned by the File from here on
         let f = unsafe { File::from_raw_handle(handle.0) };
         // an existing file keeps its DACL with CREATE_ALWAYS
-        ensure_private(path)?;
+        if !key_file_is_private(path)? {
+            restrict(path)?;
+        }
         Ok(f)
     }
 
-    pub(super) fn ensure_private(path: &Path) -> io::Result<bool> {
-        let sid = current_user_sid()?;
+    pub(crate) fn key_file_is_private(path: &Path) -> io::Result<bool> {
         let name = HSTRING::from(path);
         let mut sd = PSECURITY_DESCRIPTOR::default();
         let err = unsafe {
@@ -243,11 +260,13 @@ mod windows_acl {
         };
         let sddl = unsafe { s.to_string() }.map_err(io::Error::other);
         unsafe { LocalFree(Some(HLOCAL(s.0 as *mut _))) };
-        if super::dacl_is_private(&sddl?, &sid) {
-            return Ok(false);
-        }
+        Ok(super::dacl_is_private(&sddl?, &current_user_sid()?))
+    }
 
-        let private = private_descriptor(&sid)?;
+    /// replace the DACL of `path` with one granting the current user only
+    pub(super) fn restrict(path: &Path) -> io::Result<()> {
+        let name = HSTRING::from(path);
+        let private = private_descriptor(&current_user_sid()?)?;
         let mut present = BOOL::default();
         let mut defaulted = BOOL::default();
         let mut acl: *mut ACL = ptr::null_mut();
@@ -268,7 +287,7 @@ mod windows_acl {
         if err.is_err() {
             return Err(io::Error::from_raw_os_error(err.0 as i32));
         }
-        Ok(true)
+        Ok(())
     }
 }
 
