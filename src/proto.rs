@@ -51,6 +51,11 @@ pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Enter(Position),
+    /// [`ProtoEvent::Enter`] plus where along the edge the cursor crossed:
+    /// 0 is the top (left/right edges) or left (top/bottom edges) end,
+    /// `u16::MAX` the other end. Same event id as `Enter` with two trailing
+    /// bytes, which Lan Mouse peers ignore, so it is safe to send to them.
+    EnterAt(Position, u16),
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Leave(u32),
@@ -69,6 +74,7 @@ impl Display for ProtoEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ProtoEvent::Enter(s) => write!(f, "Enter({s})"),
+            ProtoEvent::EnterAt(s, at) => write!(f, "Enter({s} @ {at})"),
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
@@ -117,17 +123,29 @@ impl ProtoEvent {
             },
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
-            ProtoEvent::Enter(_) => EventType::Enter,
+            ProtoEvent::Enter(_) | ProtoEvent::EnterAt(..) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
         }
     }
-}
 
-impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
-    type Error = ProtocolError;
+    /// decodes one datagram. Datagrams are at most [`MAX_EVENT_SIZE`] bytes;
+    /// shorter ones are zero padded, so a truncated event cannot panic.
+    pub fn decode(datagram: &[u8]) -> Result<Self, ProtocolError> {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        let len = datagram.len().min(MAX_EVENT_SIZE);
+        buf[..len].copy_from_slice(&datagram[..len]);
+        match Self::decode_padded(buf)? {
+            // a plain `Enter` is 2 bytes; `EnterAt` adds the crossing point
+            ProtoEvent::Enter(pos) if len >= 4 => Ok(ProtoEvent::EnterAt(
+                pos,
+                u16::from_be_bytes([buf[2], buf[3]]),
+            )),
+            event => Ok(event),
+        }
+    }
 
-    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
+    fn decode_padded(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, ProtocolError> {
         let mut buf = &buf[..];
         let event_type = decode_u8(&mut buf)?;
         match EventType::try_from(event_type)? {
@@ -236,6 +254,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
+                ProtoEvent::EnterAt(pos, at) => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_u16(buf, len, at);
+                }
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
             }
@@ -277,6 +299,51 @@ macro_rules! encode_impl {
 }
 
 encode_impl!(u8);
+encode_impl!(u16);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(event: ProtoEvent) -> Vec<u8> {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        buf[..len].to_vec()
+    }
+
+    #[test]
+    fn enter_at_carries_the_crossing_point() {
+        let wire = encode(ProtoEvent::EnterAt(Position::Left, 0xBEEF));
+        assert_eq!(wire, [8, 0, 0xBE, 0xEF]);
+        assert!(matches!(
+            ProtoEvent::decode(&wire),
+            Ok(ProtoEvent::EnterAt(Position::Left, 0xBEEF))
+        ));
+    }
+
+    #[test]
+    fn lan_mouse_enter_stays_plain() {
+        // a Lan Mouse peer sends the 2 byte form
+        let wire = encode(ProtoEvent::Enter(Position::Top));
+        assert_eq!(wire, [8, 2]);
+        assert!(matches!(
+            ProtoEvent::decode(&wire),
+            Ok(ProtoEvent::Enter(Position::Top))
+        ));
+    }
+
+    #[test]
+    fn lan_mouse_decoder_reads_enter_at_as_enter() {
+        // Lan Mouse decodes from a reused, zero-initialized MAX_EVENT_SIZE
+        // buffer and ignores the datagram length
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        let wire = encode(ProtoEvent::EnterAt(Position::Bottom, 7));
+        buf[..wire.len()].copy_from_slice(&wire);
+        assert!(matches!(
+            ProtoEvent::decode_padded(buf),
+            Ok(ProtoEvent::Enter(Position::Bottom))
+        ));
+    }
+}

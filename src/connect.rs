@@ -254,8 +254,8 @@ async fn receive_loop(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        if let Ok(event) = buf.try_into() {
+    while let Ok(n) = conn.recv(&mut buf).await {
+        if let Ok(event) = ProtoEvent::decode(&buf[..n]) {
             log::trace!("{addr} <==<==<== {event}");
             match event {
                 ProtoEvent::Pong(b) => {

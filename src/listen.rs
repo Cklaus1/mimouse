@@ -253,8 +253,8 @@ async fn read_loop(
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_EVENT_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
+    while let Ok(n) = conn.recv(&mut b).await {
+        match ProtoEvent::decode(&b[..n]) {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),
