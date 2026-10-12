@@ -1,6 +1,6 @@
+use super::macos_logic::{KeyAction, KeyPlanner};
 use super::{Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
-use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
@@ -12,15 +12,13 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use super::error::MacOSEmulationCreationError;
 
@@ -41,10 +39,10 @@ pub(crate) struct MacOSEmulation {
     previous_button_click: Option<Instant>,
     /// click state, i.e. number of clicks in quick succession
     button_click_state: i64,
-    /// current modifier state
-    modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
+    /// modifier and repeating-key state
+    keys: KeyPlanner,
+    /// current modifier flags, shared with the repeat task
+    flags: Rc<Cell<CGEventFlags>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -72,8 +70,8 @@ impl MacOSEmulation {
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
-            modifier_state: Rc::new(Cell::new(XMods::empty())),
+            keys: KeyPlanner::default(),
+            flags: Rc::new(Cell::new(CGEventFlags::empty())),
         })
     }
 
@@ -82,52 +80,29 @@ impl MacOSEmulation {
         Some(event.location())
     }
 
-    async fn spawn_repeat_task(&mut self, key: u16) {
+    /// posts the key-down for `key` and repeats it until stopped; the
+    /// key-up is posted by the caller when the key is released
+    fn start_repeat(&mut self, key: u16) {
         // there can only be one repeating key and it's
         // always the last to be pressed
-        self.cancel_repeat_task().await;
-        // initial key event
-        key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
-        // repeat task
+        self.stop_repeat();
+        key_event(self.event_source.clone(), key, true, self.flags.get());
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
-        let modifiers = self.modifier_state.clone();
-        let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
+        let flags = self.flags.clone();
+        self.repeat_task = Some(tokio::task::spawn_local(async move {
+            tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
+            loop {
+                key_event(event_source.clone(), key, true, flags.get());
+                tokio::time::sleep(DEFAULT_REPEAT_INTERVAL).await;
             }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
-        });
-        self.repeat_task = Some(repeat_task);
+        }));
     }
 
-    async fn cancel_repeat_task(&mut self) {
+    fn stop_repeat(&mut self) {
+        // the task runs on this thread and is parked at an await point,
+        // so aborting it guarantees no further key-down is posted
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
-            let _ = task.await;
+            task.abort();
         }
     }
 }
@@ -181,15 +156,14 @@ fn is_arrow_key(key: u16) -> bool {
     )
 }
 
-fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
-    let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
+fn key_event(event_source: CGEventSource, key: u16, down: bool, mut flags: CGEventFlags) {
+    let event = match CGEvent::new_keyboard_event(event_source, key, down) {
         Ok(e) => e,
         Err(_) => {
             log::warn!("unable to create key event");
             return;
         }
     };
-    let mut flags = to_cgevent_flags(modifiers);
     // Hardware-generated arrow keys on macOS carry NumericPad + SecondaryFn.
     // CGEventTap-based hotkey matchers (e.g. tiling window managers) check
     // these flags to recognize navigation keys; without them synthesized
@@ -199,19 +173,20 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     }
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
-    log::trace!("key event: {key} {state}");
+    log::trace!("key event: {key} {down}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
+/// flags-changed event for a modifier key: carries the modifier's own key
+/// code (a bare `CGEvent` has code 0, which is 'A')
+fn modifier_key_event(event_source: CGEventSource, key: u16, down: bool, flags: CGEventFlags) {
+    let Ok(event) = CGEvent::new_keyboard_event(event_source, key, down) else {
         log::warn!("could not create CGEvent");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+    log::trace!("modifiers updated: {key} {down} {flags:?}");
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -491,24 +466,40 @@ impl Emulation for MacOSEmulation {
                             return Ok(());
                         }
                     };
-                    let is_modifier = update_modifiers(&self.modifier_state, key, state);
-                    if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
-                    }
-                    match state {
-                        // pressed
-                        1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                    let action = self.keys.key(key, code, state != 0);
+                    match action {
+                        KeyAction::FlagsChanged {
+                            code,
+                            pressed,
+                            flags,
+                        } => {
+                            let flags = CGEventFlags::from_bits_retain(flags);
+                            self.flags.set(flags);
+                            modifier_key_event(self.event_source.clone(), code, pressed, flags);
+                        }
+                        KeyAction::Press { code, flags } => {
+                            self.flags.set(CGEventFlags::from_bits_retain(flags));
+                            self.start_repeat(code);
+                        }
+                        KeyAction::Release {
+                            code,
+                            flags,
+                            stop_repeat,
+                        } => {
+                            if stop_repeat {
+                                self.stop_repeat();
+                            }
+                            let flags = CGEventFlags::from_bits_retain(flags);
+                            key_event(self.event_source.clone(), code, false, flags);
+                        }
                     }
                 }
-                KeyboardEvent::Modifiers {
-                    depressed,
-                    latched,
-                    locked,
-                    group,
-                } => {
-                    set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                KeyboardEvent::Modifiers { depressed, .. } => {
+                    // only the depressed modifiers matter; they apply to the
+                    // next key event, so nothing is posted here
+                    self.keys.set_modifiers(depressed);
+                    self.flags
+                        .set(CGEventFlags::from_bits_retain(self.keys.flags()));
                 }
             },
         }
@@ -520,83 +511,17 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
-}
-
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
-    if let Ok(key) = scancode::Linux::try_from(key) {
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
-        };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
-        let mut mods = modifiers.get();
-        match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
-        }
-        modifiers.set(mods);
-        true
-    } else {
-        false
+    async fn terminate(&mut self) {
+        self.stop_repeat();
     }
 }
 
-fn set_modifiers(
-    active_modifiers: &Cell<XMods>,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
-) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
-    let _group = XMods::from_bits(group).unwrap_or_default();
-
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
-}
-
-fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
-    let mut flags = CGEventFlags::empty();
-    if depressed.contains(XMods::ShiftMask) {
-        flags |= CGEventFlags::CGEventFlagShift;
-    }
-    if depressed.contains(XMods::LockMask) {
-        flags |= CGEventFlags::CGEventFlagAlphaShift;
-    }
-    if depressed.contains(XMods::ControlMask) {
-        flags |= CGEventFlags::CGEventFlagControl;
-    }
-    if depressed.contains(XMods::Mod1Mask) {
-        flags |= CGEventFlags::CGEventFlagAlternate;
-    }
-    if depressed.contains(XMods::Mod4Mask) {
-        flags |= CGEventFlags::CGEventFlagCommand;
-    }
-    flags
-}
-
-// From X11/X.h
-bitflags! {
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    struct XMods: u32 {
-        const ShiftMask = (1<<0);
-        const LockMask = (1<<1);
-        const ControlMask = (1<<2);
-        const Mod1Mask = (1<<3);
-        const Mod2Mask = (1<<4);
-        const Mod3Mask = (1<<5);
-        const Mod4Mask = (1<<6);
-        const Mod5Mask = (1<<7);
-    }
-}
+// the flag bits used by the platform-independent key logic
+const _: () = {
+    use super::macos_logic::*;
+    assert!(CGEventFlags::CGEventFlagShift.bits() == CG_SHIFT);
+    assert!(CGEventFlags::CGEventFlagAlphaShift.bits() == CG_ALPHA_SHIFT);
+    assert!(CGEventFlags::CGEventFlagControl.bits() == CG_CONTROL);
+    assert!(CGEventFlags::CGEventFlagAlternate.bits() == CG_ALTERNATE);
+    assert!(CGEventFlags::CGEventFlagCommand.bits() == CG_COMMAND);
+};
