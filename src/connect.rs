@@ -94,6 +94,15 @@ async fn connect_any(
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+/// what [`MiMouseConnection::recv`] reports about a client
+#[derive(Debug)]
+pub(crate) enum ConnEvent {
+    /// an event sent by the client
+    Received(ProtoEvent),
+    /// the connection closed: ping timeout, recv or send error
+    Closed,
+}
+
 /// outgoing connection state, shared by [`MiMouseConnection`] (owned by the
 /// capture task) and the service, which keeps active clients connected
 #[derive(Clone)]
@@ -102,7 +111,7 @@ pub(crate) struct Connector {
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, ArcConn>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: Sender<(ClientHandle, ConnEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
     /// notified whenever a connection attempt ends or a connection closes
     changed: Rc<Notify>,
@@ -112,7 +121,7 @@ pub(crate) struct Connector {
 
 pub(crate) struct MiMouseConnection {
     connector: Connector,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<(ClientHandle, ConnEvent)>,
 }
 
 impl MiMouseConnection {
@@ -135,7 +144,7 @@ impl MiMouseConnection {
         self.connector.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, ConnEvent) {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -328,7 +337,10 @@ impl Connector {
                         self.client_manager.set_alive(handle, b);
                         self.ping_response.borrow_mut().insert(addr);
                     }
-                    event => self.recv_tx.send((handle, event)).expect("channel closed"),
+                    event => self
+                        .recv_tx
+                        .send((handle, ConnEvent::Received(event)))
+                        .expect("channel closed"),
                 }
             }
         }
@@ -349,6 +361,9 @@ impl Connector {
             self.client_manager.set_active_addr(handle, None);
         }
         log::info!("active connections: {active:?}");
+        // the capture task gives control back if this client had it; it is
+        // gone when the service shuts down
+        let _ = self.recv_tx.send((handle, ConnEvent::Closed));
         self.changed.notify_waiters();
     }
 }
@@ -373,11 +388,7 @@ impl MissedPings {
 }
 
 /// returns once the peer counts as gone
-async fn ping_pong(
-    addr: SocketAddr,
-    conn: &ArcConn,
-    ping_response: &RefCell<HashSet<SocketAddr>>,
-) {
+async fn ping_pong(addr: SocketAddr, conn: &ArcConn, ping_response: &RefCell<HashSet<SocketAddr>>) {
     let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
     let mut missed = MissedPings::default();
     loop {
@@ -405,7 +416,7 @@ mod tests {
     use crate::crypto;
     use crate::listen::{ListenEvent, MiMouseListener};
     use futures::StreamExt;
-    use std::{net::Ipv4Addr, sync::RwLock};
+    use std::{net::Ipv4Addr, sync::RwLock, time::Instant};
     use tokio::task::LocalSet;
 
     /// feeds per-interval Pong results, returns the interval (1-based) at
@@ -488,18 +499,64 @@ mod tests {
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
                 let (mut listener, client_manager, handle) = peer(&cert).await;
-                let conn = MiMouseConnection::new(cert, client_manager);
+                let mut conn = MiMouseConnection::new(cert, client_manager);
                 conn.connector().keep_connected(handle);
 
                 // connected before anything was sent
                 let first = accepted(&mut listener).await;
-                // nobody answers the pings here, so the connection is dropped
-                // after 4 s and re-established 1 s later
+                // nobody answers the pings here: the connection is dropped
+                // after 4 s, the capture task is told ...
+                let start = Instant::now();
+                assert_eq!(closed(&mut conn).await, handle);
+                let elapsed = start.elapsed();
+                assert!(
+                    (Duration::from_millis(3500)..Duration::from_millis(5500)).contains(&elapsed),
+                    "closed after {elapsed:?}"
+                );
+                // ... and it is re-established 1 s later
                 let second = accepted(&mut listener).await;
                 assert_ne!(first, second);
 
                 listener.terminate().await;
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn peer_closing_the_connection_is_reported() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, client_manager, handle) = peer(&cert).await;
+                let mut conn = MiMouseConnection::new(cert, client_manager);
+                conn.connector().keep_connected(handle);
+                accepted(&mut listener).await;
+
+                // the peer shuts down (close_notify): reported at once, not
+                // only after the ping window
+                let start = Instant::now();
+                listener.terminate().await;
+                assert_eq!(closed(&mut conn).await, handle);
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "{:?}",
+                    start.elapsed()
+                );
+            })
+            .await;
+    }
+
+    /// waits for a [`ConnEvent::Closed`], skipping received events
+    async fn closed(conn: &mut MiMouseConnection) -> ClientHandle {
+        let closed = async {
+            loop {
+                if let (handle, ConnEvent::Closed) = conn.recv().await {
+                    return handle;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), closed)
+            .await
+            .expect("connection not reported closed")
     }
 }
