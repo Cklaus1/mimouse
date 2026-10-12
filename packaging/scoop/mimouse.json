@@ -5,7 +5,7 @@
     "license": "GPL-3.0-or-later",
     "notes": [
         "Config: %LOCALAPPDATA%\\mimouse\\config.toml",
-        "Allow UDP 4242 (and TCP 4242 with clipboard = true) in the Windows firewall.",
+        "Allow UDP and TCP 4242 in the Windows firewall (UDP for input, TCP for pairing and clipboard).",
         "Run at logon: scheduled task running 'mimouse daemon' with highest privileges."
     ],
     "architecture": {

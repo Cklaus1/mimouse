@@ -22,7 +22,7 @@ class Mimouse < Formula
   def caveats
     <<~EOS
       Write ~/.config/mimouse/config.toml (example: #{opt_pkgshare}/config.toml.example).
-      Open port 4242: UDP for input, plus TCP if clipboard = true.
+      Open port 4242, UDP and TCP: UDP for input, TCP for pairing and clipboard.
       macOS: grant Accessibility and Input Monitoring to #{opt_bin}/mimouse when prompted;
       macOS asks again after an upgrade because the binary path changes.
     EOS

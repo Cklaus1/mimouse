@@ -5,7 +5,7 @@ release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 # double-tapping Ctrl also returns control; default true
 release_double_tap_ctrl = true
 
-# default 4242; UDP for input, TCP for clipboard
+# default 4242; open UDP (input) and TCP (pairing, clipboard; needed even with clipboard = false)
 port = 4242
 
 # share clipboard (text, HTML, images, copied files); default false
