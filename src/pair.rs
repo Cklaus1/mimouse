@@ -337,6 +337,8 @@ struct Session {
     /// the code shown to the user, once known
     code: Option<String>,
     decisions: mpsc::UnboundedSender<bool>,
+    /// the user cancelled; the session must not end in trust
+    cancelled: bool,
     task: JoinHandle<()>,
 }
 
@@ -457,9 +459,11 @@ impl Pairing {
     }
 
     pub(crate) fn cancel(&mut self) -> Result<(), String> {
-        if let Some(session) = &self.session {
+        if let Some(session) = &mut self.session {
             if session.code.is_some() {
-                // tells the peer, then ends with `Cancelled`
+                // tells the peer, then ends with `Cancelled`; if the session
+                // already finished, `event` turns its result into a failure
+                session.cancelled = true;
                 let _ = session.decisions.send(false);
             } else {
                 session.task.abort();
@@ -502,6 +506,7 @@ impl Pairing {
             id,
             code: None,
             decisions: decisions_tx,
+            cancelled: false,
             task,
         });
     }
@@ -544,10 +549,10 @@ impl Pairing {
                             return PairEvent::Code { code, peer, fingerprint, position };
                         }
                         SessionEvent::Done(result) => {
-                            if id.is_some() {
-                                self.session = None;
-                            }
+                            let cancelled = id.is_some()
+                                && self.session.take().is_some_and(|s| s.cancelled);
                             return match result {
+                                Ok(_) if cancelled => PairEvent::Failed(PairError::Cancelled.to_string()),
                                 Ok(trusted) => PairEvent::Trusted(trusted),
                                 Err(e) => PairEvent::Failed(e.to_string()),
                             };
@@ -814,16 +819,19 @@ where
                 Frame::Cancel { reason } => return Err(PairError::Refused(reason)),
                 _ => return Err(PairError::Invalid("expected confirm")),
             },
-            decision = ctx.decisions.recv(), if !confirmed => {
-                if decision == Some(true) {
+            // read even after confirming: a later cancel wins until the end
+            decision = ctx.decisions.recv() => match decision {
+                Some(true) if confirmed => {}
+                Some(true) => {
                     write_frame(w, &Frame::Confirm).await?;
                     confirmed = true;
-                } else {
+                }
+                _ => {
                     let reason = format!("the code was rejected on {}", local_name());
                     let _ = write_frame(w, &Frame::Cancel { reason }).await;
                     return Err(PairError::Cancelled);
                 }
-            }
+            },
             _ = sleep_until(deadline) => {
                 let reason = format!("the code was not confirmed on both machines within {} s", CONFIRM_TIMEOUT.as_secs());
                 let _ = write_frame(w, &Frame::Cancel { reason: reason.clone() }).await;
@@ -1179,6 +1187,57 @@ mod tests {
                     panic!("initiator trusted after rejection: {i:?}");
                 };
                 assert!(reason.contains("rejected"), "{reason}");
+            })
+            .await;
+    }
+
+    /// `pair --cancel` after confirming locally still prevents trust
+    #[tokio::test]
+    async fn cancelling_after_confirming_prevents_trust() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut acceptor, _, port) = endpoint().await;
+                let (mut initiator, _, _) = endpoint().await;
+                acceptor.accept(Duration::from_secs(120)).unwrap();
+                initiator.start(target(port), 4343).unwrap();
+                let (PairEvent::Code { code, .. }, PairEvent::Code { .. }) =
+                    tokio::join!(next(&mut acceptor), next(&mut initiator))
+                else {
+                    panic!("expected codes");
+                };
+                acceptor.confirm(&code).unwrap();
+                // let the acceptor send its Confirm before cancelling
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                acceptor.cancel().unwrap();
+                initiator.confirm(&code).unwrap();
+                let (a, _) = tokio::join!(next(&mut acceptor), next(&mut initiator));
+                assert!(matches!(a, PairEvent::Failed(_)), "{a:?}");
+            })
+            .await;
+    }
+
+    /// a session that finished before the cancel was handled is not trusted
+    #[tokio::test]
+    async fn cancel_wins_over_a_finished_session() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut acceptor, _, port) = endpoint().await;
+                let (mut initiator, _, _) = endpoint().await;
+                acceptor.accept(Duration::from_secs(120)).unwrap();
+                initiator.start(target(port), 4343).unwrap();
+                let (PairEvent::Code { code, .. }, PairEvent::Code { .. }) =
+                    tokio::join!(next(&mut acceptor), next(&mut initiator))
+                else {
+                    panic!("expected codes");
+                };
+                acceptor.confirm(&code).unwrap();
+                initiator.confirm(&code).unwrap();
+                // both sessions end without the service reading the result
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(acceptor.session.as_ref().unwrap().task.is_finished());
+                acceptor.cancel().unwrap();
+                let a = next(&mut acceptor).await;
+                assert!(matches!(a, PairEvent::Failed(_)), "{a:?}");
             })
             .await;
     }
