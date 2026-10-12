@@ -4,6 +4,8 @@
 release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 # double-tapping Ctrl also returns control; default true
 release_double_tap_ctrl = true
+# chord that brings control back to this machine from any client
+# local_hotkey = ["KeyLeftCtrl", "KeyLeftAlt", "Key0"]
 
 # default 4242; open UDP (input) and TCP (pairing, clipboard; needed even with clipboard = false)
 port = 4242
@@ -29,9 +31,14 @@ position = "right" # left | right | top | bottom
 hostname = "iridium"
 activate_on_startup = true
 ips = ["192.168.178.156"] # optional if hostname resolves
+# chord that moves control to this client (Windows/macOS: also while local;
+# GNOME: bind `mimouse cli focus <id>` as a custom shortcut instead)
+# hotkey = ["KeyLeftCtrl", "KeyLeftAlt", "Key1"]
 
 [[clients]]
 position = "left"
 hostname = "thorium" # optional if ips are given
 ips = ["192.168.178.189", "192.168.178.172"]
+# only the upper 40% of the left edge switches to thorium
+range = [0, 40]
 port = 4242

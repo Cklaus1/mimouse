@@ -354,60 +354,65 @@ impl Stream for InputCapture {
             return Poll::Ready(Some(Ok(e)));
         }
 
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
+        loop {
+            let event = ready!(self.capture.poll_next_unpin(cx));
 
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
 
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
 
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
-
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-
-        // a requested focus: the `Begin` is for the focused client only
-        if matches!(event, CaptureEvent::Begin(_)) {
-            if let Some(id) = self.focus {
-                if self.id_map.get(&id).is_some_and(|&(p, _)| p == pos) {
-                    self.focus = None;
-                    return Poll::Ready(Some(Ok((id, event))));
-                }
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
             }
-        }
 
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
+            let len = self
+                .position_map
+                .get(&pos)
+                .map(|ids| ids.len())
+                .unwrap_or(0);
+
+            // a requested focus: the `Begin` is for the focused client only
+            if matches!(event, CaptureEvent::Begin(_)) {
+                if let Some(id) = self.focus {
+                    if self.id_map.get(&id).is_some_and(|&(p, _)| p == pos) {
+                        self.focus = None;
+                        return Poll::Ready(Some(Ok((id, event))));
                     }
                 }
-                swap(&mut self.position_map, &mut position_map);
-
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
             }
+
+            return match len {
+                // no client at this position (destroyed meanwhile): poll
+                // again, returning Pending here would lose the wakeup
+                0 => continue,
+                1 => Poll::Ready(Some(Ok((
+                    self.position_map.get(&pos).expect("no id")[0],
+                    event,
+                )))),
+                _ => {
+                    let mut position_map = HashMap::new();
+                    swap(&mut self.position_map, &mut position_map);
+                    {
+                        for &id in position_map.get(&pos).expect("position") {
+                            self.pending.push_back((id, event));
+                        }
+                    }
+                    swap(&mut self.position_map, &mut position_map);
+
+                    Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
+                }
+            };
         }
     }
 }

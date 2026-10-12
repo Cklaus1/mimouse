@@ -128,6 +128,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            announced: false,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -234,6 +235,9 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// `ClientEntered` was sent for `active_client` (after the first event
+    /// reached it), so its end must be announced with `Released`
+    announced: bool,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType, Option<EdgeRange>)>,
@@ -410,6 +414,12 @@ impl CaptureTask {
                         capture.create(h, p, r).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        // the backend's `End` for a destroyed client never
+                        // maps back to it, so leave it while it still exists
+                        if self.active_client == Some(h) {
+                            log::info!("releasing capture: client {h} removed");
+                            self.release_capture(capture).await?;
+                        }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
@@ -443,7 +453,10 @@ impl CaptureTask {
             if self.active_client.is_some() {
                 log::info!("releasing capture: ended by the compositor");
             }
-            return self.release_capture(capture).await;
+            // the backend already stopped capturing; releasing it again
+            // could end the next activation
+            self.leave_client(capture).await;
+            return Ok(());
         }
 
         if let CaptureEvent::Input(e) = event {
@@ -479,13 +492,11 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // activated a new client
+        // activated a new client; announced once an event reaches it
         if matches!(event, CaptureEvent::Begin(_)) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+            self.announced = false;
         }
 
         // a focus for this client started capture
@@ -531,6 +542,13 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        if !self.announced && self.active_client == Some(handle) {
+            self.announced = true;
+            self.event_tx
+                .send(ICaptureEvent::ClientEntered(handle))
+                .expect("channel closed");
+        }
+
         if double_tapped {
             log::info!("releasing capture: Ctrl double-tap");
             return self.release_capture(capture).await;
@@ -546,9 +564,11 @@ impl CaptureTask {
         if let Some(handle) = self.active_client.take() {
             self.send_leave(handle, capture.take_pressed_keys()).await;
             // control is local again, even if the peer was unreachable
-            self.event_tx
-                .send(ICaptureEvent::Released)
-                .expect("channel closed");
+            if std::mem::take(&mut self.announced) {
+                self.event_tx
+                    .send(ICaptureEvent::Released)
+                    .expect("channel closed");
+            }
         }
     }
 
