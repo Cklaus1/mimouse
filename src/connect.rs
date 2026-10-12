@@ -216,32 +216,50 @@ async fn connect_to_handle(
     Err(MiMouseConnectionError::NotConnected)
 }
 
+/// pings go out every `PING_INTERVAL`; the connection is closed only once
+/// `MAX_MISSED_PINGS` in a row went unanswered (4 s), so loss bursts shorter
+/// than that, e.g. 3 of every 4 pings lost, keep it open (lan-mouse#307)
+const PING_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_MISSED_PINGS: u32 = 8;
+
+/// consecutive ping intervals without a Pong
+#[derive(Debug, Default)]
+struct MissedPings(u32);
+
+impl MissedPings {
+    /// records whether a Pong arrived during the last ping interval;
+    /// true once the peer counts as gone
+    fn record(&mut self, answered: bool) -> bool {
+        self.0 = if answered { 0 } else { self.0 + 1 };
+        self.0 >= MAX_MISSED_PINGS
+    }
+}
+
 async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
+    let (buf, len) = ProtoEvent::Ping.into();
+    let mut missed = MissedPings::default();
     loop {
-        let (buf, len) = ProtoEvent::Ping.into();
-
-        // send 4 pings, at least one must be answered
-        for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
-            }
-            log::trace!("PING >->->->->- {addr}");
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::warn!("{addr}: send error `{e}`, closing connection");
+            break;
         }
+        log::trace!("PING >->->->->- {addr}");
 
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
-            return;
+        tokio::time::sleep(PING_INTERVAL).await;
+
+        if missed.record(ping_response.borrow_mut().remove(&addr)) {
+            log::warn!(
+                "{addr} did not respond for {:?}, closing connection",
+                PING_INTERVAL * MAX_MISSED_PINGS
+            );
+            break;
         }
     }
+    let _ = conn.close().await;
 }
 
 async fn receive_loop(
@@ -282,4 +300,38 @@ async fn disconnect(
     client_manager.set_active_addr(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// feeds per-interval Pong results, returns the interval (1-based) at
+    /// which the connection would be closed
+    fn closed_at(answered: impl IntoIterator<Item = bool>) -> Option<usize> {
+        let mut missed = MissedPings::default();
+        answered
+            .into_iter()
+            .position(|a| missed.record(a))
+            .map(|i| i + 1)
+    }
+
+    #[test]
+    fn ping_window_tolerates_loss_bursts() {
+        // 3 of every 4 pings lost for a minute
+        let lossy = [false, false, false, true].repeat(30);
+        assert_eq!(closed_at(lossy), None);
+        // 3.5 s of silence, then a Pong
+        let burst = [true; 4].into_iter().chain([false; 7]).chain([true]);
+        assert_eq!(closed_at(burst.clone().chain(burst)), None);
+    }
+
+    #[test]
+    fn ping_window_closes_after_4_s_of_silence() {
+        let dead = [true; 4].into_iter().chain([false; 20]);
+        assert_eq!(closed_at(dead), Some(4 + 8));
+        // a Pong resets the count
+        let flapping = [false; 7].into_iter().chain([true]).chain([false; 8]);
+        assert_eq!(closed_at(flapping), Some(16));
+    }
 }

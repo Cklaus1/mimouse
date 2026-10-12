@@ -126,7 +126,7 @@ struct ListenTask {
 
 impl ListenTask {
     async fn run(mut self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(WATCHDOG_TICK);
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
         loop {
@@ -180,22 +180,40 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
-                            log::warn!("releasing keys: {addr} not responding!");
-                            self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    for addr in take_expired(&mut last_response, Instant::now(), WATCHDOG_TIMEOUT) {
+                        log::warn!("releasing keys: {addr} not responding!");
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                    }
                 }
             }
         }
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }
+}
+
+/// A connected peer pings every 500 ms, so 3 s of silence is 6 lost
+/// datagrams in a row, not a short loss burst (lan-mouse#307)
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+/// keys of a vanished peer stay held at most `WATCHDOG_TIMEOUT + WATCHDOG_TICK`
+const WATCHDOG_TICK: Duration = Duration::from_millis(500);
+
+/// removes and returns the peers not heard from for more than `timeout`
+fn take_expired(
+    last_response: &mut HashMap<SocketAddr, Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<SocketAddr> {
+    let expired: Vec<SocketAddr> = last_response
+        .iter()
+        .filter(|&(_, &seen)| now.saturating_duration_since(seen) > timeout)
+        .map(|(&addr, _)| addr)
+        .collect();
+    for addr in &expired {
+        last_response.remove(addr);
+    }
+    expired
 }
 
 /// proxy handling the actual input emulation,
@@ -421,5 +439,32 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_tolerates_loss_bursts_but_bounds_stuck_keys() {
+        let start = Instant::now();
+        let quiet: SocketAddr = "192.0.2.1:4242".parse().unwrap();
+        let lossy: SocketAddr = "192.0.2.2:4242".parse().unwrap();
+        let mut seen = HashMap::from([(quiet, start), (lossy, start)]);
+        let at = |ms| start + Duration::from_millis(ms);
+
+        // 1.5 s without datagrams (3 pings lost) is a loss burst, not a dead peer
+        assert!(take_expired(&mut seen, at(1500), WATCHDOG_TIMEOUT).is_empty());
+        seen.insert(lossy, at(2900));
+        assert!(take_expired(&mut seen, at(3000), WATCHDOG_TIMEOUT).is_empty());
+
+        // the first tick past the timeout releases the silent peer only
+        assert_eq!(take_expired(&mut seen, at(3500), WATCHDOG_TIMEOUT), [quiet]);
+        assert_eq!(seen.keys().collect::<Vec<_>>(), [&lossy]);
+        // ... once
+        assert!(take_expired(&mut seen, at(4000), WATCHDOG_TIMEOUT).is_empty());
+        assert_eq!(take_expired(&mut seen, at(6400), WATCHDOG_TIMEOUT), [lossy]);
+        assert!(seen.is_empty());
     }
 }
