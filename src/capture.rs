@@ -425,6 +425,10 @@ impl CaptureTask {
     async fn leave_client(&mut self, capture: &mut InputCapture) {
         if let Some(handle) = self.active_client.take() {
             self.send_leave(handle, capture.take_pressed_keys()).await;
+            // control is local again, even if the peer was unreachable
+            self.event_tx
+                .send(ICaptureEvent::Released)
+                .expect("channel closed");
         }
     }
 
@@ -436,9 +440,6 @@ impl CaptureTask {
                 log::warn!("failed to send {event} to client {handle}: {e}");
                 return;
             }
-            self.event_tx
-                .send(ICaptureEvent::Released)
-                .expect("channel closed");
         }
     }
 
