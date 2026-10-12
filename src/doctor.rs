@@ -226,6 +226,7 @@ pub(crate) enum Firewall {
     /// no filtering, with the reason
     Off(String),
     /// descriptions of the rules allowing the port; empty: blocked
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Rules { udp: Vec<String>, tcp: Vec<String> },
     /// the rules could not be read, with the reason
     Unknown(String),
@@ -277,6 +278,7 @@ fn ports_contain(list: &str, port: u16) -> Option<bool> {
 }
 
 /// `port[/proto]` with port lists and ranges; `None` if `s` is not a port spec
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 fn port_spec(s: &str, port: u16) -> Option<(bool, Proto)> {
     let (ports, proto) = match s.split_once('/') {
         Some((ports, proto)) => (ports, Proto::parse(proto)?),
@@ -286,6 +288,7 @@ fn port_spec(s: &str, port: u16) -> Option<(bool, Proto)> {
 }
 
 /// `ufw status verbose` (or `ufw status`)
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_ufw(output: &str, port: u16) -> Firewall {
     let (mut udp, mut tcp) = (vec![], vec![]);
     let mut rules = false;
@@ -369,6 +372,7 @@ pub(crate) fn parse_ufw(output: &str, port: u16) -> Firewall {
 }
 
 /// `ENABLED=no` in /etc/ufw/ufw.conf
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 fn ufw_disabled(conf: &str) -> bool {
     conf.lines()
         .any(|l| l.trim().eq_ignore_ascii_case("ENABLED=no"))
@@ -376,6 +380,7 @@ fn ufw_disabled(conf: &str) -> bool {
 
 /// `firewall-cmd --list-ports` (space separated `port[-port]/proto`);
 /// for `--info-service` output, the value of its `ports:` line
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 pub(crate) fn firewalld_ports(list: &str, port: u16) -> (bool, bool) {
     let (mut udp, mut tcp) = (false, false);
     for spec in list.split_whitespace() {
@@ -388,6 +393,7 @@ pub(crate) fn firewalld_ports(list: &str, port: u16) -> (bool, bool) {
 }
 
 /// the `ports:` line of `firewall-cmd --info-service=<name>`
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
 pub(crate) fn firewalld_service_ports(info: &str) -> &str {
     info.lines()
         .find_map(|l| l.trim().strip_prefix("ports:"))
@@ -747,10 +753,22 @@ fn tls_connector(cert: &Certificate) -> Result<TlsConnector, rustls::Error> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+/// why a TLS probe got no certificate
+enum TlsFailure {
+    /// the TCP port is open but the handshake failed
+    Refused(String),
+    /// no TCP connection
+    NoAnswer(String),
+}
+
 /// TLS handshake with a peer's clipboard / pairing port: its fingerprint
-async fn tls_probe(addr: SocketAddr, connector: TlsConnector) -> Result<String, String> {
+async fn tls_probe(addr: SocketAddr, connector: TlsConnector) -> Result<String, TlsFailure> {
+    let stream = match timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(TlsFailure::NoAnswer(e.to_string())),
+        Err(_) => return Err(TlsFailure::NoAnswer("timed out".into())),
+    };
     let handshake = async {
-        let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
         let name = ServerName::try_from("mimouse").expect("valid server name");
         let mut stream = connector
             .connect(name, stream)
@@ -769,6 +787,7 @@ async fn tls_probe(addr: SocketAddr, connector: TlsConnector) -> Result<String, 
     timeout(PROBE_TIMEOUT, handshake)
         .await
         .unwrap_or(Err("timed out".into()))
+        .map_err(TlsFailure::Refused)
 }
 
 /// a client to check, from the service or (if it is not running) the config
@@ -794,7 +813,7 @@ async fn resolve(resolver: &Option<TokioResolver>, host: &str) -> Result<Vec<IpA
 /// handshake, if the handshakes agree
 fn peer_fingerprint<'a>(
     dtls: &'a [(SocketAddr, Dtls)],
-    tls: &'a [(SocketAddr, Result<String, String>)],
+    tls: &'a [(SocketAddr, Result<String, TlsFailure>)],
 ) -> Option<&'a str> {
     dtls.iter()
         .find_map(|(_, d)| match d {
@@ -906,29 +925,39 @@ async fn client_checks(
             format!("answers on {}", answered.join(", ")),
         ));
     }
-    match tls.iter().find(|(_, r)| r.is_ok()) {
-        Some((a, _)) => checks.push(Check::pass(
+    let refused = tls.iter().find_map(|(a, r)| match r {
+        Err(TlsFailure::Refused(e)) => Some((a, e)),
+        _ => None,
+    });
+    match (tls.iter().find(|(_, r)| r.is_ok()), refused) {
+        (Some((a, _)), _) => checks.push(Check::pass(
             format!("{label}: TLS (clipboard, pairing)"),
             format!("answers on {a}"),
         )),
-        None => {
+        // a listener without clipboard sharing serves pairing only and
+        // closes other connections
+        (None, Some((a, e))) => checks.push(Check::pass(
+            format!("{label}: TLS (clipboard, pairing)"),
+            format!(
+                "port open on {a}, handshake refused ({e}): clipboard sharing is off there or not authorized"
+            ),
+        )),
+        (None, None) => {
             let errors = tls
                 .iter()
-                .map(|(a, r)| {
-                    format!(
-                        "{a}: {}",
-                        r.as_ref().err().map(String::as_str).unwrap_or("")
-                    )
+                .filter_map(|(a, r)| match r {
+                    Err(TlsFailure::NoAnswer(e)) => Some(format!("{a}: {e}")),
+                    _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            // the TCP port is open only while clipboard sharing or a
-            // `pair --accept` is active there, so silence is not an error
+            // older MiMouse versions open the TCP port only with clipboard
+            // sharing on, so silence is not an error
             checks.push(Check::warn(
                 format!("{label}: TLS (clipboard, pairing)"),
                 format!("no answer from {errors}"),
                 format!(
-                    "needed only for clipboard sharing (`clipboard = true` on both sides) and pairing; its firewall must allow {}/tcp",
+                    "needed for clipboard sharing and pairing: its firewall must allow {}/tcp (MiMouse before pairing support listens only with `clipboard = true`)",
                     target.port
                 ),
             ));
