@@ -11,8 +11,10 @@ use futures_core::Stream;
 
 use input_event::{Event, KeyboardEvent, scancode};
 
+pub use chord::{Chord, ChordMatcher};
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
+pub mod chord;
 pub mod error;
 
 #[cfg(libei)]
@@ -174,6 +176,11 @@ pub struct InputCapture {
     id_map: HashMap<CaptureHandle, (Position, Option<EdgeRange>)>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
+    /// client hotkeys the backend starts capture with while input is local
+    hotkeys: Vec<(Chord, CaptureHandle)>,
+    /// the client a requested focus goes to: the next `Begin` at its
+    /// position is for it alone
+    focus: Option<CaptureHandle>,
 }
 
 impl InputCapture {
@@ -197,7 +204,7 @@ impl InputCapture {
         if old != Some(new) {
             self.capture.create(pos, new).await?;
         }
-        Ok(())
+        self.update_hotkeys().await
     }
 
     /// destroy the client with the given id, if it exists
@@ -205,6 +212,9 @@ impl InputCapture {
         let (pos, _) = *self.id_map.get(&id).expect("no position for this handle");
         let old = self.barrier_range(pos);
         self.id_map.remove(&id);
+        if self.focus == Some(id) {
+            self.focus = None;
+        }
 
         log::debug!("destroying capture {id} @ {pos}");
         let remaining = self.position_map.get_mut(&pos).expect("id vector");
@@ -221,7 +231,51 @@ impl InputCapture {
                 self.capture.create(pos, new).await?;
             }
         }
-        Ok(())
+        self.update_hotkeys().await
+    }
+
+    /// Starts capture for `id` without a crossing (a hotkey or `cli focus`);
+    /// the backend reports `Begin` for it. Backends that cannot start
+    /// capture themselves return [`CaptureError::FocusByPointerPush`]: the
+    /// caller then moves the pointer through the barrier, and the `Begin`
+    /// that follows is for `id`.
+    pub async fn focus(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
+        let Some(&(pos, range)) = self.id_map.get(&id) else {
+            return Err(CaptureError::NoSuchClient(id));
+        };
+        self.focus = Some(id);
+        let result = self.capture.focus(pos, range).await;
+        if let Err(e) = &result {
+            if !matches!(e, CaptureError::FocusByPointerPush) {
+                self.focus = None;
+            }
+        }
+        result
+    }
+
+    /// forget a requested focus that did not start capture
+    pub fn clear_focus(&mut self) {
+        self.focus = None;
+    }
+
+    /// Hotkeys that start capture for a client while input is local, on
+    /// backends that see local keys (Windows, macOS). Clients without a
+    /// barrier are ignored until they get one.
+    pub async fn set_hotkeys(
+        &mut self,
+        hotkeys: Vec<(Chord, CaptureHandle)>,
+    ) -> Result<(), CaptureError> {
+        self.hotkeys = hotkeys;
+        self.update_hotkeys().await
+    }
+
+    async fn update_hotkeys(&mut self) -> Result<(), CaptureError> {
+        let hotkeys = self
+            .hotkeys
+            .iter()
+            .filter_map(|(chord, id)| Some((chord.clone(), self.id_map.get(id)?.0)))
+            .collect();
+        self.capture.set_hotkeys(hotkeys).await
     }
 
     /// the range of the barrier at `pos`: covers every client there
@@ -273,12 +327,9 @@ impl InputCapture {
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
+            hotkeys: Vec::new(),
+            focus: None,
         })
-    }
-
-    /// check whether the given keys are pressed
-    pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
-        keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -329,6 +380,16 @@ impl Stream for InputCapture {
             .map(|ids| ids.len())
             .unwrap_or(0);
 
+        // a requested focus: the `Begin` is for the focused client only
+        if matches!(event, CaptureEvent::Begin(_)) {
+            if let Some(id) = self.focus {
+                if self.id_map.get(&id).is_some_and(|&(p, _)| p == pos) {
+                    self.focus = None;
+                    return Poll::Ready(Some(Ok((id, event))));
+                }
+            }
+        }
+
         match len {
             0 => Poll::Pending,
             1 => Poll::Ready(Some(Ok((
@@ -363,6 +424,20 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Start capture at `pos` without a crossing, as if the cursor crossed
+    /// in the middle of `range`, and report `Begin`. Backends that cannot
+    /// grab input on their own return [`CaptureError::FocusByPointerPush`]:
+    /// a pointer pushed through the barrier by the local input emulation
+    /// starts it.
+    #[allow(clippy::double_must_use)] // async_trait's boxed future, as for the methods above
+    async fn focus(&mut self, pos: Position, range: Option<EdgeRange>) -> Result<(), CaptureError>;
+
+    /// Chords that start capture at a position while input is local. Only
+    /// backends that see local keys watch them (Windows, macOS); elsewhere
+    /// input is local exactly when these keys are invisible to mimouse.
+    #[allow(clippy::double_must_use)]
+    async fn set_hotkeys(&mut self, hotkeys: Vec<(Chord, Position)>) -> Result<(), CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

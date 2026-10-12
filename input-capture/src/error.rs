@@ -29,6 +29,12 @@ pub enum CaptureError {
     ActivationClosed,
     #[error("libei stream was closed")]
     EndOfStream,
+    /// this backend starts capture only when the pointer crosses the
+    /// barrier: push it through with the local input emulation
+    #[error("capture starts only when the pointer crosses the edge")]
+    FocusByPointerPush,
+    #[error("no capture barrier for client {0}")]
+    NoSuchClient(u64),
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
     #[cfg(libei)]

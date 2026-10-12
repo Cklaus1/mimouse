@@ -46,6 +46,14 @@ impl Capture for DummyInputCapture {
         Ok(())
     }
 
+    async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
+        Err(CaptureError::FocusByPointerPush)
+    }
+
+    async fn set_hotkeys(&mut self, _: Vec<(crate::Chord, Position)>) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }

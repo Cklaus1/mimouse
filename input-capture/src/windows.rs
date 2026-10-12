@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
 
-use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
+use super::{Capture, CaptureError, CaptureEvent, Chord, EdgeRange, Position};
 
 mod display_util;
 mod event_thread;
@@ -35,6 +35,16 @@ impl Capture for WindowsInputCapture {
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.event_thread.release_capture();
+        Ok(())
+    }
+
+    async fn focus(&mut self, pos: Position, range: Option<EdgeRange>) -> Result<(), CaptureError> {
+        self.event_thread.focus(pos, range);
+        Ok(())
+    }
+
+    async fn set_hotkeys(&mut self, hotkeys: Vec<(Chord, Position)>) -> Result<(), CaptureError> {
+        self.event_thread.set_hotkeys(hotkeys);
         Ok(())
     }
 

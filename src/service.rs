@@ -5,7 +5,7 @@ use crate::ipc::{
 use crate::{
     approval::reported_status,
     audit::AuditLog,
-    capture::{Capture, CaptureType, ICaptureEvent},
+    capture::{Capture, CaptureType, Hotkeys, ICaptureEvent},
     client::{Barrier, ClientManager, reuse_barriers},
     clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
@@ -18,6 +18,8 @@ use crate::{
     notify::Notifier,
 };
 use hickory_resolver::ResolveError;
+use input_capture::EdgeRange;
+use input_emulation::Edge;
 use log;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -59,6 +61,9 @@ pub struct Service {
     audit: AuditLog,
     /// `ChangePort` requests waiting for the listener to rebind
     port_requests: Vec<(ConnId, u64, Peer, FrontendRequest)>,
+    /// `Focus` requests waiting for the outcome, with the client they move
+    /// control to
+    focus_requests: Vec<(ConnId, u64, Peer, FrontendRequest, ClientHandle)>,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     /// (outgoing) client information
@@ -151,6 +156,7 @@ impl Service {
             config,
             audit,
             port_requests: Default::default(),
+            focus_requests: Default::default(),
             capture,
             emulation,
             clipboard,
@@ -188,6 +194,7 @@ impl Service {
         for handle in active {
             self.activate_client(handle);
         }
+        self.sync_hotkeys();
 
         loop {
             tokio::select! {
@@ -236,6 +243,20 @@ impl Service {
                         self.port_requests.push((conn, seq, peer, request));
                         return;
                     }
+                }
+                if let FrontendRequest::Focus { id } = request {
+                    match self.focus_error(id) {
+                        // answered once capture started, or failed to
+                        None => {
+                            self.capture.focus(id);
+                            self.focus_requests.push((conn, seq, peer, request, id));
+                        }
+                        Some(e) => {
+                            self.audit.record(&peer, &request, &Err(e.clone()));
+                            self.reply(conn, seq, Err(e));
+                        }
+                    }
+                    return;
                 }
                 let result = self.handle_request(&request);
                 if !request.is_read_only() {
@@ -310,8 +331,8 @@ impl Service {
                 self.save_config()?;
                 self.client_reply(id)
             }
-            // a different port is handled in `handle_ipc_event`
-            FrontendRequest::ChangePort { .. } => Reply::Done,
+            // a different port and focus are handled in `handle_ipc_event`
+            FrontendRequest::ChangePort { .. } | FrontendRequest::Focus { .. } => Reply::Done,
             FrontendRequest::EnableCapture => {
                 self.capture.reenable();
                 Reply::Done
@@ -418,6 +439,7 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        self.sync_hotkeys();
         self.notifier
             .set_switch_enabled(self.config.notify_switch());
         self.inhibit.set_enabled(self.config.idle_inhibit());
@@ -581,6 +603,21 @@ impl Service {
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
                     self.emulation.send_leave_event(incoming.addr);
+                }
+            }
+            ICaptureEvent::PushPointer { pos, range } => {
+                let (edge, fraction) = push_target(pos, range);
+                self.emulation.push_pointer(edge, fraction);
+            }
+            ICaptureEvent::FocusResult(handle, result) => {
+                let (done, waiting) = std::mem::take(&mut self.focus_requests)
+                    .into_iter()
+                    .partition(|r| r.4 == handle);
+                self.focus_requests = waiting;
+                for (conn, seq, peer, request, _) in done {
+                    self.audit.record(&peer, &request, &result);
+                    let reply = result.clone().map(|()| self.client_reply(handle));
+                    self.reply(conn, seq, reply);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -772,6 +809,7 @@ impl Service {
             self.connector.stop(handle);
             self.capture.destroy(handle);
             self.broadcast_client(handle);
+            self.sync_hotkeys();
             log::info!("deactivated client {handle}");
         }
     }
@@ -804,6 +842,7 @@ impl Service {
                 .create(handle, pos, CaptureType::Default, range);
             self.connector.keep_connected(handle);
             self.broadcast_client(handle);
+            self.sync_hotkeys();
             log::info!("activated client {handle} ({pos})");
         }
     }
@@ -817,6 +856,7 @@ impl Service {
         {
             self.capture.destroy(handle);
             self.connector.stop(handle);
+            self.sync_hotkeys();
         }
         self.notify_frontend(FrontendEvent::Deleted { id: handle });
     }
@@ -870,6 +910,30 @@ impl Service {
         self.inhibit.set(to.is_some());
     }
 
+    /// why control cannot move to `handle`, if it cannot
+    fn focus_error(&self, handle: ClientHandle) -> Option<String> {
+        match self.client_manager.get_state(handle) {
+            None => Some(format!("no such client: {handle}")),
+            Some((_, s)) if !s.active => Some(format!("client {handle} is not active")),
+            Some(_) => None,
+        }
+    }
+
+    /// hands the hotkeys of the active clients and `local_hotkey` to capture
+    fn sync_hotkeys(&self) {
+        let clients = self
+            .client_manager
+            .get_client_states()
+            .into_iter()
+            .filter(|(_, _, s)| s.active)
+            .filter_map(|(h, c, _)| Some((h, c.hotkey?)))
+            .collect();
+        self.capture.set_hotkeys(Hotkeys {
+            local: self.config.local_hotkey(),
+            clients,
+        });
+    }
+
     fn spawn_hook_command(&self, handle: ClientHandle) {
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
             return;
@@ -894,5 +958,39 @@ impl Service {
                 Err(e) => log::warn!("{cmd}: {e}"),
             }
         });
+    }
+}
+
+/// where to push the local pointer to cross the barrier at `pos`: that edge
+/// of this desktop, in the middle of `range` (`None`: the whole edge)
+fn push_target(pos: input_capture::Position, range: Option<EdgeRange>) -> (Edge, u16) {
+    let edge = match pos {
+        input_capture::Position::Left => Edge::Left,
+        input_capture::Position::Right => Edge::Right,
+        input_capture::Position::Top => Edge::Top,
+        input_capture::Position::Bottom => Edge::Bottom,
+    };
+    let (start, end) = range.map_or((0, 100), |r| (r.start(), r.end()));
+    // percent sum / 200 = the middle as a fraction of the edge
+    let fraction = (u32::from(start) + u32::from(end)) * u32::from(u16::MAX) / 200;
+    (edge, u16::try_from(fraction).unwrap_or(u16::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_is_pushed_through_the_middle_of_the_range() {
+        use input_capture::Position;
+        assert_eq!(push_target(Position::Left, None), (Edge::Left, 32767));
+        assert_eq!(
+            push_target(Position::Top, EdgeRange::new(0, 40)),
+            (Edge::Top, 13107)
+        );
+        assert_eq!(
+            push_target(Position::Bottom, EdgeRange::new(100 - 1, 100)),
+            (Edge::Bottom, 65207)
+        );
     }
 }

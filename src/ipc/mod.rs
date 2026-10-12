@@ -340,6 +340,10 @@ pub enum FrontendRequest {
         fingerprint: String,
     },
     SaveConfig,
+    /// move control to a client, as if the cursor crossed into it
+    Focus {
+        id: ClientHandle,
+    },
 }
 
 impl FrontendRequest {

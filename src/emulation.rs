@@ -63,6 +63,8 @@ enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
     ChangePort(u16),
+    /// move the local pointer through `edge` at a fraction of it
+    PushPointer(Edge, u16),
     Terminate,
 }
 
@@ -104,6 +106,14 @@ impl Emulation {
     pub(crate) fn request_port_change(&self, port: u16) {
         self.request_tx
             .send(EmulationRequest::ChangePort(port))
+            .expect("channel closed")
+    }
+
+    /// moves the local pointer through `edge` at `fraction` of it, so a
+    /// capture barrier there activates (GNOME `cli focus`)
+    pub(crate) fn push_pointer(&self, edge: Edge, fraction: u16) {
+        self.request_tx
+            .send(EmulationRequest::PushPointer(edge, fraction))
             .expect("channel closed")
     }
 
@@ -193,6 +203,7 @@ impl ListenTask {
                         let result = self.listener.port_changed().await;
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
                     }
+                    EmulationRequest::PushPointer(edge, fraction) => self.emulation_proxy.push_pointer(edge, fraction),
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
@@ -246,6 +257,8 @@ enum ProxyRequest {
     Input(Event, SocketAddr),
     /// place the pointer where the remote cursor enters
     EnterAt(SocketAddr, Edge, u16),
+    /// move the local pointer through an edge
+    PushPointer(Edge, u16),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -319,6 +332,16 @@ impl EmulationProxy {
         }
     }
 
+    fn push_pointer(&self, edge: Edge, fraction: u16) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::PushPointer(edge, fraction))
+                .expect("channel closed");
+        } else {
+            log::warn!("cannot push the pointer: input emulation is disabled");
+        }
+    }
+
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
@@ -367,6 +390,7 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::EnterAt(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::PushPointer(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -428,6 +452,12 @@ impl EmulationTask {
                         let handle = self.handle(emulation, addr).await;
                         emulation.enter_at(handle, edge, fraction)?;
                     }
+                    ProxyRequest::PushPointer(edge, fraction) => {
+                        emulation.create(PUSH_HANDLE).await;
+                        if !emulation.push_through(PUSH_HANDLE, edge, fraction).await? {
+                            log::warn!("cannot push the pointer: the emulation backend cannot place it");
+                        }
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -456,6 +486,9 @@ impl EmulationTask {
         handle
     }
 }
+
+/// emulation handle for pushing the local pointer, never a peer's
+const PUSH_HANDLE: EmulationHandle = EmulationHandle::MAX;
 
 /// Places the pointer once per crossing: the sender repeats `Enter` until it
 /// sees the Ack, and a late duplicate must not pull the pointer back to the
@@ -508,7 +541,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::EnterAt(..) => continue,
+            ProxyRequest::EnterAt(..) | ProxyRequest::PushPointer(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }

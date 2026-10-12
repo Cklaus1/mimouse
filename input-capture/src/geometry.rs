@@ -94,6 +94,49 @@ pub(crate) fn edge_fraction(displays: &[Rect], pos: Position, point: (f64, f64))
     Some((fraction * f64::from(u16::MAX)).round() as u16)
 }
 
+/// Where capture starts without a crossing (a hotkey or `cli focus`): the
+/// middle of `range` (`None`: the whole edge) on the `pos` edge, on the
+/// outermost pixel of the display there, as if the cursor had crossed
+/// there. `None` without a usable display.
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn focus_point(
+    displays: &[Rect],
+    pos: Position,
+    range: Option<EdgeRange>,
+) -> Option<(f64, f64)> {
+    let extent = edge_extent(displays, pos)?;
+    let (start, end) = match range {
+        Some(range) => range_segment(extent, range),
+        None => extent,
+    };
+    let mid = ((start + end) / 2.).floor();
+    // how far out the display's `pos` side lies
+    let outward = |d: &Rect| match pos {
+        Position::Left => -d.x,
+        Position::Right => d.x + d.width,
+        Position::Top => -d.y,
+        Position::Bottom => d.y + d.height,
+    };
+    // how far `mid` lies outside the display along the edge
+    let distance = |d: &Rect| {
+        let (lo, hi) = d.along(pos);
+        (lo - mid).max(mid - (hi - 1.)).max(0.)
+    };
+    let usable = || displays.iter().filter(|d| d.width > 0. && d.height > 0.);
+    let display = usable()
+        .filter(|d| distance(d) == 0.)
+        .max_by(|a, b| outward(a).total_cmp(&outward(b)))
+        .or_else(|| usable().min_by(|a, b| distance(a).total_cmp(&distance(b))))?;
+    let (lo, hi) = display.along(pos);
+    let along = mid.clamp(lo, hi - 1.);
+    Some(match pos {
+        Position::Left => (display.x, along),
+        Position::Right => (display.x + display.width - 1., along),
+        Position::Top => (along, display.y),
+        Position::Bottom => (along, display.y + display.height - 1.),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +282,34 @@ mod tests {
             barrier_segment(&[], &primary, Position::Left, range(0, 50)),
             None
         );
+    }
+
+    #[test]
+    fn focus_point_is_mid_range_on_the_outer_edge() {
+        let d = [rect(0., 0., 1920., 1080.)];
+        assert_eq!(focus_point(&d, Position::Left, None), Some((0., 540.)));
+        assert_eq!(
+            focus_point(&d, Position::Right, range(0, 40)),
+            Some((1919., 216.))
+        );
+        assert_eq!(
+            focus_point(&d, Position::Bottom, range(50, 100)),
+            Some((1440., 1079.))
+        );
+        // the right edge of a secondary display 200 px higher: the point
+        // lies on the display that reaches furthest right
+        let d = [rect(0., 0., 1920., 1080.), rect(1920., -200., 2560., 1440.)];
+        assert_eq!(focus_point(&d, Position::Right, None), Some((4479., 520.)));
+        assert_eq!(focus_point(&d, Position::Left, None), Some((0., 520.)));
+        // the middle of the top edge is on the secondary display
+        assert_eq!(focus_point(&d, Position::Top, None), Some((2240., -200.)));
+        // a gap along the edge: the nearest display (y = 750 is 250 px
+        // from the lower one, 251 from the upper one's last row)
+        let d = [rect(0., 0., 1000., 500.), rect(0., 1000., 1000., 500.)];
+        assert_eq!(
+            focus_point(&d, Position::Left, range(40, 60)),
+            Some((0., 1000.))
+        );
+        assert_eq!(focus_point(&[], Position::Left, None), None);
     }
 }

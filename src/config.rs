@@ -373,7 +373,7 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 /// ways to return control to the capturing machine
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseBind {
-    /// chord: all keys held at once
+    /// chord: exactly these keys held at once
     pub keys: Vec<scancode::Linux>,
     /// Ctrl tapped twice in quick succession
     pub double_tap_ctrl: bool,

@@ -698,6 +698,16 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
+    /// a layer-shell surface grabs input only on pointer enter
+    async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
+        Err(CaptureError::FocusByPointerPush)
+    }
+
+    /// local keys are invisible here: the compositor binds `cli focus`
+    async fn set_hotkeys(&mut self, _: Vec<(crate::Chord, Position)>) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }

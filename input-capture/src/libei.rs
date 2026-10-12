@@ -726,6 +726,16 @@ impl MiMouseInputCapture for LibeiInputCapture {
         Ok(())
     }
 
+    /// the portal activates capture only when the pointer hits a barrier
+    async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
+        Err(CaptureError::FocusByPointerPush)
+    }
+
+    /// local keys are invisible here: a desktop shortcut runs `cli focus`
+    async fn set_hotkeys(&mut self, _: Vec<(crate::Chord, Position)>) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
         let task = &mut self.capture_task;
