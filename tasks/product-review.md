@@ -69,7 +69,7 @@ Accept: parser test on a captured status JSON; smoke on gpumaster lists megapc a
 **S2 `mimouse cli doctor`.** Checks and prints pass/fail with a fix line: service running, config parses, key file permissions, firewall rule for the port (ufw, firewalld, Windows Firewall), each client resolves and answers (DTLS + TLS), each side trusts the other, capture/emulation state (incl. awaiting approval). `--json` supported.
 Accept: smoke on both machines shows all green; with the peer stopped, the reachability check fails with the address tried.
 
-**S3 Packages.** `.deb` and `.rpm` with the systemd user unit (cargo-deb / cargo-generate-rpm metadata, built in the release workflow), Scoop and winget manifests and a Homebrew formula under `packaging/`, Windows signing step in the release workflow that runs when signing secrets exist. [needs-human: publishing to winget/Scoop/Homebrew repositories and buying a code-signing certificate need accounts and money.]
+**S3 Packages.** `.deb` and `.rpm` with the systemd user unit (cargo-deb / cargo-generate-rpm metadata, built in the release workflow), Scoop and winget manifests and a Homebrew formula under `packaging/`. Windows binaries stay unsigned (decided by user). [needs-human: publishing to winget/Scoop/Homebrew repositories needs accounts.]
 Accept: `cargo deb` builds locally and the package installs the binary and unit; manifests validate (`winget validate` if available, JSON schema otherwise).
 
 ### U: upstream bugs present in the fork
@@ -91,4 +91,4 @@ Accept U1-U4: unit tests on extracted pure functions (flag mapping, scroll sign,
 | D5 | Discovery | Tailscale (`tailscale status --json`), no mDNS | decided by user |
 | D6 | Pair trust model | Short code shown on both sides, explicit confirm on both; tailnet membership never implies trust | engineering |
 | D7 | Weak-network thresholds | close after 3 of 4 missed pings window (2 s -> 4 s worst case), emulation watchdog 3 s | engineering |
-| D8 | Package publication, code-signing certificate | not done here | needs-human |
+| D8 | Package publication; code signing | publication not done here; no code-signing certificate, Windows binaries unsigned | publication needs-human; signing decided by user |
