@@ -10,6 +10,7 @@ mod crypto;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+mod inhibit;
 pub mod ipc;
 mod listen;
 #[cfg(target_os = "macos")]

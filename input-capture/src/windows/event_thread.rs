@@ -305,6 +305,12 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    /* mimouse's idle keepalive must reach the system to reset its idle timer */
+    let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
+    if mouse_low_level.dwExtraInfo == crate::IDLE_KEEPALIVE_TAG {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */

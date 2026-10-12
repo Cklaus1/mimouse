@@ -12,6 +12,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    inhibit::IdleInhibit,
     listen::{ListenerCreationError, MiMouseListener},
     notify::Notifier,
 };
@@ -80,6 +81,8 @@ pub struct Service {
     next_trigger_handle: u64,
     /// desktop notifications (switches, unauthorized peers)
     notifier: Notifier,
+    /// keeps this machine awake while it forwards input
+    inhibit: IdleInhibit,
 }
 
 #[derive(Debug)]
@@ -134,6 +137,7 @@ impl Service {
         let port = config.port();
         let audit = AuditLog::new(config.config_dir());
         let notifier = Notifier::new(config.notify_switch());
+        let inhibit = IdleInhibit::new(config.idle_inhibit());
         let service = Self {
             config,
             audit,
@@ -155,6 +159,7 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             notifier,
+            inhibit,
         };
         Ok(service)
     }
@@ -395,7 +400,9 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
-        self.notifier.set_switch_enabled(self.config.notify_switch());
+        self.notifier
+            .set_switch_enabled(self.config.notify_switch());
+        self.inhibit.set_enabled(self.config.idle_inhibit());
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -758,6 +765,7 @@ impl Service {
                 .unwrap_or_else(|| format!("client {h}"))
         });
         self.notifier.switched(host.as_deref());
+        self.inhibit.set(to.is_some());
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle) {
