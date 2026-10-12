@@ -1050,11 +1050,19 @@ impl Service {
         self.inhibit.set(to.is_some());
     }
 
-    /// why control cannot move to `handle`, if it cannot
+    /// why control cannot move to `handle`, if it cannot. Capture reads
+    /// requests only once enabled, so a focus forwarded while the portal
+    /// dialog waits would never be answered.
     fn focus_error(&self, handle: ClientHandle) -> Option<String> {
         match self.client_manager.get_state(handle) {
             None => Some(format!("no such client: {handle}")),
             Some((_, s)) if !s.active => Some(format!("client {handle} is not active")),
+            Some(_) if self.capture_awaiting => {
+                Some("input capture is waiting for permission: approve the system dialog".into())
+            }
+            Some(_) if self.capture_status != Status::Enabled => {
+                Some("input capture is disabled".into())
+            }
             Some(_) => None,
         }
     }
