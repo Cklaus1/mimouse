@@ -1,7 +1,7 @@
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{Edge, EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -74,6 +74,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            enter_gate: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -122,6 +123,7 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    enter_gate: EnterGate,
 }
 
 impl ListenTask {
@@ -141,10 +143,16 @@ impl ListenTask {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    if let ProtoEvent::EnterAt(_, fraction) = event {
+                                        if self.enter_gate.crossing(addr, Instant::now()) {
+                                            self.emulation_proxy.enter_at(addr, to_edge(pos), fraction);
+                                        }
+                                    }
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                self.enter_gate.left(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
@@ -171,7 +179,10 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr) => {
+                        self.enter_gate.left(addr);
+                        self.listener.reply(addr, ProtoEvent::Leave(0)).await
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -210,6 +221,8 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    /// place the pointer where the remote cursor enters
+    EnterAt(SocketAddr, Edge, u16),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -259,6 +272,14 @@ impl EmulationProxy {
         }
     }
 
+    fn enter_at(&self, addr: SocketAddr, edge: Edge, fraction: u16) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::EnterAt(addr, edge, fraction))
+                .expect("channel closed");
+        }
+    }
+
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
@@ -304,6 +325,7 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::EnterAt(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -358,18 +380,13 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
-                            }
-                        };
+                        let handle = self.handle(emulation, addr).await;
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::EnterAt(addr, edge, fraction) => {
+                        let handle = self.handle(emulation, addr).await;
+                        emulation.enter_at(handle, edge, fraction)?;
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -380,6 +397,59 @@ impl EmulationTask {
                 },
             }
         }
+    }
+
+    /// the emulation handle for `addr`, created on first use
+    async fn handle(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+    ) -> EmulationHandle {
+        if let Some(&handle) = self.handles.get(&addr) {
+            return handle;
+        }
+        let handle = self.next_id;
+        self.next_id += 1;
+        emulation.create(handle).await;
+        self.handles.insert(addr, handle);
+        handle
+    }
+}
+
+/// Places the pointer once per crossing: the sender repeats `Enter` until it
+/// sees the Ack, and a late duplicate must not pull the pointer back to the
+/// edge after relative motion has moved it.
+#[derive(Default)]
+struct EnterGate {
+    last_enter: HashMap<SocketAddr, Instant>,
+}
+
+/// `Enter`s from the same peer closer than this belong to one crossing.
+const ENTER_REPEAT_WINDOW: Duration = Duration::from_secs(1);
+
+impl EnterGate {
+    /// records an `Enter` from `addr`; true if it starts a new crossing
+    fn crossing(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        let new = self
+            .last_enter
+            .get(&addr)
+            .is_none_or(|&last| now.saturating_duration_since(last) > ENTER_REPEAT_WINDOW);
+        self.last_enter.insert(addr, now);
+        new
+    }
+
+    /// the cursor left this device for `addr`
+    fn left(&mut self, addr: SocketAddr) {
+        self.last_enter.remove(&addr);
+    }
+}
+
+fn to_edge(pos: Position) -> Edge {
+    match pos {
+        Position::Left => Edge::Left,
+        Position::Right => Edge::Right,
+        Position::Top => Edge::Top,
+        Position::Bottom => Edge::Bottom,
     }
 }
 
@@ -397,6 +467,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::EnterAt(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
@@ -421,5 +492,31 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod enter_tests {
+    use super::*;
+
+    #[test]
+    fn places_once_per_crossing() {
+        let a: SocketAddr = "10.0.0.1:4242".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:4242".parse().unwrap();
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut gate = EnterGate::default();
+        assert!(gate.crossing(a, t0));
+        // repeats while the sender waits for the Ack, incl. a late one
+        assert!(!gate.crossing(a, ms(5)));
+        assert!(!gate.crossing(a, ms(900)));
+        assert!(!gate.crossing(a, ms(1800)));
+        // other peers are independent
+        assert!(gate.crossing(b, ms(10)));
+        // the cursor left and comes back quickly: a new crossing
+        gate.left(a);
+        assert!(gate.crossing(a, ms(1850)));
+        // the Leave got lost, but the next crossing is seconds later
+        assert!(gate.crossing(a, ms(6000)));
     }
 }

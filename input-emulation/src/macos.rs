@@ -1,9 +1,10 @@
+use super::geometry::{Rect, entry_point};
 use super::macos_logic::{KeyAction, KeyPlanner};
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{Edge, Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -74,6 +75,30 @@ impl MacOSEmulation {
             keys: KeyPlanner::default(),
             flags: Rc::new(Cell::new(CGEventFlags::empty())),
         })
+    }
+
+    /// moves the pointer to `location` with a mouse-moved event, or a drag
+    /// event if a button is held
+    fn post_motion(&self, location: CGPoint, dx: f64, dy: f64) -> bool {
+        let event_type = self
+            .pressed_buttons
+            .iter()
+            .next()
+            .map(|&btn| drag_event_type(btn))
+            .unwrap_or(CGEventType::MouseMoved);
+        let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            event_type,
+            location,
+            CGMouseButton::Left,
+        ) else {
+            log::warn!("mouse event creation failed!");
+            return false;
+        };
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
+        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+        event.post(CGEventTapLocation::HID);
+        true
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
@@ -286,30 +311,7 @@ impl Emulation for MacOSEmulation {
 
                         mouse_location.x = new_mouse_x;
                         mouse_location.y = new_mouse_y;
-
-                        // If any button is held, emit a drag event for it;
-                        // otherwise emit a normal mouse-moved event.
-                        let event_type = self
-                            .pressed_buttons
-                            .iter()
-                            .next()
-                            .map(|&btn| drag_event_type(btn))
-                            .unwrap_or(CGEventType::MouseMoved);
-                        let event = match CGEvent::new_mouse_event(
-                            self.event_source.clone(),
-                            event_type,
-                            mouse_location,
-                            CGMouseButton::Left,
-                        ) {
-                            Ok(e) => e,
-                            Err(_) => {
-                                log::warn!("mouse event creation failed!");
-                                return Ok(());
-                            }
-                        };
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
-                        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        self.post_motion(mouse_location, dx, dy);
                     }
                     PointerEvent::Button {
                         time: _,
@@ -476,6 +478,40 @@ impl Emulation for MacOSEmulation {
         }
         // FIXME
         Ok(())
+    }
+
+    fn enter_at(
+        &mut self,
+        _handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let displays = match CGDisplay::active_displays() {
+            Ok(displays) => displays,
+            Err(e) => {
+                log::warn!("could not list displays: {e}");
+                return Ok(None);
+            }
+        };
+        let displays = displays
+            .into_iter()
+            .map(|id| {
+                // global display coordinates (points), origin top left of
+                // the main display
+                let b = CGDisplay::new(id).bounds();
+                Rect {
+                    x: b.origin.x.round() as i32,
+                    y: b.origin.y.round() as i32,
+                    width: b.size.width.round() as i32,
+                    height: b.size.height.round() as i32,
+                }
+            })
+            .collect::<Vec<_>>();
+        let Some((x, y)) = entry_point(&displays, edge, fraction) else {
+            return Ok(None);
+        };
+        let placed = self.post_motion(CGPoint::new(x as CGFloat, y as CGFloat), 0., 0.);
+        Ok(placed.then_some((x, y)))
     }
 
     async fn create(&mut self, _handle: EmulationHandle) {}
