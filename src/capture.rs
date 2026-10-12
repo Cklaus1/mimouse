@@ -17,7 +17,10 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::{config::ReleaseBind, connect::MiMouseConnection};
+use crate::{
+    config::ReleaseBind,
+    connect::{ConnEvent, MiMouseConnection},
+};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -286,15 +289,20 @@ impl CaptureTask {
 
                     match event {
                         // connection acknowlegded => set state to Sending
-                        ProtoEvent::Ack(_) => {
+                        ConnEvent::Received(ProtoEvent::Ack(_)) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                         }
                         // client disconnected
-                        ProtoEvent::Leave(_) => {
+                        ConnEvent::Received(ProtoEvent::Leave(_)) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // the client we control is gone: give control back
+                        ConnEvent::Closed if self.active_client == Some(handle) => {
+                            log::info!("releasing capture: connection to client {handle} closed");
+                            self.release_capture(capture).await?;
+                        }
                         _ => {}
                     }
                 },
