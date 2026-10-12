@@ -10,6 +10,7 @@ use core_graphics::event::{
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use input_event::macos_scroll::MacosScroll;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
@@ -390,53 +391,23 @@ impl Emulation for MacOSEmulation {
                         }
                         event.post(CGEventTapLocation::HID);
                     }
-                    PointerEvent::Axis {
-                        time: _,
-                        axis,
-                        value,
-                    } => {
-                        let value = value as i32;
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
+                    PointerEvent::Axis { .. } | PointerEvent::AxisDiscrete120 { .. } => {
+                        let Some(scroll) = MacosScroll::from_wire(pointer_event) else {
+                            log::warn!("invalid scroll event: {pointer_event:?}");
+                            return Ok(());
+                        };
+                        let unit = if scroll.lines {
+                            ScrollEventUnit::LINE
+                        } else {
+                            ScrollEventUnit::PIXEL
                         };
                         let event = match CGEvent::new_scroll_event(
                             self.event_source.clone(),
-                            ScrollEventUnit::PIXEL,
-                            count,
-                            wheel1,
-                            wheel2,
-                            wheel3,
-                        ) {
-                            Ok(e) => e,
-                            Err(()) => {
-                                log::warn!("scroll event creation failed!");
-                                return Ok(());
-                            }
-                        };
-                        event.post(CGEventTapLocation::HID);
-                    }
-                    PointerEvent::AxisDiscrete120 { axis, value } => {
-                        const LINES_PER_STEP: i32 = 3;
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
-                        };
-                        let event = match CGEvent::new_scroll_event(
-                            self.event_source.clone(),
-                            ScrollEventUnit::LINE,
-                            count,
-                            wheel1,
-                            wheel2,
-                            wheel3,
+                            unit,
+                            scroll.wheel_count(),
+                            scroll.vertical,
+                            scroll.horizontal,
+                            0,
                         ) {
                             Ok(e) => e,
                             Err(()) => {
