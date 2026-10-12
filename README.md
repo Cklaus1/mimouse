@@ -34,12 +34,19 @@ Packages from source: `cargo build --release && cargo deb --no-build && cargo ge
 
 ## Setup
 
-1. Run `mimouse` on each machine. The log shows `certificate fingerprint: aa:bb:...`.
-2. Write `config.toml` on each machine (see [config.toml](config.toml)): the peer under `[[clients]]` with its position, and the peer's fingerprint under `[authorized_fingerprints]`.
+1. Run `mimouse` on each machine (or install the package / service, see [Run at login](#run-at-login)).
+2. Open the port (default 4242): UDP for input, TCP for clipboard and pairing (TCP is needed even with `clipboard = false`). firewalld: `firewall/mimouse.xml`.
+3. Pair the machines (below), or write `config.toml` by hand on each machine (see [config.toml](config.toml)): the peer under `[[clients]]` with its position, and the peer's fingerprint (`certificate fingerprint: aa:bb:...` in its log) under `[authorized_fingerprints]`.
    - Linux/macOS: `~/.config/mimouse/config.toml`
    - Windows: `%LOCALAPPDATA%\mimouse\config.toml`
-3. Open the port (default 4242): UDP for input, plus TCP if `clipboard = true`. firewalld: `firewall/mimouse.xml`.
-4. Restart `mimouse`.
+
+### Pairing
+
+On the machine to be added run `mimouse cli pair --accept` (waits 120 s, `--timeout` to change). On this machine run `mimouse cli pair <host> --position <left|right|top|bottom>`. `<host>` can be a host name, an address, or a Tailscale machine name; `mimouse cli discover` lists tailnet machines that answer on the MiMouse port (it reads `tailscale status`; no mDNS). Both terminals show a 6-digit code; confirm only if both codes match. Without a terminal, use `mimouse cli pair --confirm <code>` or `--cancel`. Each side then trusts the other's certificate and adds it as a client on the matching side. Being on the same tailnet never implies trust.
+
+### Troubleshooting
+
+`mimouse cli doctor` checks the service, config, key file permissions, firewall and every client (reachable over DTLS/TLS, trusted in both directions) and prints a fix for each failure. It exits non-zero when any check fails; `--json` gives machine-readable output.
 
 An unauthorized peer shows up in the log with the command to approve it (`mimouse cli authorize-key <name> <fingerprint>`).
 
@@ -67,7 +74,7 @@ Set `clipboard = true` on both machines. Text, HTML and images go to the machine
 ## CLI
 
 Talks to the running service; `mimouse cli help` lists commands:
-`list`, `watch`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `set-enter-hook`, `change-port`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`.
+`list`, `watch`, `discover`, `doctor`, `pair`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `set-enter-hook`, `change-port`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`.
 
 - Commands wait for the service, exit non-zero on failure (e.g. unknown client id), and save `config.toml` on success.
 - `--json`: one JSON value per result. `list --json` includes `capture` and `emulation`: `enabled`, `disabled` or `awaiting_approval` (a portal dialog is waiting). `watch --json` prints the current state, then streams events (clients, connections, clipboard transfers without contents, unauthorized attempts) as JSON lines; schema: `FrontendEvent` in `src/ipc/mod.rs`.

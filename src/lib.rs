@@ -8,7 +8,9 @@ mod clipboard;
 pub mod config;
 mod connect;
 mod crypto;
+mod discover;
 mod dns;
+mod doctor;
 mod emulation;
 pub mod emulation_test;
 mod inhibit;
@@ -17,5 +19,6 @@ mod listen;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
 mod notify;
+mod pair;
 mod proto;
 pub mod service;
