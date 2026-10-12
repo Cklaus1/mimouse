@@ -7,6 +7,7 @@ mod clipboard;
 pub mod config;
 mod connect;
 mod crypto;
+mod discover;
 mod dns;
 mod emulation;
 pub mod emulation_test;

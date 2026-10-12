@@ -3,9 +3,13 @@ use futures::StreamExt;
 use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
-use crate::ipc::{
-    AsyncFrontendEventReader, ClientHandle, ClientInfo, ClipboardDirection, ConnectionError,
-    DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, connect_async,
+use crate::{
+    config::Config,
+    discover::{self, DiscoverError},
+    ipc::{
+        AsyncFrontendEventReader, ClientHandle, ClientInfo, ClipboardDirection, ConnectionError,
+        DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, connect_async,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -20,6 +24,8 @@ pub enum CliError {
     Request(String),
     #[error("the service closed the connection")]
     Closed,
+    #[error(transparent)]
+    Discover(#[from] DiscoverError),
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -89,9 +95,18 @@ enum CliSubcommand {
     SaveConfig,
     /// print the current state, then stream events until interrupted
     Watch,
+    /// list online Tailscale machines that answer on the MiMouse port
+    Discover {
+        /// port to probe (default: this machine's port)
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
-pub async fn run(args: CliArgs) -> Result<(), CliError> {
+pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
+    if let CliSubcommand::Discover { port } = args.command {
+        return Ok(discover::run(&config, port, args.json).await?);
+    }
     let (rx, mut tx) = connect_async(Some(Duration::from_millis(500))).await?;
     let request = match args.command {
         CliSubcommand::Watch => return watch(rx, args.json).await,
@@ -155,7 +170,9 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
             }
         }
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
-        CliSubcommand::Watch => unreachable!("handled in `run`"),
+        CliSubcommand::Watch | CliSubcommand::Discover { .. } => {
+            unreachable!("handled in `run`")
+        }
     }
 }
 
