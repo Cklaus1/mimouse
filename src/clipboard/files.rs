@@ -105,10 +105,40 @@ fn numbered(name: &str, n: usize) -> String {
     }
 }
 
+/// names to store received files under: made safe for Windows if
+/// `sanitize`, and unique even where names differing only in case collide
+/// (`fold_case`: Windows, and macOS by default)
+fn local_names(names: &[&str], sanitize: bool, fold_case: bool) -> Vec<String> {
+    let key = |n: &str| {
+        if fold_case {
+            n.to_lowercase()
+        } else {
+            n.to_owned()
+        }
+    };
+    let mut used = HashSet::new();
+    names
+        .iter()
+        .map(|&name| {
+            let name = if sanitize {
+                windows_file_name(name)
+            } else {
+                name.to_owned()
+            };
+            let mut unique = name.clone();
+            let mut n = 2;
+            while !used.insert(key(&unique)) {
+                unique = numbered(&name, n);
+                n += 1;
+            }
+            unique
+        })
+        .collect()
+}
+
 /// a valid wire name made safe for the Windows file system: reserved
 /// characters replaced, trailing dots and spaces removed, device names
 /// prefixed with `_`
-#[cfg_attr(not(windows), allow(dead_code))]
 fn windows_file_name(name: &str) -> String {
     const DEVICES: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -219,10 +249,13 @@ fn next_transfer_id(existing: &[u64], now: u64) -> u64 {
 
 fn write_files(dir: &Path, files: &[(&str, &[u8])]) -> io::Result<Vec<FileRef>> {
     let mut stored = Vec::with_capacity(files.len());
-    for &(name, bytes) in files {
-        #[cfg(windows)]
-        let path = dir.join(windows_file_name(name));
-        #[cfg(not(windows))]
+    let names: Vec<&str> = files.iter().map(|&(name, _)| name).collect();
+    let names = local_names(
+        &names,
+        cfg!(windows),
+        cfg!(any(windows, target_os = "macos")),
+    );
+    for (name, &(_, bytes)) in names.iter().zip(files) {
         let path = dir.join(name);
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -368,6 +401,32 @@ pub(super) mod tests {
         assert_eq!(windows_file_name("con.txt"), "_con.txt");
         assert_eq!(windows_file_name("LPT1"), "_LPT1");
         assert_eq!(windows_file_name("console.txt"), "console.txt");
+    }
+
+    #[test]
+    fn local_names_collide_after_sanitizing_or_case_folding() {
+        let names = [
+            "Readme", "README", "a:b", "a_b", "x.", "x", "c.TXT", "C.txt",
+        ];
+        assert_eq!(
+            local_names(&names, true, true),
+            [
+                "Readme",
+                "README (2)",
+                "a_b",
+                "a_b (2)",
+                "x",
+                "x (2)",
+                "c.TXT",
+                "C (2).txt"
+            ]
+        );
+        // case-sensitive file systems keep the wire names
+        assert_eq!(local_names(&names[..2], false, false), ["Readme", "README"]);
+        assert_eq!(
+            local_names(&names[..2], false, true),
+            ["Readme", "README (2)"]
+        );
     }
 
     #[test]
