@@ -629,7 +629,7 @@ fn merge_clients(doc: &mut toml_edit::Table, clients: &[TomlClient]) {
     for client in clients {
         let found = existing.iter_mut().find(|t| {
             t.as_ref()
-                .and_then(|t| table_client(t))
+                .and_then(table_client)
                 .is_some_and(|c| key(&c) == key(client))
         });
         let new = to_table(client);
