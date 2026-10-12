@@ -8,6 +8,10 @@ use async_trait::async_trait;
 use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
+use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -17,9 +21,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
+use windows::core::BOOL;
 
-use super::{Emulation, EmulationHandle};
+use super::geometry::{Rect, entry_point};
+use super::{Edge, Emulation, EmulationHandle};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -75,11 +81,65 @@ impl Emulation for WindowsEmulation {
         Ok(())
     }
 
+    fn enter_at(
+        &mut self,
+        _: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let Some((x, y)) = entry_point(&monitors(), edge, fraction) else {
+            log::warn!("no monitors to place the pointer on");
+            return Ok(None);
+        };
+        // virtual-desktop coordinates, the same space EnumDisplayMonitors uses
+        if let Err(e) = unsafe { SetCursorPos(x, y) } {
+            log::warn!("SetCursorPos({x}, {y}): {e}");
+            return Ok(None);
+        }
+        Ok(Some((x, y)))
+    }
+
     async fn create(&mut self, _handle: EmulationHandle) {}
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+}
+
+/// Monitor rectangles on the virtual desktop.
+fn monitors() -> Vec<Rect> {
+    unsafe extern "system" fn add_monitor(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<Rect>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            let r = info.rcMonitor;
+            monitors.push(Rect {
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+            });
+        }
+        true.into()
+    }
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(add_monitor),
+            LPARAM(&mut monitors as *mut Vec<Rect> as isize),
+        );
+    }
+    monitors
 }
 
 impl WindowsEmulation {

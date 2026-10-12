@@ -19,8 +19,8 @@ use async_trait::async_trait;
 
 use reis::{
     ei::{
-        self, Button, Keyboard, Pointer, Scroll, button::ButtonState, handshake::ContextType,
-        keyboard::KeyState,
+        self, Button, Keyboard, Pointer, PointerAbsolute, Scroll, button::ButtonState,
+        handshake::ContextType, keyboard::KeyState,
     },
     event::{self, Connection, DeviceCapability, DeviceEvent, EiEvent, SeatEvent},
     tokio::EiConvertEventStream,
@@ -30,11 +30,16 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
+use super::geometry::{Rect, entry_point};
+use super::{Edge, Emulation, EmulationHandle, error::LibeiEmulationCreationError};
+
+/// absolute pointer with its regions (one per monitor on mutter)
+type AbsolutePointer = (ei::Device, ei::PointerAbsolute, Vec<Rect>);
 
 #[derive(Clone, Default)]
 struct Devices {
     pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
+    absolute: Arc<RwLock<Option<AbsolutePointer>>>,
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
     button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
@@ -254,6 +259,36 @@ impl Emulation for LibeiEmulation {
         Ok(())
     }
 
+    fn enter_at(
+        &mut self,
+        _: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let point = {
+            let absolute = self.devices.absolute.read().unwrap();
+            let Some((d, p, regions)) = absolute.as_ref() else {
+                log::warn!("no absolute pointer device: pointer not placed");
+                return Ok(None);
+            };
+            let Some((x, y)) = entry_point(regions, edge, fraction) else {
+                log::warn!("absolute pointer device has no regions: pointer not placed");
+                return Ok(None);
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+            p.motion_absolute(x as f32, y as f32);
+            d.frame(self.conn.serial(), now);
+            (x, y)
+        };
+        self.context
+            .flush()
+            .map_err(|e| io::Error::new(e.kind(), e))?;
+        Ok(Some(point))
+    }
+
     async fn create(&mut self, _: EmulationHandle) {}
     async fn destroy(&mut self, _: EmulationHandle) {}
 
@@ -323,6 +358,25 @@ async fn ei_event_handler(
                         .unwrap()
                         .replace((device.device().clone(), pointer));
                 }
+                if let Some(absolute) = e.device().interface::<PointerAbsolute>() {
+                    let regions = e
+                        .device()
+                        .regions()
+                        .iter()
+                        .map(|r| Rect {
+                            x: r.x as i32,
+                            y: r.y as i32,
+                            width: r.width as i32,
+                            height: r.height as i32,
+                        })
+                        .collect::<Vec<_>>();
+                    log::debug!("absolute pointer regions: {regions:?}");
+                    devices.absolute.write().unwrap().replace((
+                        device.device().clone(),
+                        absolute,
+                        regions,
+                    ));
+                }
                 if let Some(keyboard) = e.device().interface::<Keyboard>() {
                     devices
                         .keyboard
@@ -347,6 +401,13 @@ async fn ei_event_handler(
             }
             EiEvent::DeviceRemoved(e) => {
                 log::debug!("device removed: {:?}", e.device().device_type());
+                let mut absolute = devices.absolute.write().unwrap();
+                if absolute
+                    .as_ref()
+                    .is_some_and(|(d, ..)| d == e.device().device())
+                {
+                    absolute.take();
+                }
             }
             EiEvent::DevicePaused(e) => {
                 log::debug!("device paused: {:?}", e.device().device_type());
