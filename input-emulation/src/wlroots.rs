@@ -251,6 +251,16 @@ impl Emulation for WlrootsEmulation {
         let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
             return Ok(None);
         };
+        if self.last_flush_failed {
+            match self.queue.flush() {
+                // outgoing buffer still full, like `consume`: drop the move
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    log::warn!("can't keep up, discarding entry point ({handle})");
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
         let displays = self.state.displays();
         let Some((x, y)) = entry_point(&displays, edge, fraction) else {
             return Ok(None);
@@ -280,7 +290,14 @@ impl Emulation for WlrootsEmulation {
             (bottom - top) as u32,
         );
         virtual_input.pointer.frame();
-        self.queue.flush()?;
+        match self.queue.flush() {
+            Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.last_flush_failed = true;
+                log::warn!("can't keep up, entry point ({handle}) delayed");
+            }
+            Ok(()) => self.last_flush_failed = false,
+            Err(e) => Err(e)?,
+        }
         Ok(Some((x, y)))
     }
 
