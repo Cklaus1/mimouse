@@ -22,6 +22,7 @@ mod portal;
 mod windows;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
@@ -120,6 +121,8 @@ impl ClipboardData {
 }
 
 type Snapshot = (u64, Arc<ClipboardData>);
+/// digest of the snapshot a client sender is transferring
+type Sending = Rc<Cell<Option<u64>>>;
 
 /// a clipboard transfer to or from a peer; contents are never included
 pub(crate) struct ClipboardEvent {
@@ -269,8 +272,9 @@ struct ClipboardTask {
     /// digest of the clipboard contents each client is known to have
     delivered: HashMap<ClientHandle, u64>,
     /// per-client sender tasks; a watch channel coalesces rapid updates and
-    /// keeps them in order
-    senders: HashMap<ClientHandle, watch::Sender<Option<Snapshot>>>,
+    /// keeps them in order. The cell holds the digest being sent until it is
+    /// delivered or fails, so a re-enter meanwhile does not send it again
+    senders: HashMap<ClientHandle, (watch::Sender<Option<Snapshot>>, Sending)>,
     delivered_tx: mpsc::UnboundedSender<Delivered>,
     event_tx: mpsc::UnboundedSender<ClipboardEvent>,
 }
@@ -340,6 +344,11 @@ impl ClipboardTask {
                 Some(data) = local_rx.recv() => self.local_changed(data),
                 Some((data, ip)) = received_rx.recv() => self.received(data, ip, &backend),
                 Some(delivered) = delivered_rx.recv() => {
+                    if let Some((_, sending)) = self.senders.get(&delivered.handle) {
+                        if sending.get() == Some(delivered.digest) {
+                            sending.set(None);
+                        }
+                    }
                     self.delivered.insert(delivered.handle, delivered.digest);
                     let _ = self.event_tx.send(delivered.event);
                 }
@@ -412,20 +421,30 @@ impl ClipboardTask {
 
     fn update(&mut self, handle: ClientHandle) {
         let snapshot = self.current.clone();
-        if let Some(tx) = self.senders.get(&handle).filter(|tx| !tx.is_closed()) {
-            tx.send_replace(snapshot);
+        if let Some((tx, sending)) = self.senders.get(&handle).filter(|(tx, _)| !tx.is_closed()) {
+            // skip if exactly this clipboard is being sent, with nothing
+            // else queued behind it
+            let digest = snapshot.as_ref().map(|(d, _)| *d);
+            let in_flight = digest.is_some()
+                && sending.get() == digest
+                && tx.borrow().as_ref().map(|(d, _)| *d) == digest;
+            if !in_flight {
+                tx.send_replace(snapshot);
+            }
             return;
         }
         let (tx, rx) = watch::channel(snapshot);
+        let sending = Rc::new(Cell::new(None));
         spawn_local(client_sender(
             handle,
             rx,
+            sending.clone(),
             self.tls.clone(),
             self.client_manager.clone(),
             self.delivered_tx.clone(),
             self.max_file_size,
         ));
-        self.senders.insert(handle, tx);
+        self.senders.insert(handle, (tx, sending));
     }
 }
 
@@ -433,6 +452,7 @@ impl ClipboardTask {
 async fn client_sender(
     handle: ClientHandle,
     mut rx: watch::Receiver<Option<Snapshot>>,
+    sending: Sending,
     tls: Rc<transport::Tls>,
     client_manager: ClientManager,
     delivered_tx: mpsc::UnboundedSender<Delivered>,
@@ -446,19 +466,28 @@ async fn client_sender(
                 Some(addrs) if addrs.is_empty() => {
                     log::debug!("clipboard: no address known for client {handle}")
                 }
-                Some(addrs) => match transport::send(&tls, &addrs, data.clone(), max_file_size)
-                    .await
-                {
-                    Ok(addr) => {
-                        log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
-                        let _ = delivered_tx.send(Delivered {
-                            handle,
-                            digest,
-                            event: ClipboardEvent::new(ClipboardDirection::Sent, addr.ip(), &data),
-                        });
+                Some(addrs) => {
+                    sending.set(Some(digest));
+                    match transport::send(&tls, &addrs, data.clone(), max_file_size).await {
+                        Ok(addr) => {
+                            log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
+                            let _ = delivered_tx.send(Delivered {
+                                handle,
+                                digest,
+                                event: ClipboardEvent::new(
+                                    ClipboardDirection::Sent,
+                                    addr.ip(),
+                                    &data,
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            // a later re-enter retries
+                            sending.set(None);
+                            log::warn!("could not send clipboard to client {handle}: {e}");
+                        }
                     }
-                    Err(e) => log::warn!("could not send clipboard to client {handle}: {e}"),
-                },
+                }
             }
         }
         if rx.changed().await.is_err() {
