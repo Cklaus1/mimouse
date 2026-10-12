@@ -141,9 +141,16 @@ fn is_tailscale_v6(ip: &Ipv6Addr) -> bool {
 impl TailnetPeer {
     /// `name` is this peer's host name, MagicDNS name or its first label
     pub fn matches(&self, name: &str) -> bool {
+        let host = name.trim_end_matches('.');
+        self.dns_matches(name) || (!self.name.is_empty() && self.name.eq_ignore_ascii_case(host))
+    }
+
+    /// `name` is this peer's MagicDNS name or its first label: unique in a
+    /// tailnet, unlike host names
+    fn dns_matches(&self, name: &str) -> bool {
         let name = name.trim_end_matches('.');
         let label = self.dns_name.split('.').next().unwrap_or_default();
-        [self.name.as_str(), self.dns_name.as_str(), label]
+        [self.dns_name.as_str(), label]
             .iter()
             .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(name))
     }
@@ -157,6 +164,19 @@ impl TailnetPeer {
         let mut seen = std::collections::HashSet::new();
         addrs.retain(|a| seen.insert(*a));
         addrs
+    }
+}
+
+/// the peer called `name`: the one with that MagicDNS name, else the only
+/// one with that host name; none if several share it (DNS decides then)
+fn find_peer<'a>(peers: &'a [TailnetPeer], name: &str) -> Option<&'a TailnetPeer> {
+    if let Some(p) = peers.iter().find(|p| p.dns_matches(name)) {
+        return Some(p);
+    }
+    let mut by_host = peers.iter().filter(|p| p.matches(name));
+    match (by_host.next(), by_host.next()) {
+        (Some(p), None) => Some(p),
+        _ => None,
     }
 }
 
@@ -296,10 +316,13 @@ pub async fn addresses(config: &Config, name: &str) -> Vec<IpAddr> {
     for ip in candidates.iter().flatten().filter(|ip| is_lan(ip)) {
         *claims.entry(*ip).or_default() += 1;
     }
+    let Some(peer) = find_peer(&peers, name) else {
+        return vec![];
+    };
     let Some(mut addrs) = peers
         .iter()
         .zip(candidates)
-        .find_map(|(p, c)| p.matches(name).then_some(c))
+        .find_map(|(p, c)| std::ptr::eq(p, peer).then_some(c))
     else {
         return vec![];
     };
@@ -417,6 +440,30 @@ mod tests {
         assert!(wsl.matches("megapc-wsl.tail6765ef.ts.net."));
         assert!(!wsl.matches("megapc"));
         assert!(!wsl.matches("tail6765ef"));
+    }
+
+    /// two machines with HostName `evo-pc`: DNS names decide, an ambiguous
+    /// host name matches none
+    #[test]
+    fn find_peer_prefers_dns_names() {
+        let mut peers = parse_status(FIXTURE).unwrap();
+        let dns = |name: &str| find_peer(&peers, name).map(|p| p.dns_name.clone());
+        assert_eq!(dns("evo-pc").as_deref(), Some("evo-pc.tail6765ef.ts.net"));
+        assert_eq!(
+            dns("EVO-PC-1").as_deref(),
+            Some("evo-pc-1.tail6765ef.ts.net")
+        );
+        assert_eq!(
+            dns("wsl-chris").as_deref(),
+            Some("megapc-wsl.tail6765ef.ts.net")
+        );
+        for p in peers
+            .iter_mut()
+            .filter(|p| p.dns_name.starts_with("evo-pc."))
+        {
+            p.dns_name = "evo-pc-2.tail6765ef.ts.net".into();
+        }
+        assert!(find_peer(&peers, "evo-pc").is_none());
     }
 
     fn probed(peer: &TailnetPeer, answering: &[IpAddr]) -> Probed {
