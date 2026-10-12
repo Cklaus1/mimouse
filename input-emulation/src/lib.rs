@@ -5,7 +5,7 @@ use std::{
 };
 use tokio::sync::watch;
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 pub use self::geometry::Edge;
@@ -184,6 +184,40 @@ impl InputEmulation {
             log::info!("entered at {x},{y} ({edge} edge, fraction {fraction})");
         }
         Ok(())
+    }
+
+    /// Moves the pointer just inside `edge` at `fraction` (as `enter_at`),
+    /// then relatively out through the edge, the way a user's mouse would
+    /// reach it. Compositors check pointer barriers on this motion, so a
+    /// capture barrier there activates. Returns `false` when the backend
+    /// cannot place the pointer absolutely.
+    pub async fn push_through(
+        &mut self,
+        handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<bool, EmulationError> {
+        /// a few events, so one lost to rounding or acceleration still lands
+        const STEPS: usize = 3;
+        /// logical pixels per event: far more than the edge inset
+        const STEP: f64 = 16.;
+        let Some((x, y)) = self.emulation.enter_at(handle, edge, fraction)? else {
+            return Ok(false);
+        };
+        log::info!("pushing the pointer from {x},{y} through the {edge} edge");
+        let (dx, dy) = match edge {
+            Edge::Left => (-STEP, 0.),
+            Edge::Right => (STEP, 0.),
+            Edge::Top => (0., -STEP),
+            Edge::Bottom => (0., STEP),
+        };
+        for _ in 0..STEPS {
+            let motion = PointerEvent::Motion { time: 0, dx, dy };
+            self.emulation
+                .consume(Event::Pointer(motion), handle)
+                .await?;
+        }
+        Ok(true)
     }
 
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {

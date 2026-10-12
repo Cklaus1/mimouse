@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
@@ -15,27 +15,30 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::core::{PCWSTR, w};
-
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
     HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WNDPROC,
 };
+use windows::core::{PCWSTR, w};
 
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode::{self, Linux},
 };
 
-use super::{CaptureEvent, Position, display_util};
+use super::{CaptureEvent, EdgeRange, Position, display_util};
+use crate::ChordMatcher;
+use crate::chord::Chord;
 use crate::geometry::{self, Rect};
 
 pub(crate) struct EventThread {
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<Request>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
 }
@@ -52,27 +55,37 @@ impl EventThread {
     }
 
     pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+        self.request(Request::Release);
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, pos: Position, range: Option<EdgeRange>) {
+        self.request(Request::Create(pos, range));
     }
 
     pub(crate) fn destroy(&self, pos: Position) {
-        self.client_update(ClientUpdate::Destroy(pos));
+        self.request(Request::Destroy(pos));
+    }
+
+    pub(crate) fn focus(&self, pos: Position, range: Option<EdgeRange>) {
+        self.request(Request::Focus(pos, range));
+    }
+
+    pub(crate) fn set_hotkeys(&self, hotkeys: Vec<(Chord, Position)>) {
+        self.request(Request::SetHotkeys(hotkeys));
     }
 
     fn exit(&self) {
         self.signal(RequestType::Exit);
     }
 
-    fn client_update(&self, request: ClientUpdate) {
+    /// one queue for every request, so a release and the focus that
+    /// follows it are handled in order
+    fn request(&self, request: Request) {
         {
             let mut requests = self.request_buffer.lock().unwrap();
             requests.push(request);
         }
-        self.signal(RequestType::ClientUpdate);
+        self.signal(RequestType::Request);
     }
 
     fn signal(&self, event_type: RequestType) {
@@ -89,14 +102,17 @@ impl Drop for EventThread {
 }
 
 enum RequestType {
-    ClientUpdate = 0,
-    Release = 1,
+    Request = 0,
     Exit = 2,
 }
 
-enum ClientUpdate {
-    Create(Position),
+enum Request {
+    Create(Position, Option<EdgeRange>),
     Destroy(Position),
+    Release,
+    /// start capture at a position without a crossing
+    Focus(Position, Option<EdgeRange>),
+    SetHotkeys(Vec<(Chord, Position)>),
 }
 
 fn blocking_send_event(pos: Position, event: CaptureEvent) {
@@ -111,8 +127,8 @@ fn try_send_event(
 }
 
 thread_local! {
-    /// all configured clients
-    static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
+    /// all configured clients and the part of their edge that activates them
+    static CLIENTS: RefCell<HashMap<Position, Option<EdgeRange>>> = RefCell::new(HashMap::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
@@ -123,6 +139,13 @@ thread_local! {
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// client hotkeys, watched while input is local
+    static HOTKEYS: RefCell<ChordMatcher<Position>> = RefCell::new(ChordMatcher::default());
+    /// virtual-key code of each key the hotkeys saw go down
+    static VIRTUAL_KEYS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// keys held down locally when a hotkey started capture: their key-ups
+    /// go to the system, or it would keep them held
+    static LOCAL_KEYS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn get_msg() -> Option<MSG> {
@@ -139,7 +162,7 @@ fn get_msg() -> Option<MSG> {
 
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<Request>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
@@ -159,7 +182,7 @@ fn start(
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<Request>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
     /* communicate thread id */
@@ -229,21 +252,10 @@ fn start_routine(
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
-                x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
-                }
-                x if x == RequestType::ClientUpdate as usize => {
-                    let requests = {
-                        let mut res = vec![];
-                        let mut requests = request_buffer.lock().unwrap();
-                        for request in requests.drain(..) {
-                            res.push(request);
-                        }
-                        res
-                    };
-
+                x if x == RequestType::Request as usize => {
+                    let requests = std::mem::take(&mut *request_buffer.lock().unwrap());
                     for request in requests {
-                        update_clients(request)
+                        handle_request(request)
                     }
                 }
                 _ => {}
@@ -286,18 +298,30 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     };
 
     /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+    let Some(range) = CLIENTS.with_borrow(|clients| clients.get(&pos).copied()) else {
+        return ret;
+    };
+
+    let (entry_point, fraction, in_range) = DISPLAYS.with_borrow(|(displays, _)| {
+        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
+        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
+        let point = (f64::from(entry_point.0), f64::from(entry_point.1));
+        let in_range = match geometry::edge_extent(&rects, pos) {
+            Some(extent) => geometry::in_range(extent, geometry::along(point, pos), range),
+            None => range.is_none(),
+        };
+        let fraction = geometry::edge_fraction(&rects, pos, point);
+        (entry_point, fraction, in_range)
+    });
+
+    /* a crossing outside the client's range does not activate it */
+    if !in_range {
+        log::trace!("crossing at {entry_point:?} outside the range of {pos}");
         return ret;
     }
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
-    let (entry_point, fraction) = DISPLAYS.with_borrow(|(displays, _)| {
-        let entry_point = display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos);
-        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
-        let point = (f64::from(entry_point.0), f64::from(entry_point.1));
-        (entry_point, geometry::edge_fraction(&rects, pos, point))
-    });
     ENTRY_POINT.replace(entry_point);
 
     /* notify main thread */
@@ -342,15 +366,59 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let active = ACTIVE_CLIENT.get();
+    let watching = HOTKEYS.with_borrow(|hotkeys| !hotkeys.is_empty());
+
+    /* convert to key event */
+    let key_event = if active.is_some() || watching {
+        to_key_event(wparam, lparam)
+    } else {
+        None
+    };
+
+    /* hotkeys see every key, so they know which keys are held */
+    let hotkey = match key_event {
+        Some(KeyboardEvent::Key { key, state, .. }) => {
+            let vk = unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode };
+            feed_hotkeys(key, state, vk, active.is_none())
+        }
+        _ => None,
+    };
+
     /* get active client if any */
-    let Some(client) = ACTIVE_CLIENT.get() else {
+    let Some(client) = active else {
+        /* a client hotkey while local: capture for it; only its last key
+         * is swallowed, the held modifiers reach applications as usual */
+        if let Some(pos) = hotkey {
+            let range = CLIENTS.with_borrow(|clients| clients.get(&pos).copied().flatten());
+            /* everything held but the swallowed final key went down locally */
+            let local_keys = HOTKEYS.with_borrow(|hotkeys| match hotkeys.held() {
+                [held @ .., _last] => held.to_vec(),
+                [] => Vec::new(),
+            });
+            if activate(pos, range) {
+                LOCAL_KEYS.replace(local_keys);
+                return LRESULT(1);
+            }
+        }
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
 
-    /* convert to key event */
-    let Some(key_event) = to_key_event(wparam, lparam) else {
+    let Some(key_event) = key_event else {
         return LRESULT(1);
     };
+
+    /* the key-up of a key that went down locally */
+    if let KeyboardEvent::Key { key, state: 0, .. } = key_event {
+        let local = LOCAL_KEYS.with_borrow_mut(|keys| {
+            let held = keys.contains(&key);
+            keys.retain(|&k| k != key);
+            held
+        });
+        if local {
+            return CallNextHookEx(None, ncode, wparam, lparam);
+        }
+    }
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
         log::warn!("e: {e}");
@@ -358,6 +426,63 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* don't pass event to applications */
     LRESULT(1)
+}
+
+/// Feeds a key to the hotkeys; returns the position whose hotkey it
+/// completes. `local`: input goes to this machine.
+fn feed_hotkeys(key: u32, state: u8, vk: u32, local: bool) -> Option<Position> {
+    VIRTUAL_KEYS.with_borrow_mut(|vks| {
+        HOTKEYS.with_borrow_mut(|hotkeys| {
+            if state != 0 {
+                vks.insert(key, vk);
+                /* key-ups on the secure desktop (Ctrl+Alt+Del, Win+L) never
+                 * reach this hook. Keys swallowed while capturing are
+                 * missing from the async key state, so only check while local. */
+                if local {
+                    hotkeys.forget_released(|k| {
+                        k == key || vks.get(&k).is_none_or(|&vk| is_key_down(vk))
+                    });
+                }
+            }
+            hotkeys.feed(key, state)
+        })
+    })
+}
+
+fn is_key_down(vk: u32) -> bool {
+    // the most significant bit is set while the key is down
+    unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+/// Starts capture at `pos` without a crossing (a hotkey or a focus
+/// request): moves the cursor to the middle of `range` on that edge, as if
+/// it had crossed there, and reports `Begin`. False if no client is there.
+fn activate(pos: Position, range: Option<EdgeRange>) -> bool {
+    if !CLIENTS.with_borrow(|clients| clients.contains_key(&pos)) {
+        log::warn!("cannot start capture: no client at {pos}");
+        return false;
+    }
+    let target = DISPLAYS.with_borrow_mut(|(displays, generation)| {
+        update_display_regions(displays, generation);
+        let rects: Vec<Rect> = displays.iter().map(to_rect).collect();
+        let point = geometry::focus_point(&rects, pos, range)?;
+        Some((point, geometry::edge_fraction(&rects, pos, point)))
+    });
+    let Some(((x, y), fraction)) = target else {
+        log::warn!("cannot start capture: no display");
+        return false;
+    };
+    let point = (x as i32, y as i32);
+    if let Err(e) = unsafe { SetCursorPos(point.0, point.1) } {
+        log::warn!("failed to move the cursor to {point:?}: {e}");
+    }
+    /* motion is relative to the entry point, where the cursor now is */
+    ENTRY_POINT.replace(point);
+    PREV_POS.replace(Some(point));
+    ACTIVE_CLIENT.replace(Some(pos));
+    log::debug!("capture for {pos} started at {point:?}");
+    blocking_send_event(pos, CaptureEvent::Begin(fraction));
+    true
 }
 
 unsafe extern "system" fn window_proc(
@@ -428,12 +553,12 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
     }
 }
 
-fn update_clients(request: ClientUpdate) {
+fn handle_request(request: Request) {
     match request {
-        ClientUpdate::Create(pos) => {
-            CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
+        Request::Create(pos, range) => {
+            CLIENTS.with_borrow_mut(|clients| clients.insert(pos, range));
         }
-        ClientUpdate::Destroy(pos) => {
+        Request::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
@@ -441,6 +566,14 @@ fn update_clients(request: ClientUpdate) {
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
+        Request::Release => {
+            ACTIVE_CLIENT.take();
+            LOCAL_KEYS.take();
+        }
+        Request::Focus(pos, range) => {
+            activate(pos, range);
+        }
+        Request::SetHotkeys(hotkeys) => HOTKEYS.with_borrow_mut(|h| h.set_chords(hotkeys)),
     }
 }
 

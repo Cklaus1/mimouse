@@ -3,7 +3,9 @@ use std::task::Poll;
 use async_trait::async_trait;
 use futures_core::Stream;
 
-use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::X11InputCaptureCreationError,
+};
 
 pub struct X11InputCapture {}
 
@@ -15,7 +17,7 @@ impl X11InputCapture {
 
 #[async_trait]
 impl Capture for X11InputCapture {
-    async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+    async fn create(&mut self, _pos: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
         Ok(())
     }
 
@@ -24,6 +26,14 @@ impl Capture for X11InputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
+        Err(CaptureError::FocusByPointerPush)
+    }
+
+    async fn set_hotkeys(&mut self, _: Vec<(crate::Chord, Position)>) -> Result<(), CaptureError> {
         Ok(())
     }
 

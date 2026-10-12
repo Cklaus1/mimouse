@@ -1,4 +1,7 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, Chord, ChordMatcher, EdgeRange, Position,
+    error::MacosCaptureCreationError,
+};
 use crate::geometry::{self, Rect};
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -27,7 +30,7 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -50,8 +53,8 @@ struct Bounds {
 
 #[derive(Debug)]
 struct InputCaptureState {
-    /// active capture positions
-    active_clients: Lazy<HashSet<Position>>,
+    /// active capture positions and the part of their edge that activates them
+    active_clients: Lazy<HashMap<Position, Option<EdgeRange>>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
     /// position where the cursor was captured
@@ -60,14 +63,22 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// client hotkeys, watched while input is local
+    hotkeys: ChordMatcher<Position>,
+    /// keys held down locally when a hotkey started capture: their key-ups
+    /// go to the system, or it would keep them held
+    local_keys: Vec<u32>,
 }
 
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
-    Create(Position),
+    Create(Position, Option<EdgeRange>),
     Destroy(Position),
     Grab(Position),
+    /// start capture at a position without a crossing
+    Focus(Position, Option<EdgeRange>),
+    SetHotkeys(Vec<(Chord, Position)>),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -75,11 +86,13 @@ enum ProducerEvent {
 impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
-            active_clients: Lazy::new(HashSet::new),
+            active_clients: Lazy::new(HashMap::new),
             current_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            hotkeys: ChordMatcher::default(),
+            local_keys: Vec::new(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -89,13 +102,24 @@ impl InputCaptureState {
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+        let desktop = [self.desktop()];
 
-        for &position in self.active_clients.iter() {
+        for (&position, &range) in self.active_clients.iter() {
             if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
                 || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
                 || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
                 || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
             {
+                // a crossing outside the client's range does not activate it
+                let point = geometry::along((location.x, location.y), position);
+                let in_range = match geometry::edge_extent(&desktop, position) {
+                    Some(extent) => geometry::in_range(extent, point, range),
+                    None => range.is_none(),
+                };
+                if !in_range {
+                    log::trace!("crossing at {point} outside the range of {position}");
+                    continue;
+                }
                 log::debug!("Crossed barrier into position: {position:?}");
                 return Some(position);
             }
@@ -119,21 +143,34 @@ impl InputCaptureState {
         Ok(())
     }
 
-    /// where `location` lies along the `pos` edge of the display bounds
-    fn edge_fraction(&self, location: CGPoint, pos: Position) -> Option<u16> {
+    /// the bounding box of all displays
+    fn desktop(&self) -> Rect {
         let b = &self.bounds;
-        let desktop = [Rect {
+        Rect {
             x: b.xmin,
             y: b.ymin,
             width: b.xmax - b.xmin,
             height: b.ymax - b.ymin,
-        }];
-        geometry::edge_fraction(&desktop, pos, (location.x, location.y))
+        }
+    }
+
+    /// where `location` lies along the `pos` edge of the display bounds
+    fn edge_fraction(&self, location: CGPoint, pos: Position) -> Option<u16> {
+        geometry::edge_fraction(&[self.desktop()], pos, (location.x, location.y))
     }
 
     /// start the input capture by
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
-        let mut location = event.location();
+        self.start_capture_at(event.location(), position)
+    }
+
+    /// start the input capture with the cursor at `location`, moved onto
+    /// the `position` edge
+    fn start_capture_at(
+        &mut self,
+        mut location: CGPoint,
+        position: Position,
+    ) -> Result<(), CaptureError> {
         let edge_offset = 1.0;
         // move cursor location to display bounds
         match position {
@@ -144,6 +181,37 @@ impl InputCaptureState {
         };
         self.enter_position = Some(location);
         self.reset_cursor()
+    }
+
+    /// Starts capture at `pos` without a crossing (a hotkey or a focus
+    /// request): the cursor moves to the middle of `range` on that edge, as
+    /// if it had crossed there. Returns where along the edge.
+    fn focus(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<Option<u16>, CaptureError> {
+        let desktop = self.desktop();
+        let (x, y) =
+            geometry::focus_point(&[desktop], pos, range).unwrap_or((desktop.x, desktop.y));
+        let location = CGPoint::new(x, y);
+        let at = self.edge_fraction(location, pos);
+        self.start_capture_at(location, pos)?;
+        Ok(at)
+    }
+
+    /// feeds the key events among `events` to the hotkeys; returns the
+    /// position whose hotkey they complete
+    fn feed_hotkeys(&mut self, events: &[CaptureEvent]) -> Option<Position> {
+        let mut fired = None;
+        for event in events {
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                *event
+            {
+                fired = self.hotkeys.feed(key, state).or(fired);
+            }
+        }
+        fired
     }
 
     /// resets the cursor to the position, where the capture started
@@ -164,10 +232,12 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
+        event_tx: &Sender<(Position, CaptureEvent)>,
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
+                self.local_keys.clear();
                 if self.current_pos.is_some() {
                     self.show_cursor()?;
                     self.current_pos = None;
@@ -179,8 +249,19 @@ impl InputCaptureState {
                     self.current_pos = Some(pos);
                 }
             }
-            ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
+            ProducerEvent::Focus(pos, range) => {
+                if self.current_pos.is_some() || !self.active_clients.contains_key(&pos) {
+                    log::warn!("cannot start capture at {pos}: capturing or no client there");
+                    return Ok(());
+                }
+                let at = self.focus(pos, range)?;
+                self.hide_cursor()?;
+                self.current_pos = Some(pos);
+                let _ = event_tx.send((pos, CaptureEvent::Begin(at))).await;
+            }
+            ProducerEvent::SetHotkeys(hotkeys) => self.hotkeys.set_chords(hotkeys),
+            ProducerEvent::Create(p, range) => {
+                self.active_clients.insert(p, range);
             }
             ProducerEvent::Destroy(p) => {
                 if let Some(current) = self.current_pos {
@@ -437,6 +518,8 @@ fn create_event_tap<'a>(
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
         let mut res_events = vec![];
+        // the event goes to the system although capture is active
+        let mut pass_through = false;
 
         if matches!(event_type, CGEventType::TapDisabledByTimeout) {
             // The kernel disables the tap when our callback runs
@@ -499,6 +582,24 @@ fn create_event_tap<'a>(
             .unwrap_or_else(|e| {
                 log::error!("Failed to get events: {e}");
             });
+            // the hotkeys see every key, so they know which keys are held
+            state.feed_hotkeys(&res_events);
+            // key-ups of keys that went down locally go to the system
+            if !state.local_keys.is_empty() {
+                let local_keys = &mut state.local_keys;
+                res_events.retain(|e| match *e {
+                    CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                        key,
+                        state: 0,
+                        ..
+                    })) if local_keys.contains(&key) => {
+                        local_keys.retain(|&k| k != key);
+                        pass_through = true;
+                        false
+                    }
+                    _ => true,
+                });
+            }
 
             // Keep (hidden) cursor at the edge of the screen
             if matches!(
@@ -509,6 +610,37 @@ fn create_event_tap<'a>(
                     | CGEventType::OtherMouseDragged
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
+            }
+        } else if matches!(
+            event_type,
+            CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+        ) {
+            // a client hotkey while local: capture for it; only its last key
+            // is dropped, the held modifiers reach applications as usual
+            let mut keys = vec![];
+            if let Err(e) = get_events(&event_type, cg_ev, &mut keys, &mut state.modifier_state) {
+                log::debug!("{e}");
+            }
+            if let Some(pos) = state.feed_hotkeys(&keys) {
+                if let Some(&range) = state.active_clients.get(&pos) {
+                    // everything held but the dropped final key went down
+                    // locally
+                    let local_keys = match state.hotkeys.held() {
+                        [held @ .., _last] => held.to_vec(),
+                        [] => Vec::new(),
+                    };
+                    match state.focus(pos, range) {
+                        Ok(at) => {
+                            state.local_keys = local_keys;
+                            capture_position = Some(pos);
+                            res_events.push(CaptureEvent::Begin(at));
+                            notify_tx
+                                .blocking_send(ProducerEvent::Grab(pos))
+                                .expect("Failed to send notification");
+                        }
+                        Err(e) => log::warn!("cannot start capture at {pos}: {e}"),
+                    }
+                }
             }
         } else if matches!(event_type, CGEventType::MouseMoved) {
             // Did we cross a barrier?
@@ -531,6 +663,8 @@ fn create_event_tap<'a>(
                 // may already be closed when the InputCapture instance is dropped.
                 let _ = event_tx.blocking_send((pos, *e));
             });
+        }
+        if capture_position.is_some() && !pass_through {
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
             cg_ev.set_type(CGEventType::Null);
@@ -657,6 +791,7 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
+        let focus_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -689,7 +824,7 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        state.handle_producer_event(producer_event, &focus_tx).await.unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
                     }
@@ -748,11 +883,15 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        pos: Position,
+        range: Option<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
+            let _ = notify_tx.send(ProducerEvent::Create(pos, range)).await;
             log::debug!("done !");
         });
         Ok(())
@@ -768,12 +907,24 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
+    // sent in order, unlike create / destroy: a focus right after a release
+    // must not overtake it
     async fn release(&mut self) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
-        });
+        log::debug!("notifying Release");
+        let _ = self.notify_tx.send(ProducerEvent::Release).await;
+        Ok(())
+    }
+
+    async fn focus(&mut self, pos: Position, range: Option<EdgeRange>) -> Result<(), CaptureError> {
+        let _ = self.notify_tx.send(ProducerEvent::Focus(pos, range)).await;
+        Ok(())
+    }
+
+    async fn set_hotkeys(&mut self, hotkeys: Vec<(Chord, Position)>) -> Result<(), CaptureError> {
+        let _ = self
+            .notify_tx
+            .send(ProducerEvent::SetHotkeys(hotkeys))
+            .await;
         Ok(())
     }
 

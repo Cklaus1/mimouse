@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use input_event::scancode;
 use serde::{Deserialize, Serialize};
 
 mod connect_async;
@@ -148,6 +149,13 @@ pub struct ClientConfig {
     /// enter hook
     #[serde(rename = "enter_hook")]
     pub cmd: Option<String>,
+    /// the part of the edge that switches to this client, in percent of its
+    /// length (`None`: all of it)
+    #[serde(default)]
+    pub range: Option<[u8; 2]>,
+    /// chord that switches control to this client
+    #[serde(default)]
+    pub hotkey: Option<Vec<scancode::Linux>>,
 }
 
 impl Default for ClientConfig {
@@ -158,6 +166,8 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            range: None,
+            hotkey: None,
         }
     }
 }
@@ -348,6 +358,10 @@ pub enum FrontendRequest {
         fingerprint: String,
     },
     SaveConfig,
+    /// move control to a client, as if the cursor crossed into it
+    Focus {
+        id: ClientHandle,
+    },
     /// pair with the machine at `host` (running `pair --accept`), placing it
     /// at `position`; `ips` are tried before resolving `host`
     Pair {

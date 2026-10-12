@@ -5,6 +5,7 @@ use std::{
     rc::Rc,
 };
 
+use input_event::scancode;
 use slab::Slab;
 
 use crate::ipc::{ClientConfig, ClientHandle, ClientState, Position};
@@ -33,6 +34,8 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            range: config_client.range,
+            hotkey: config_client.hotkey,
         };
         let state = ClientState {
             active: config_client.active,
@@ -236,6 +239,13 @@ impl ClientManager {
         }
     }
 
+    /// update the hotkey that moves control to the client
+    pub(crate) fn set_hotkey(&self, handle: ClientHandle, hotkey: Option<Vec<scancode::Linux>>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.hotkey = hotkey;
+        }
+    }
+
     /// set resolving status of the client
     pub(crate) fn set_resolving(&self, handle: ClientHandle, status: bool) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -316,17 +326,25 @@ impl ClientManager {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Barrier {
     pub(crate) pos: Position,
+    /// the part of the edge it covers, in percent (`None`: all of it)
+    pub(crate) range: Option<[u8; 2]>,
 }
 
 impl From<&ClientConfig> for Barrier {
     fn from(c: &ClientConfig) -> Self {
-        Self { pos: c.pos }
+        Self {
+            pos: c.pos,
+            range: c.range,
+        }
     }
 }
 
 impl From<&ConfigClient> for Barrier {
     fn from(c: &ConfigClient) -> Self {
-        Self { pos: c.pos }
+        Self {
+            pos: c.pos,
+            range: c.range,
+        }
     }
 }
 
@@ -364,7 +382,7 @@ mod tests {
     use super::*;
 
     fn at(pos: Position) -> Barrier {
-        Barrier { pos }
+        Barrier { pos, range: None }
     }
 
     #[test]
@@ -392,6 +410,20 @@ mod tests {
         // deactivated
         assert_eq!(reuse_barriers(&running, &[None]), None);
         assert_eq!(reuse_barriers(&[], &[Some(at(Position::Left))]), None);
+    }
+
+    #[test]
+    fn changed_range_is_a_moved_barrier() {
+        let running = [(0, at(Position::Left))];
+        let narrowed = Barrier {
+            range: Some([20, 80]),
+            ..at(Position::Left)
+        };
+        assert_eq!(reuse_barriers(&running, &[Some(narrowed)]), None);
+        assert_eq!(
+            reuse_barriers(&[(0, narrowed)], &[Some(narrowed)]),
+            Some(vec![Some(0)])
+        );
     }
 
     #[test]

@@ -1,13 +1,13 @@
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+    cell::Cell,
     time::{Duration, Instant},
 };
 
 use crate::proto::ProtoEvent;
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, Chord, ChordMatcher, EdgeRange, InputCapture,
+    InputCaptureError, Position,
 };
 use input_event::{
     Event, KeyboardEvent, PointerEvent,
@@ -17,6 +17,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::{
     sync::watch,
     task::{JoinHandle, spawn_local},
+    time::sleep_until,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +54,24 @@ pub(crate) enum ICaptureEvent {
     /// the backend waits for the user to approve capturing input (or no
     /// longer does)
     AwaitingApproval(bool),
+    /// The backend cannot start capture on its own: move the local pointer
+    /// out through the `pos` edge, in the middle of `range`, so it crosses
+    /// the barrier there.
+    PushPointer {
+        pos: Position,
+        range: Option<EdgeRange>,
+    },
+    /// whether a focus (`cli focus`, a hotkey) moved control to the client
+    FocusResult(CaptureHandle, Result<(), String>),
+}
+
+/// Chords that move control, while it is on a client: `local` (and the
+/// release bind) back to this machine, `clients` to that client. Client
+/// hotkeys also start capture while local, where the backend sees keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Hotkeys {
+    pub(crate) local: Option<Vec<Linux>>,
+    pub(crate) clients: Vec<(CaptureHandle, Vec<Linux>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,13 +89,17 @@ enum CaptureRequest {
     /// capture must release the mouse
     Release,
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    Create(CaptureHandle, Position, CaptureType, Option<EdgeRange>),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable,
     /// set release bind
     SetReleaseBind(ReleaseBind),
+    /// move control to a client without a crossing
+    Focus(CaptureHandle),
+    /// set the hotkeys
+    SetHotkeys(Hotkeys),
 }
 
 impl Capture {
@@ -112,7 +135,10 @@ impl Capture {
             event_tx,
             permission_pending,
             request_rx,
-            release_bind: Rc::new(RefCell::new(release_bind)),
+            hotkey_watch: HotkeyWatch::default(),
+            hotkeys: Hotkeys::default(),
+            pending_focus: None,
+            release_bind,
             ctrl_taps: Default::default(),
             enter_at: None,
             state: Default::default(),
@@ -140,15 +166,18 @@ impl Capture {
         }
     }
 
+    /// `range`: `[start, end]` percent of the edge that activates the client
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
         pos: crate::ipc::Position,
         capture_type: CaptureType,
+        range: Option<[u8; 2]>,
     ) {
         let pos = to_capture_pos(pos);
+        let range = range.and_then(|[start, end]| EdgeRange::new(start, end));
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, pos, capture_type, range))
             .expect("channel closed");
     }
 
@@ -170,6 +199,19 @@ impl Capture {
 
     pub(crate) fn set_release_bind(&mut self, bind: ReleaseBind) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    }
+
+    /// moves control to `handle`; answered by [`ICaptureEvent::FocusResult`]
+    pub(crate) fn focus(&self, handle: CaptureHandle) {
+        self.request_tx
+            .send(CaptureRequest::Focus(handle))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn set_hotkeys(&self, hotkeys: Hotkeys) {
+        self.request_tx
+            .send(CaptureRequest::SetHotkeys(hotkeys))
+            .expect("channel closed");
     }
 }
 
@@ -194,12 +236,18 @@ struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<(CaptureHandle, Position, CaptureType, Option<EdgeRange>)>,
     conn: MiMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     /// `true` while the backend waits for a permission request
     permission_pending: watch::Sender<bool>,
-    release_bind: Rc<RefCell<ReleaseBind>>,
+    release_bind: ReleaseBind,
+    /// the configured hotkeys
+    hotkeys: Hotkeys,
+    /// release bind and hotkeys, watched while control is on a client
+    hotkey_watch: HotkeyWatch,
+    /// a focus waiting for its `Begin`
+    pending_focus: Option<PendingFocus>,
     ctrl_taps: CtrlDoubleTap,
     /// where the cursor crossed into the active client, if the backend knows
     enter_at: Option<u16>,
@@ -208,8 +256,14 @@ struct CaptureTask {
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        pos: Position,
+        capture_type: CaptureType,
+        range: Option<EdgeRange>,
+    ) {
+        self.captures.push((handle, pos, capture_type, range));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
@@ -219,7 +273,7 @@ impl CaptureTask {
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|&(_, p, t, _)| p == pos && t == CaptureType::Default)
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
@@ -247,12 +301,12 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t, r) => self.add_capture(h, p, t, r),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
-                        }
+                        CaptureRequest::SetReleaseBind(bind) => self.release_bind = bind,
+                        CaptureRequest::SetHotkeys(hotkeys) => self.hotkeys = hotkeys,
+                        CaptureRequest::Focus(h) => self.focus_done(h, Err("input capture is disabled".into())),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -274,7 +328,10 @@ impl CaptureTask {
         );
 
         /* create barriers for active clients */
-        let r = self.create_captures(&mut capture).await;
+        let mut r = self.create_captures(&mut capture).await;
+        if r.is_ok() {
+            r = self.apply_hotkeys(&mut capture).await;
+        }
         if let Err(e) = r {
             capture.terminate().await?;
             return Err(e.into());
@@ -285,6 +342,9 @@ impl CaptureTask {
         // capture ended by an error, the end of the stream or termination:
         // the peer must not keep keys held
         self.leave_client(&mut capture).await;
+        if let Some(pending) = self.pending_focus.take() {
+            self.focus_done(pending.handle, Err("input capture stopped".into()));
+        }
 
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;
@@ -294,9 +354,9 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, _type, range) in captures {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = capture.create(handle, pos, range) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -308,6 +368,7 @@ impl CaptureTask {
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
         loop {
+            let focus_deadline = self.pending_focus.as_ref().map(|p| p.deadline);
             tokio::select! {
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
@@ -344,18 +405,26 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
-                        capture.create(h, p).await?;
+                    CaptureRequest::Create(h, p, t, r) => {
+                        self.add_capture(h, p, t, r);
+                        capture.create(h, p, r).await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
-                        self.release_bind.borrow_mut().clone_from(&bind);
+                        self.release_bind = bind;
+                        self.hotkey_watch.set_chords(chords(&self.release_bind, &self.hotkeys));
                     }
+                    CaptureRequest::SetHotkeys(hotkeys) => {
+                        self.hotkeys = hotkeys;
+                        self.apply_hotkeys(capture).await?;
+                    }
+                    CaptureRequest::Focus(h) => self.focus(capture, h).await?,
                 },
+                _ = sleep_until(focus_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if focus_deadline.is_some() => self.focus_timed_out(capture),
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
@@ -377,9 +446,19 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        if capture.keys_pressed(&self.release_bind.borrow().keys) {
-            log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+        if let CaptureEvent::Input(e) = event {
+            match self.hotkey_watch.action(&e, self.active_client) {
+                HotkeyAction::Forward => {}
+                HotkeyAction::Ignore => return Ok(()),
+                HotkeyAction::Release => {
+                    log::info!("releasing capture: hotkey pressed");
+                    return self.release_capture(capture).await;
+                }
+                HotkeyAction::Switch(h) => {
+                    log::info!("hotkey pressed: moving control to client {h}");
+                    return self.focus(capture, h).await;
+                }
+            }
         }
 
         if matches!(event, CaptureEvent::Begin(_)) {
@@ -409,6 +488,17 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
+        // a focus for this client started capture
+        if matches!(event, CaptureEvent::Begin(_))
+            && self
+                .pending_focus
+                .as_ref()
+                .is_some_and(|p| p.handle == handle)
+        {
+            self.pending_focus = None;
+            self.focus_done(handle, Ok(()));
+        }
+
         // checked before sending, applied after: the final Ctrl release must
         // reach the peer or Ctrl stays held there
         let double_tapped = match event {
@@ -418,8 +508,7 @@ impl CaptureTask {
                 false
             }
             CaptureEvent::Input(e) => {
-                self.release_bind.borrow().double_tap_ctrl
-                    && self.ctrl_taps.feed(&e, Instant::now())
+                self.release_bind.double_tap_ctrl && self.ctrl_taps.feed(&e, Instant::now())
             }
             CaptureEvent::End => unreachable!("handled above"),
         };
@@ -452,6 +541,8 @@ impl CaptureTask {
     /// Key-ups for every key still held, a modifier reset and `Leave` for
     /// the active client. Every path that ends capturing goes through here.
     async fn leave_client(&mut self, capture: &mut InputCapture) {
+        // key-ups from now on are not seen
+        self.hotkey_watch.reset();
         if let Some(handle) = self.active_client.take() {
             self.send_leave(handle, capture.take_pressed_keys()).await;
             // control is local again, even if the peer was unreachable
@@ -459,6 +550,102 @@ impl CaptureTask {
                 .send(ICaptureEvent::Released)
                 .expect("channel closed");
         }
+    }
+
+    /// Moves control to `handle` without a crossing (a hotkey, `cli focus`):
+    /// leaves the active client, then lets the backend start capture, or
+    /// pushes the local pointer through the barrier where it cannot. The
+    /// result follows as [`ICaptureEvent::FocusResult`].
+    async fn focus(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.active_client == Some(handle) {
+            self.focus_done(handle, Ok(()));
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_focus.take() {
+            capture.clear_focus();
+            self.focus_done(
+                pending.handle,
+                Err(format!("control moved to client {handle} instead")),
+            );
+        }
+        let Some(&(_, pos, _, range)) = self
+            .captures
+            .iter()
+            .find(|&&(h, _, t, _)| h == handle && t == CaptureType::Default)
+        else {
+            self.focus_done(handle, Err(format!("client {handle} is not active")));
+            return Ok(());
+        };
+        if self.active_client.is_some() {
+            // the hotkey's modifiers are still held: the next hotkey that
+            // shares them must fire without pressing them again
+            let watch = self.hotkey_watch.clone();
+            self.release_capture(capture).await?;
+            self.hotkey_watch = watch;
+        }
+        let deadline = tokio::time::Instant::now() + FOCUS_TIMEOUT;
+        let pushed = match capture.focus(handle).await {
+            Ok(()) => false,
+            Err(CaptureError::FocusByPointerPush) => {
+                self.event_tx
+                    .send(ICaptureEvent::PushPointer { pos, range })
+                    .expect("channel closed");
+                true
+            }
+            Err(e) => {
+                log::warn!("cannot move control to client {handle}: {e}");
+                self.focus_done(handle, Err(e.to_string()));
+                return Ok(());
+            }
+        };
+        self.pending_focus = Some(PendingFocus {
+            handle,
+            deadline,
+            pushed,
+        });
+        Ok(())
+    }
+
+    /// a focus got no `Begin` in time
+    fn focus_timed_out(&mut self, capture: &mut InputCapture) {
+        let Some(pending) = self.pending_focus.take() else {
+            return;
+        };
+        capture.clear_focus();
+        let error = if pending.pushed {
+            log::warn!(
+                "focus on client {}: the pushed pointer did not activate the barrier",
+                pending.handle
+            );
+            FOCUS_BY_PUSH_UNAVAILABLE.to_string()
+        } else {
+            format!("capture for client {} did not start", pending.handle)
+        };
+        self.focus_done(pending.handle, Err(error));
+    }
+
+    fn focus_done(&self, handle: CaptureHandle, result: Result<(), String>) {
+        self.event_tx
+            .send(ICaptureEvent::FocusResult(handle, result))
+            .expect("channel closed");
+    }
+
+    /// applies release bind and hotkeys: to the chords watched while
+    /// capturing, and the client hotkeys to the backend
+    async fn apply_hotkeys(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.hotkey_watch
+            .set_chords(chords(&self.release_bind, &self.hotkeys));
+        let backend = self
+            .hotkeys
+            .clients
+            .iter()
+            .filter_map(|(h, keys)| Some((Chord::new(keys.iter().copied())?, *h)))
+            .collect();
+        capture.set_hotkeys(backend).await
     }
 
     async fn send_leave(&self, handle: CaptureHandle, pressed: impl IntoIterator<Item = Linux>) {
@@ -507,6 +694,101 @@ fn leave_events(pressed: impl IntoIterator<Item = Linux>) -> Vec<ProtoEvent> {
         group: 0,
     }));
     key_ups.chain([mods_zero, ProtoEvent::Leave(0)]).collect()
+}
+
+/// how long a focus waits for capture to start
+const FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// a pointer pushed through the barrier did not start capture: GNOME, at
+/// least, ignores barriers for emulated motion
+const FOCUS_BY_PUSH_UNAVAILABLE: &str = "focus is not available on this desktop session (the \
+     compositor, e.g. GNOME, ignores barriers for emulated motion): move the pointer across \
+     the edge";
+
+/// a focus waiting for capture to start
+#[derive(Debug)]
+struct PendingFocus {
+    handle: CaptureHandle,
+    deadline: tokio::time::Instant,
+    /// the local pointer was pushed through the barrier
+    pushed: bool,
+}
+
+/// where a hotkey moves control
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Local,
+    Client(CaptureHandle),
+}
+
+/// the chords watched while control is on a client: the release bind and
+/// the local hotkey return it, client hotkeys move it on
+fn chords(release_bind: &ReleaseBind, hotkeys: &Hotkeys) -> Vec<(Chord, Target)> {
+    let local = [Some(&release_bind.keys), hotkeys.local.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|keys| Some((Chord::new(keys.iter().copied())?, Target::Local)));
+    let clients = hotkeys
+        .clients
+        .iter()
+        .filter_map(|(h, keys)| Some((Chord::new(keys.iter().copied())?, Target::Client(*h))));
+    local.chain(clients).collect()
+}
+
+/// what an input event does while control is on `active`
+#[derive(Debug, PartialEq, Eq)]
+enum HotkeyAction {
+    /// no hotkey: send it to the client
+    Forward,
+    /// the hotkey of the active client: nothing to do, the key is dropped
+    Ignore,
+    /// return control to this machine
+    Release,
+    /// move control to this client
+    Switch(CaptureHandle),
+}
+
+/// The hotkeys watched while control is on a client. A key that completed
+/// a hotkey is dropped until it goes up, auto-repeat included.
+#[derive(Clone, Debug, Default)]
+struct HotkeyWatch {
+    chords: ChordMatcher<Target>,
+    swallowed: Vec<u32>,
+}
+
+impl HotkeyWatch {
+    fn set_chords(&mut self, chords: Vec<(Chord, Target)>) {
+        self.chords.set_chords(chords);
+    }
+
+    /// forget held keys: their key-ups will not be seen
+    fn reset(&mut self) {
+        self.chords.reset();
+        self.swallowed.clear();
+    }
+
+    /// what `event` does while control is on `active`
+    fn action(&mut self, event: &Event, active: Option<CaptureHandle>) -> HotkeyAction {
+        let Event::Keyboard(KeyboardEvent::Key { key, state, .. }) = *event else {
+            return HotkeyAction::Forward;
+        };
+        let target = self.chords.feed(key, state);
+        if self.swallowed.contains(&key) {
+            if state == 0 {
+                self.swallowed.retain(|&k| k != key);
+            }
+            return HotkeyAction::Ignore;
+        }
+        let Some(target) = target else {
+            return HotkeyAction::Forward;
+        };
+        self.swallowed.push(key);
+        match target {
+            Target::Local => HotkeyAction::Release,
+            Target::Client(h) if Some(h) == active => HotkeyAction::Ignore,
+            Target::Client(h) => HotkeyAction::Switch(h),
+        }
+    }
 }
 
 thread_local! {
@@ -760,5 +1042,122 @@ mod tests {
         assert!(matches!(events[held.len() + 1], ProtoEvent::Leave(_)));
         // nothing held: still reset modifiers and leave
         assert_eq!(leave_events([]).len(), 2);
+    }
+
+    /// release bind Ctrl+Shift+Alt+Meta, local hotkey Ctrl+Alt+0, client 1
+    /// on Ctrl+Alt+1, client 2 on Ctrl+Alt+2
+    fn hotkey_watch() -> HotkeyWatch {
+        use Linux::*;
+        let release_bind = ReleaseBind {
+            keys: vec![KeyLeftCtrl, KeyLeftShift, KeyLeftAlt, KeyLeftMeta],
+            double_tap_ctrl: true,
+        };
+        let hotkeys = Hotkeys {
+            local: Some(vec![KeyLeftCtrl, KeyLeftAlt, Key0]),
+            clients: vec![
+                (1, vec![KeyLeftCtrl, KeyLeftAlt, Key1]),
+                (2, vec![KeyLeftCtrl, KeyLeftAlt, Key2]),
+                // no keys: never matches
+                (3, vec![]),
+            ],
+        };
+        let mut watch = HotkeyWatch::default();
+        watch.set_chords(chords(&release_bind, &hotkeys));
+        watch
+    }
+
+    /// presses `keys` in order while control is on `active`; returns the
+    /// action of the last press
+    fn press(keys: &[Linux], active: CaptureHandle) -> HotkeyAction {
+        let mut watch = hotkey_watch();
+        let mut action = HotkeyAction::Forward;
+        for &k in keys {
+            action = watch.action(&key(k, true), Some(active));
+        }
+        action
+    }
+
+    #[test]
+    fn hotkey_moves_control_to_another_client() {
+        use Linux::*;
+        assert_eq!(
+            press(&[KeyLeftCtrl, KeyLeftAlt, Key2], 1),
+            HotkeyAction::Switch(2)
+        );
+        // the modifiers alone go to the client
+        assert_eq!(press(&[KeyLeftCtrl, KeyLeftAlt], 1), HotkeyAction::Forward);
+        // the active client's own hotkey does nothing
+        assert_eq!(
+            press(&[KeyLeftAlt, KeyLeftCtrl, Key1], 1),
+            HotkeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn local_hotkey_and_release_bind_return_control() {
+        use Linux::*;
+        assert_eq!(
+            press(&[KeyLeftCtrl, KeyLeftAlt, Key0], 1),
+            HotkeyAction::Release
+        );
+        assert_eq!(
+            press(&[KeyLeftMeta, KeyLeftCtrl, KeyLeftShift, KeyLeftAlt], 1),
+            HotkeyAction::Release
+        );
+    }
+
+    #[test]
+    fn unknown_keys_and_supersets_are_forwarded() {
+        use Linux::*;
+        assert_eq!(
+            press(&[KeyLeftCtrl, KeyLeftAlt, Key3], 1),
+            HotkeyAction::Forward
+        );
+        // an extra Shift: Ctrl+Shift+Alt+2 is not Ctrl+Alt+2
+        assert_eq!(
+            press(&[KeyLeftCtrl, KeyLeftShift, KeyLeftAlt, Key2], 1),
+            HotkeyAction::Forward
+        );
+        // non-key events never match
+        let mut watch = hotkey_watch();
+        let motion = Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 0.,
+        });
+        assert_eq!(watch.action(&motion, Some(1)), HotkeyAction::Forward);
+    }
+
+    #[test]
+    fn the_final_key_is_dropped_until_it_goes_up() {
+        use Linux::*;
+        let mut watch = hotkey_watch();
+        for k in [KeyLeftCtrl, KeyLeftAlt, Key2] {
+            watch.action(&key(k, true), Some(1));
+        }
+        // auto-repeat and the key-up of the final key
+        assert_eq!(
+            watch.action(&key(Key2, true), Some(2)),
+            HotkeyAction::Ignore
+        );
+        assert_eq!(
+            watch.action(&key(Key2, false), Some(2)),
+            HotkeyAction::Ignore
+        );
+        // Key1 with the modifiers still held, now that control is on 2
+        assert_eq!(
+            watch.action(&key(Key1, true), Some(2)),
+            HotkeyAction::Switch(1)
+        );
+        // after a reset (control went local) the held keys are forgotten
+        watch.reset();
+        assert_eq!(
+            watch.action(&key(Key1, false), Some(1)),
+            HotkeyAction::Forward
+        );
+        assert_eq!(
+            watch.action(&key(Key2, true), Some(1)),
+            HotkeyAction::Forward
+        );
     }
 }

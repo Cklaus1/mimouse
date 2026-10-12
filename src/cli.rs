@@ -127,6 +127,9 @@ enum CliSubcommand {
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
     SaveConfig,
+    /// move control to a client now, as if the cursor crossed into it
+    /// (bind it to a desktop shortcut)
+    Focus { id: ClientHandle },
     /// print the current state, then stream events until interrupted
     Watch,
     /// list online Tailscale machines that answer on the MiMouse port
@@ -253,6 +256,7 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
             }
         }
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
+        CliSubcommand::Focus { id } => FrontendRequest::Focus { id },
         CliSubcommand::Watch
         | CliSubcommand::Discover { .. }
         | CliSubcommand::Doctor
