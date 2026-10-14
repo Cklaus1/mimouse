@@ -319,6 +319,7 @@ const AUTO_BACKENDS: &[Backend] = &[
 
 /// the `configured` backend, else the first of `auto` that `create`
 /// succeeds with, stopping early when the user denied a permission request
+/// or a backend's desktop runs but is not ready yet (the caller retries it)
 async fn select<T, F, Fut>(
     configured: Option<Backend>,
     auto: &[Backend],
@@ -351,7 +352,7 @@ where
                     },
                 ));
             }
-            Err(e) if e.cancelled_by_user() => return Err(e),
+            Err(e) if e.cancelled_by_user() || e.not_ready() => return Err(e),
             Err(e) => log::warn!("{e}"),
         }
     }
@@ -563,5 +564,62 @@ mod tests {
             auto: true,
         };
         assert_eq!(result.unwrap(), (2, auto));
+    }
+
+    /// a wlroots compositor whose seat has no keyboard yet is retried (the
+    /// error is transient), never replaced by X11, which on Xwayland reaches
+    /// only X11 clients; without a compositor, X11 is still selected
+    #[cfg(all(wlroots, x11))]
+    #[test]
+    fn auto_selection_retries_wlroots_until_its_seat_has_a_keyboard() {
+        use crate::error::WlrootsEmulationCreationError;
+        use std::time::Duration;
+        let no_keymap = || {
+            EmulationCreationError::Wlroots(WlrootsEmulationCreationError::Timeout {
+                awaited: "keymap",
+                after: Duration::from_secs(5),
+            })
+        };
+        let x11_or = |wlroots_error: fn() -> EmulationCreationError| {
+            move |backend: Backend| async move {
+                match backend {
+                    Backend::Wlroots => Err(wlroots_error()),
+                    _ => Ok(backend),
+                }
+            }
+        };
+
+        let result = block_on(select(
+            None,
+            &[Backend::Wlroots, Backend::X11],
+            x11_or(no_keymap),
+        ));
+        let error = InputEmulationError::from(result.unwrap_err());
+        assert!(error.is_transient(), "{error}");
+
+        // configured: the same error, as before
+        let result = block_on(select(
+            Some(Backend::Wlroots),
+            &[Backend::Wlroots, Backend::X11],
+            x11_or(no_keymap),
+        ));
+        assert!(InputEmulationError::from(result.unwrap_err()).is_transient());
+
+        // no Wayland compositor (an X11 session): X11
+        let no_compositor = || {
+            EmulationCreationError::Wlroots(WlrootsEmulationCreationError::Connect(
+                wayland_client::ConnectError::NoCompositor,
+            ))
+        };
+        let result = block_on(select(
+            None,
+            &[Backend::Wlroots, Backend::X11],
+            x11_or(no_compositor),
+        ));
+        let auto = Selected {
+            backend: Backend::X11,
+            auto: true,
+        };
+        assert_eq!(result.unwrap(), (Backend::X11, auto));
     }
 }
