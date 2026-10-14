@@ -32,7 +32,7 @@ use input_event::{
 
 use super::{CaptureEvent, EdgeRange, Position, display_util};
 use crate::ChordMatcher;
-use crate::chord::Chord;
+use crate::chord::{Chord, Fed};
 use crate::event_queue::EventSender;
 use crate::geometry::{self, Rect};
 
@@ -375,14 +375,14 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
             let vk = unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode };
             feed_hotkeys(key, state, vk, active.is_none())
         }
-        _ => None,
+        _ => Fed::Pass,
     };
 
     /* get active client if any */
     let Some(client) = active else {
         /* a client hotkey while local: capture for it; only its last key
          * is swallowed, the held modifiers reach applications as usual */
-        if let Some(pos) = hotkey {
+        if let (Fed::Fired(pos), Some(KeyboardEvent::Key { key, .. })) = (hotkey, key_event) {
             let range = CLIENTS.with_borrow(|clients| clients.get(&pos).copied().flatten());
             /* everything held but the swallowed final key went down locally */
             let local_keys = HOTKEYS.with_borrow(|hotkeys| match hotkeys.held() {
@@ -391,6 +391,8 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
             });
             if activate(pos, range) {
                 LOCAL_KEYS.replace(local_keys);
+                /* its auto-repeat and key-up must not reach the client */
+                HOTKEYS.with_borrow_mut(|hotkeys| hotkeys.swallow(key));
                 return LRESULT(1);
             }
         }
@@ -400,6 +402,11 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(key_event) = key_event else {
         return LRESULT(1);
     };
+
+    /* auto-repeat or key-up of the final key of the hotkey that started capture */
+    if hotkey == Fed::Swallowed {
+        return LRESULT(1);
+    }
 
     /* the key-up of a key that went down locally */
     if let KeyboardEvent::Key { key, state: 0, .. } = key_event {
@@ -419,9 +426,9 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     LRESULT(1)
 }
 
-/// Feeds a key to the hotkeys; returns the position whose hotkey it
-/// completes. `local`: input goes to this machine.
-fn feed_hotkeys(key: u32, state: u8, vk: u32, local: bool) -> Option<Position> {
+/// Feeds a key to the hotkeys: whether it completes the hotkey of a
+/// position or is swallowed. `local`: input goes to this machine.
+fn feed_hotkeys(key: u32, state: u8, vk: u32, local: bool) -> Fed<Position> {
     VIRTUAL_KEYS.with_borrow_mut(|vks| {
         HOTKEYS.with_borrow_mut(|hotkeys| {
             if state != 0 {

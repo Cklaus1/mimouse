@@ -7,7 +7,7 @@ use crate::proto::ProtoEvent;
 use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, Chord, ChordMatcher, EdgeRange, InputCapture,
-    InputCaptureError, Position,
+    InputCaptureError, Position, chord::Fed,
 };
 use input_event::{
     Event, KeyboardEvent, PointerEvent,
@@ -406,13 +406,17 @@ impl CaptureTask {
                         capture.create(h, p, r, t == CaptureType::EnterOnly).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        // forgotten first: a failing release must not leave
+                        // a barrier for it to be recreated
+                        self.remove_capture(h);
                         // the backend's `End` for a destroyed client never
                         // maps back to it, so leave it while it still exists
                         if self.active_client == Some(h) {
                             log::info!("releasing capture: client {h} removed");
-                            self.release_capture(capture).await?;
+                            if let Err(e) = self.release_capture(capture).await {
+                                log::warn!("releasing capture for removed client {h}: {e}");
+                            }
                         }
-                        self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
@@ -580,6 +584,15 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         if self.active_client == Some(handle) {
             self.focus_done(handle, Ok(()));
+            return Ok(());
+        }
+        // a repeated request joins the pending focus, whose result answers
+        // every request for the client
+        if self
+            .pending_focus
+            .as_ref()
+            .is_some_and(|p| p.handle == handle)
+        {
             return Ok(());
         }
         if let Some(pending) = self.pending_focus.take() {
@@ -791,7 +804,6 @@ enum HotkeyAction {
 #[derive(Clone, Debug, Default)]
 struct HotkeyWatch {
     chords: ChordMatcher<Target>,
-    swallowed: Vec<u32>,
 }
 
 impl HotkeyWatch {
@@ -802,7 +814,6 @@ impl HotkeyWatch {
     /// forget held keys: their key-ups will not be seen
     fn reset(&mut self) {
         self.chords.reset();
-        self.swallowed.clear();
     }
 
     /// what `event` does while control is on `active`
@@ -810,17 +821,12 @@ impl HotkeyWatch {
         let Event::Keyboard(KeyboardEvent::Key { key, state, .. }) = *event else {
             return HotkeyAction::Forward;
         };
-        let target = self.chords.feed(key, state);
-        if self.swallowed.contains(&key) {
-            if state == 0 {
-                self.swallowed.retain(|&k| k != key);
-            }
-            return HotkeyAction::Ignore;
-        }
-        let Some(target) = target else {
-            return HotkeyAction::Forward;
+        let target = match self.chords.feed(key, state) {
+            Fed::Pass => return HotkeyAction::Forward,
+            Fed::Swallowed => return HotkeyAction::Ignore,
+            Fed::Fired(target) => target,
         };
-        self.swallowed.push(key);
+        self.chords.swallow(key);
         match target {
             Target::Local => HotkeyAction::Release,
             Target::Client(h) if Some(h) == active => HotkeyAction::Ignore,
@@ -942,6 +948,10 @@ impl<T> Drop for DropGuard<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
+    use futures::FutureExt;
+
     use super::*;
 
     fn key(key: input_event::scancode::Linux, down: bool) -> Event {
@@ -1214,5 +1224,211 @@ mod tests {
             watch.action(&key(Key2, true), Some(1)),
             HotkeyAction::Forward
         );
+    }
+
+    /// a backend that starts capture on a focus and whose `release` fails;
+    /// its stream ends once a barrier is destroyed
+    struct TestBackend {
+        destroyed: Rc<Cell<bool>>,
+    }
+
+    type Done<'a> = futures::future::BoxFuture<'a, Result<(), CaptureError>>;
+
+    fn done<'a>(result: Result<(), CaptureError>) -> Done<'a> {
+        Box::pin(std::future::ready(result))
+    }
+
+    // `Capture` is an `async_trait`: these are its expanded signatures
+    impl input_capture::Capture for TestBackend {
+        fn create<'life0, 'async_trait>(
+            &'life0 mut self,
+            _: Position,
+            _: Option<EdgeRange>,
+        ) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            done(Ok(()))
+        }
+
+        fn destroy<'life0, 'async_trait>(&'life0 mut self, _: Position) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.destroyed.set(true);
+            done(Ok(()))
+        }
+
+        fn release<'life0, 'async_trait>(&'life0 mut self) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            done(Err(std::io::Error::other("release failed").into()))
+        }
+
+        fn focus<'life0, 'async_trait>(
+            &'life0 mut self,
+            _: Position,
+            _: Option<EdgeRange>,
+        ) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            done(Ok(()))
+        }
+
+        fn set_hotkeys<'life0, 'async_trait>(
+            &'life0 mut self,
+            _: Vec<(Chord, Position)>,
+        ) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            done(Ok(()))
+        }
+
+        fn terminate<'life0, 'async_trait>(&'life0 mut self) -> Done<'async_trait>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            done(Ok(()))
+        }
+    }
+
+    impl futures::Stream for TestBackend {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            // the session loop polls again after each request
+            if self.destroyed.get() {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    struct Harness {
+        task: CaptureTask,
+        capture: InputCapture,
+        requests: Sender<CaptureRequest>,
+        events: Receiver<ICaptureEvent>,
+        destroyed: Rc<Cell<bool>>,
+    }
+
+    /// the capture task over [`TestBackend`] with client 1 on the left
+    async fn harness() -> Harness {
+        let destroyed = Rc::new(Cell::new(false));
+        let mut capture = InputCapture::with_backend(Box::new(TestBackend {
+            destroyed: destroyed.clone(),
+        }));
+        let (requests, request_rx) = channel();
+        let (event_tx, events) = channel();
+        let cert = webrtc_dtls::crypto::Certificate::generate_self_signed(["ignored".to_owned()])
+            .expect("cert");
+        let mut task = CaptureTask {
+            active_client: None,
+            announced: false,
+            backend: None,
+            cancellation_token: CancellationToken::new(),
+            captures: Default::default(),
+            conn: MiMouseConnection::new(cert, crate::client::ClientManager::default()),
+            event_tx,
+            permission_pending: watch::channel(false).0,
+            request_rx,
+            hotkey_watch: HotkeyWatch::default(),
+            hotkeys: Hotkeys::default(),
+            pending_focus: None,
+            release_bind: ReleaseBind {
+                keys: vec![],
+                double_tap_ctrl: false,
+            },
+            ctrl_taps: Default::default(),
+            enter_at: None,
+            state: Default::default(),
+        };
+        task.add_capture(1, Position::Left, CaptureType::Default, None);
+        capture
+            .create(1, Position::Left, None, false)
+            .await
+            .expect("create");
+        Harness {
+            task,
+            capture,
+            requests,
+            events,
+            destroyed,
+        }
+    }
+
+    /// the focus results sent so far
+    fn focus_results(events: &mut Receiver<ICaptureEvent>) -> Vec<Result<(), String>> {
+        std::iter::from_fn(|| events.recv().now_or_never().flatten())
+            .filter_map(|e| match e {
+                ICaptureEvent::FocusResult(1, result) => Some(result),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn repeated_focus_joins_the_pending_one() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let Harness {
+                    mut task,
+                    mut capture,
+                    mut events,
+                    ..
+                } = harness().await;
+                task.focus(&mut capture, 1).await.expect("focus");
+                let deadline = task.pending_focus.as_ref().expect("pending").deadline;
+                task.focus(&mut capture, 1).await.expect("focus");
+                // both requests wait for the same focus
+                assert!(focus_results(&mut events).is_empty());
+                assert_eq!(
+                    task.pending_focus.as_ref().map(|p| p.deadline),
+                    Some(deadline)
+                );
+                // its `Begin` answers both (the unconnected peer then ends
+                // the capture, which is beside the point here)
+                let _ = task
+                    .handle_capture_event(&mut capture, (1, CaptureEvent::Begin(None)))
+                    .await;
+                assert_eq!(focus_results(&mut events), [Ok(())]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn destroying_the_active_client_survives_a_failing_release() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let Harness {
+                    mut task,
+                    mut capture,
+                    requests,
+                    destroyed,
+                    ..
+                } = harness().await;
+                task.active_client = Some(1);
+                requests.send(CaptureRequest::Destroy(1)).expect("send");
+                // the stream ends once the barrier is gone
+                let r = task.do_capture_session(&mut capture).await;
+                assert!(r.is_ok(), "{r:?}");
+                assert!(task.captures.is_empty());
+                assert!(destroyed.get());
+                assert_eq!(task.active_client, None);
+            })
+            .await;
     }
 }

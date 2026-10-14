@@ -1,5 +1,5 @@
 use super::{
-    Capture, CaptureError, CaptureEvent, Chord, ChordMatcher, EdgeRange, Position,
+    Capture, CaptureError, CaptureEvent, Chord, ChordMatcher, EdgeRange, Position, chord::Fed,
     error::MacosCaptureCreationError,
 };
 use crate::event_queue::{self, EventReceiver, EventSender};
@@ -219,17 +219,26 @@ impl InputCaptureState {
         Ok(at)
     }
 
-    /// feeds the key events among `events` to the hotkeys; returns the
-    /// position whose hotkey they complete
-    fn feed_hotkeys(&mut self, events: &[CaptureEvent]) -> Option<Position> {
+    /// Feeds the key events among `events` to the hotkeys and drops those
+    /// [swallowed](ChordMatcher::swallow); returns the position whose hotkey
+    /// they complete, with the hotkey's final key.
+    fn feed_hotkeys(&mut self, events: &mut Vec<CaptureEvent>) -> Option<(Position, u32)> {
         let mut fired = None;
-        for event in events {
-            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+        events.retain(|event| {
+            let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
                 *event
-            {
-                fired = self.hotkeys.feed(key, state).or(fired);
+            else {
+                return true;
+            };
+            match self.hotkeys.feed(key, state) {
+                Fed::Pass => true,
+                Fed::Fired(pos) => {
+                    fired = Some((pos, key));
+                    true
+                }
+                Fed::Swallowed => false,
             }
-        }
+        });
         fired
     }
 
@@ -602,8 +611,10 @@ fn create_event_tap<'a>(
             .unwrap_or_else(|e| {
                 log::error!("Failed to get events: {e}");
             });
-            // the hotkeys see every key, so they know which keys are held
-            state.feed_hotkeys(&res_events);
+            // the hotkeys see every key, so they know which keys are held;
+            // auto-repeat and key-up of the final key of the hotkey that
+            // started capture are dropped
+            state.feed_hotkeys(&mut res_events);
             // key-ups of keys that went down locally go to the system
             if !state.local_keys.is_empty() {
                 let local_keys = &mut state.local_keys;
@@ -641,7 +652,7 @@ fn create_event_tap<'a>(
             if let Err(e) = get_events(&event_type, cg_ev, &mut keys, &mut state.modifier_state) {
                 log::debug!("{e}");
             }
-            if let Some(pos) = state.feed_hotkeys(&keys) {
+            if let Some((pos, key)) = state.feed_hotkeys(&mut keys) {
                 if let Some(&range) = state.active_clients.get(&pos) {
                     // everything held but the dropped final key went down
                     // locally
@@ -654,6 +665,9 @@ fn create_event_tap<'a>(
                         Ok(at) => {
                             if event_tx.send(pos, CaptureEvent::Begin(at)) {
                                 state.local_keys = local_keys;
+                                // its auto-repeat and key-up must not reach
+                                // the client
+                                state.hotkeys.swallow(key);
                                 capture_position = Some(pos);
                                 if let Err(e) = notify_tx.send(ProducerEvent::Grab(pos)) {
                                     log::error!("Failed to send notification: {e}");

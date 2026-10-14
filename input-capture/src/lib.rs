@@ -330,8 +330,14 @@ impl InputCapture {
         backend: Option<Backend>,
         permission_pending: tokio::sync::watch::Sender<bool>,
     ) -> Result<Self, CaptureCreationError> {
-        let capture = create(backend, permission_pending).await?;
-        Ok(Self {
+        Ok(Self::with_backend(
+            create(backend, permission_pending).await?,
+        ))
+    }
+
+    /// an [`InputCapture`] over an injected backend (tests and embedders)
+    pub fn with_backend(capture: Box<dyn Capture>) -> Self {
+        Self {
             capture,
             id_map: Default::default(),
             pending: Default::default(),
@@ -339,7 +345,7 @@ impl InputCapture {
             pressed_keys: HashSet::new(),
             hotkeys: Vec::new(),
             focus: None,
-        })
+        }
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -596,8 +602,10 @@ mod event_queue {
     }
 }
 
+/// An input capture backend: barriers at screen edges and the events
+/// captured through them.
 #[async_trait]
-trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
+pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a barrier at `pos`, covering `range` of the edge (`None`: all);
     /// replaces the barrier already at `pos`
     async fn create(&mut self, pos: Position, range: Option<EdgeRange>)
