@@ -125,6 +125,26 @@ impl AsyncFrontendListener {
         })
     }
 
+    /// a listener without a socket or pipe, fed through the sender (tests)
+    #[cfg(test)]
+    fn fed() -> (Self, mpsc::UnboundedSender<Internal>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let listener = Self {
+            rx,
+            conns: HashMap::new(),
+            accept: spawn_local(std::future::pending()),
+            #[cfg(unix)]
+            socket_path: PathBuf::from("/nonexistent/mimouse-test.sock"),
+        };
+        (listener, tx)
+    }
+
+    /// a listener no frontend can reach (tests)
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self::fed().0
+    }
+
     /// next connection or request (cancel safe)
     pub async fn next(&mut self) -> IpcEvent {
         loop {
@@ -357,18 +377,6 @@ mod tests {
 
     use super::*;
 
-    /// a listener without a socket, fed by `register`
-    fn listener() -> (AsyncFrontendListener, mpsc::UnboundedSender<Internal>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let listener = AsyncFrontendListener {
-            rx,
-            conns: HashMap::new(),
-            accept: spawn_local(std::future::pending()),
-            socket_path: PathBuf::from("/nonexistent/mimouse-test.sock"),
-        };
-        (listener, tx)
-    }
-
     async fn connect(
         listener: &mut AsyncFrontendListener,
         tx: &mpsc::UnboundedSender<Internal>,
@@ -400,7 +408,7 @@ mod tests {
     async fn stalled_reader_does_not_block_others() {
         LocalSet::new()
             .run_until(async {
-                let (mut listener, tx) = listener();
+                let (mut listener, tx) = AsyncFrontendListener::fed();
                 let mut stalled = connect(&mut listener, &tx, 0).await;
                 let reader = connect(&mut listener, &tx, 1).await;
                 // far more than the socket buffer and the queue hold
@@ -436,7 +444,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         LocalSet::new()
             .run_until(async {
-                let (mut listener, tx) = listener();
+                let (mut listener, tx) = AsyncFrontendListener::fed();
                 let (rx, mut wx) = connect(&mut listener, &tx, 0).await.into_split();
                 let mut lines = BufReader::new(rx).lines();
                 // e.g. a request type only a newer service knows
@@ -475,7 +483,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         LocalSet::new()
             .run_until(async {
-                let (mut listener, tx) = listener();
+                let (mut listener, tx) = AsyncFrontendListener::fed();
                 let mut client = connect(&mut listener, &tx, 0).await;
                 let request =
                     r#"{"seq":1,"request":{"action":"remove_authorized_key","fingerprint":"aa"}}"#;

@@ -35,6 +35,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
+use webrtc_dtls::crypto::Certificate;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -163,30 +164,50 @@ impl Sinks for Live<'_> {
 
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
-        let client_manager = ClientManager::default();
-
         // load certificate
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
-        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
-        log::info!("certificate fingerprint: {public_key_fingerprint}");
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
         // the running service only: crashes of CLI commands are not recorded
         telemetry::install_panic_hook(config.config_dir());
         let telemetry = Telemetry::new(&config);
-        telemetry::COUNTERS.set_peers(config.clients().len());
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
-        // listener + connection
         let listener =
             MiMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
-        let connector = conn.connector();
 
         // after the already-running check, so a second instance never prompts
         #[cfg(target_os = "macos")]
         crate::macos_permissions::request_permissions();
+
+        Self::assemble(
+            config,
+            cert,
+            frontend_listener,
+            telemetry,
+            authorized_keys,
+            listener,
+        )
+    }
+
+    /// the service around the parts that reach outside the process: the
+    /// certificate, the IPC and peer listeners, telemetry
+    fn assemble(
+        config: Config,
+        cert: Certificate,
+        frontend_listener: AsyncFrontendListener,
+        telemetry: Telemetry,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        listener: MiMouseListener,
+    ) -> Result<Self, ServiceError> {
+        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        log::info!("certificate fingerprint: {public_key_fingerprint}");
+        telemetry::COUNTERS.set_peers(config.clients().len());
+
+        let client_manager = ClientManager::default();
+        let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
+        let connector = conn.connector();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -279,6 +300,13 @@ impl Service {
             }
         }
 
+        self.terminate().await;
+        Ok(())
+    }
+
+    /// ends capture (held keys released), emulation, the clipboard and the
+    /// resolver, and saves the telemetry counters
+    async fn terminate(&mut self) {
         log::info!("terminating service ...");
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
@@ -290,8 +318,6 @@ impl Service {
         self.resolver.terminate().await;
         log::debug!("saving telemetry counters ...");
         self.telemetry.shutdown().await;
-
-        Ok(())
     }
 
     async fn handle_ipc_event(&mut self, event: IpcEvent) {
@@ -620,6 +646,7 @@ impl Service {
                     self.audit.record(&peer, &request, &result);
                     self.reply(conn, seq, result.clone().map(|_| Reply::Done));
                 }
+                self.reload_if_merged();
             }
             EmulationEvent::EmulationDisabled => {
                 crate::telemetry::COUNTERS.emulation_disables.bump();
@@ -910,6 +937,78 @@ impl Shutdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Dirs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+    use tokio::task::LocalSet;
+
+    type Keys = Arc<RwLock<HashMap<String, String>>>;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mimouse-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// a service on dummy backends running the config file
+    /// `dir/config.toml` that holds `toml`, and the authorized keys in
+    /// effect; it writes nothing outside `dir`
+    async fn service(dir: &Path, toml: &str) -> (Service, Keys) {
+        let quiet = "capture_backend = \"dummy\"\nemulation_backend = \"dummy\"\nnotify_switch = false\nidle_inhibit = false\n";
+        let path = dir.join("config.toml");
+        fs::write(&path, format!("{quiet}{toml}")).unwrap();
+        let config = Config::at(&path).unwrap();
+        let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+        let keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let (listener, _) = MiMouseListener::on_free_port(cert.clone(), keys.clone()).await;
+        let dirs = Dirs {
+            cache: dir.to_owned(),
+            config: dir.to_owned(),
+        };
+        let telemetry = Telemetry::for_test(&config, dirs);
+        let frontend = AsyncFrontendListener::detached();
+        let service =
+            Service::assemble(config, cert, frontend, telemetry, keys.clone(), listener).unwrap();
+        (service, keys)
+    }
+
+    /// `path` as an external editor leaves it, `f` applied
+    fn edit(path: &Path, f: impl FnOnce(&mut toml_edit::DocumentMut)) {
+        let mut doc: toml_edit::DocumentMut = fs::read_to_string(path).unwrap().parse().unwrap();
+        f(&mut doc);
+        fs::write(path, doc.to_string()).unwrap();
+    }
+
+    /// R-7: the save after a port change merges file edits the watcher has
+    /// not reported yet; they are applied right away, not left for a
+    /// reload that finds nothing changed
+    #[tokio::test]
+    async fn port_change_applies_the_file_edits_its_save_merged() {
+        LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("service-port-merge");
+                let path = dir.join("config.toml");
+                let (mut service, keys) = service(&dir, "port = 47301\n").await;
+                edit(&path, |doc| {
+                    doc["authorized_fingerprints"]["aa:01"] = toml_edit::value("laptop");
+                });
+                let changed = EmulationEvent::PortChanged(Ok(47302));
+                service.handle_emulation_event(changed).await;
+                let saved = fs::read_to_string(&path).unwrap();
+                assert!(saved.contains("port = 47302"), "{saved}");
+                assert!(saved.contains("aa:01"), "{saved}");
+                assert!(
+                    keys.read().expect("lock").contains_key("aa:01"),
+                    "merged key not in effect"
+                );
+                service.terminate().await;
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
+    }
 
     #[test]
     fn pointer_is_pushed_through_the_middle_of_the_range() {
