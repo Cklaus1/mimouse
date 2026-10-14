@@ -38,7 +38,10 @@ fn main() {
 
     if let Err(e) = run() {
         log::error!("{e}");
-        process::exit(1);
+        process::exit(match e {
+            MiMouseError::Cli(e) => e.exit_code(),
+            _ => 1,
+        });
     }
 }
 
