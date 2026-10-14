@@ -8,7 +8,7 @@ Wave 1
 - [x] K1 A4
 - [x] K2 B11
 - [x] K3 A10 (B10)
-- [ ] G1 A-arch-5, A3, T7, C3, B7
+- [x] G1 A-arch-5, A3, T7, C3, B7
 - [x] I1 A5, B3b
 - [x] I2 B9, C11
 - [x] L1 A11
