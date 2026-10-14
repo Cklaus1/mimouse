@@ -1,0 +1,19 @@
+# Wire events a peer sends (format: input-emulation/src/contract.rs).
+# Touchpad scrolling in pixel steps below one pixel, then a precision
+# wheel (15/120 notches) and a plain wheel, vertical and horizontal, with
+# the middle button pressed and released in between.
+axis 0 0.4
+axis 0 0.4
+axis 0 -2.5
+axis 1 0.75
+axis 1 0.75
+v120 0 15
+v120 0 15
+v120 0 15
+v120 0 15
+v120 0 120
+v120 1 -15
+v120 1 -105
+button 274 1
+button 274 0
+v120 0 -120

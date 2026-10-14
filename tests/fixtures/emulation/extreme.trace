@@ -1,0 +1,14 @@
+# Wire events a peer sends (format: input-emulation/src/contract.rs).
+# Values inside the protocol but at its limits: they reach a backend as
+# finite values, and the key and button held at the end are released like
+# any other.
+v120 0 2147483647
+v120 0 2147483647
+v120 1 -2147483648
+v120 1 -2147483648
+axis 0 1e308
+axis 0 1e308
+motion 1e308 -1e308
+motion 0.5 0.5
+key 4294967295 1
+button 4294967295 1

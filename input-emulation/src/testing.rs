@@ -1,4 +1,5 @@
-//! A backend that records what reaches it, for tests of [`InputEmulation`].
+//! Backends for tests of [`InputEmulation`]: [`Recorder`] records what
+//! reaches any backend, [`Fake`] stands in for a real one.
 
 use async_trait::async_trait;
 use input_event::Event;
@@ -27,23 +28,26 @@ impl Calls {
     }
 }
 
-/// Records every call; `steps` and whether it can place the pointer are
-/// chosen per test.
+/// Records every call, then hands it to the backend it wraps.
 pub(crate) struct Recorder {
     calls: UnboundedSender<Call>,
-    steps: Steps,
-    places_pointer: bool,
+    backend: Box<dyn Emulation>,
 }
 
 impl Recorder {
-    /// an [`InputEmulation`] on a recorder and the calls it records
+    /// an [`InputEmulation`] on a recorded [`Fake`] and the calls it records
     pub(crate) fn emulation(steps: Steps, places_pointer: bool) -> (InputEmulation, Calls) {
-        let (calls, rx) = unbounded_channel();
-        let recorder = Recorder {
-            calls,
+        Self::wrap(Box::new(Fake {
             steps,
             places_pointer,
-        };
+            stall_at: None,
+        }))
+    }
+
+    /// an [`InputEmulation`] on `backend` and the calls that reach it
+    pub(crate) fn wrap(backend: Box<dyn Emulation>) -> (InputEmulation, Calls) {
+        let (calls, rx) = unbounded_channel();
+        let recorder = Recorder { calls, backend };
         (
             InputEmulation::with_emulation(Box::new(recorder)),
             Calls(rx),
@@ -64,6 +68,60 @@ impl Emulation for Recorder {
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         self.record(Call::Consume(handle, event));
+        self.backend.consume(event, handle).await
+    }
+
+    fn steps(&self) -> Steps {
+        self.backend.steps()
+    }
+
+    fn enter_at(
+        &mut self,
+        handle: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        self.record(Call::EnterAt(handle));
+        self.backend.enter_at(handle, edge, fraction)
+    }
+
+    async fn create(&mut self, handle: EmulationHandle) {
+        self.record(Call::Create(handle));
+        self.backend.create(handle).await
+    }
+
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        self.record(Call::Destroy(handle));
+        self.backend.destroy(handle).await
+    }
+
+    async fn terminate(&mut self) {
+        self.record(Call::Terminate);
+        self.backend.terminate().await
+    }
+}
+
+/// A backend with the given `steps` that places the pointer at (0, 0) if
+/// `places_pointer`.
+pub(crate) struct Fake {
+    pub(crate) steps: Steps,
+    pub(crate) places_pointer: bool,
+    /// `consume` call (counting from 0) that never completes, as if the
+    /// caller dropped it mid-way; later calls complete
+    pub(crate) stall_at: Option<usize>,
+}
+
+#[async_trait]
+impl Emulation for Fake {
+    async fn consume(&mut self, _: Event, _: EmulationHandle) -> Result<(), EmulationError> {
+        match &mut self.stall_at {
+            Some(0) => {
+                self.stall_at = None;
+                std::future::pending().await
+            }
+            Some(n) => *n -= 1,
+            None => {}
+        }
         Ok(())
     }
 
@@ -73,23 +131,16 @@ impl Emulation for Recorder {
 
     fn enter_at(
         &mut self,
-        handle: EmulationHandle,
+        _: EmulationHandle,
         _: Edge,
         _: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        self.record(Call::EnterAt(handle));
         Ok(self.places_pointer.then_some((0, 0)))
     }
 
-    async fn create(&mut self, handle: EmulationHandle) {
-        self.record(Call::Create(handle));
-    }
+    async fn create(&mut self, _: EmulationHandle) {}
 
-    async fn destroy(&mut self, handle: EmulationHandle) {
-        self.record(Call::Destroy(handle));
-    }
+    async fn destroy(&mut self, _: EmulationHandle) {}
 
-    async fn terminate(&mut self) {
-        self.record(Call::Terminate);
-    }
+    async fn terminate(&mut self) {}
 }

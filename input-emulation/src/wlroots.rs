@@ -648,7 +648,7 @@ impl XMods {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
@@ -742,6 +742,20 @@ mod tests {
         }
     }
 
+    /// a backend bound on `conn`, with a keymap: the fake cannot send one,
+    /// that needs fd passing
+    fn bound(conn: &Connection) -> WlrootsEmulation {
+        let mut emulation = WlrootsEmulation::bind(conn).unwrap();
+        let keymap = std::fs::File::open("/dev/null").unwrap();
+        emulation.state.keymap = Some((1, keymap.into(), 0));
+        emulation
+    }
+
+    /// a backend on a fake compositor without outputs
+    pub(crate) fn on_fake_compositor() -> WlrootsEmulation {
+        bound(&Compositor::start().0)
+    }
+
     #[tokio::test]
     async fn a_seat_without_keyboard_fails_in_time() {
         let (conn, _compositor) = Compositor::start();
@@ -758,10 +772,7 @@ mod tests {
     #[tokio::test]
     async fn compositor_changes_arrive_with_input() {
         let (conn, compositor) = Compositor::start();
-        let mut emulation = WlrootsEmulation::bind(&conn).unwrap();
-        // the fake cannot send a keymap: that needs fd passing
-        let keymap = std::fs::File::open("/dev/null").unwrap();
-        emulation.state.keymap = Some((1, keymap.into(), 0));
+        let mut emulation = bound(&conn);
         emulation.create(1).await;
         assert!(emulation.state.outputs.is_empty());
 

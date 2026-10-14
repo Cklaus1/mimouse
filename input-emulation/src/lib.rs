@@ -35,6 +35,8 @@ mod macos;
 mod macos_logic;
 
 #[cfg(test)]
+mod contract;
+#[cfg(test)]
 mod testing;
 
 /// configured-only emulation that discards events

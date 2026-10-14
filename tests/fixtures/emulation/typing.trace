@@ -1,0 +1,18 @@
+# Wire events a peer sends (format: input-emulation/src/contract.rs).
+# "Hi" typed with Shift, then Ctrl+Alt held for a hotkey when the peer is
+# lost. Key codes are evdev: 42 LeftShift, 35 H, 23 I, 29 LeftCtrl,
+# 56 LeftAlt. A capture repeats the press of a held key (auto-repeat).
+key 42 1
+mods 1 0 0 0
+key 35 1
+key 35 0
+key 42 0
+mods 0 0 0 0
+key 23 1
+key 23 1
+key 23 1
+key 23 0
+key 29 1
+mods 4 0 0 0
+key 56 1
+mods 12 0 0 0
