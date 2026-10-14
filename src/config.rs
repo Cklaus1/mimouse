@@ -631,6 +631,12 @@ impl Config {
             .unwrap_or(DEFAULT_PORT)
     }
 
+    /// the port the service now listens on, written by the next `save`;
+    /// a `--port` flag still takes precedence at the next start
+    pub fn set_port(&mut self, port: u16) {
+        self.config_toml.port = Some(port);
+    }
+
     /// list of configured clients
     pub fn clients(&self) -> Vec<ConfigClient> {
         self.config_toml
@@ -1478,6 +1484,35 @@ future_client_key = "kept"
             .map(|c| c.fingerprint)
             .collect();
         assert_eq!(pins, [None, Some("aa:01".to_owned())]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// a changed port is saved; `--port` still wins over the saved value
+    #[tokio::test]
+    async fn changed_port_is_saved_and_flag_wins() {
+        let dir = temp_dir("set-port");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, COMMENTED).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        config.set_port(4300);
+        config
+            .save(config.clients(), config.authorized_fingerprints())
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            COMMENTED.replace("port = 4242", "port = 4300")
+        );
+        assert_eq!(Config::at(&path).unwrap().port(), 4300);
+        let flagged = Config::from_args(Args::parse_from([
+            "mimouse".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--port".as_ref(),
+            "4400".as_ref(),
+        ]))
+        .unwrap();
+        assert_eq!(flagged.port(), 4400);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

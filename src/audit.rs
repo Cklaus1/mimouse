@@ -91,7 +91,10 @@ fn line(requester: &Peer, request: &FrontendRequest, result: &Result<(), String>
 }
 
 fn append(path: &Path, line: &str) -> io::Result<()> {
-    rotate(path)?;
+    if let Err(e) = rotate(path) {
+        // keep recording into the current file rather than losing events
+        log::warn!("audit log {path:?}: rotation failed, appending anyway: {e}");
+    }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -156,6 +159,23 @@ mod tests {
             assert_eq!(fs::metadata(rotated(&path, i)).unwrap().len(), MAX_SIZE);
         }
         assert!(!rotated(&path, KEEP + 1).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn appends_when_rotation_fails() {
+        let dir = std::env::temp_dir().join(format!("mimouse-audit-rot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // audit.2 can't move onto the non-empty directory audit.3: rename fails
+        fs::create_dir_all(rotated(&dir.join(FILE_NAME), 2)).unwrap();
+        fs::create_dir_all(rotated(&dir.join(FILE_NAME), 3).join("x")).unwrap();
+        let path = dir.join(FILE_NAME);
+        fs::write(&path, vec![b'x'; MAX_SIZE as usize]).unwrap();
+
+        AuditLog::new(&dir).record(&Peer::default(), &FrontendRequest::SaveConfig, &Ok(()));
+        let content = fs::read_to_string(&path).unwrap();
+        let last: Value = serde_json::from_str(content[MAX_SIZE as usize..].trim()).unwrap();
+        assert_eq!(last["action"], "save_config", "event not appended");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
