@@ -145,6 +145,7 @@ Self-review checklist: diff confined to the node's files; no TODO/dead code; no 
 - New dependency: only `rustls-native-certs` (X1, license MIT/Apache-2.0/ISC) and `test-util` feature (T3) are planned; anything else needs a one-line reason in the commit and a deny check.
 - Resumability: commit messages start with the node id; on resume, `git log --oneline 4921556..product-review | grep -oE '^[0-9a-f]+ [A-Z][0-9]+'` rebuilds `tasks/todo.md`.
 - Windows/macOS-only code: cross-compiled + unit-tested; listed as hardware-unverified unless smoked on megapc.
+- X1 contract (from X2, merged 687026b): the client serializes exactly `telemetry-collector/schema.json`: every field always present (null where nullable), closed objects, days <= 7, crashes <= 8, crash `capture_backend` + `emulation_backend` (not one `backend`), switches `{edge, hotkey, cli_focus}`, size buckets `lt_1k/lt_64k/lt_1m/lt_64m/ge_64m`, approval buckets `lt_10s/lt_60s/ge_60s`, `cli_commands` keys `^[a-z][a-z0-9_]{0,31}$` (<= 64), lowercase UUID v4 install id, `commit` may be `""`, `Content-Type: application/json`, success = 204. `telemetry_endpoint` / `MIMOUSE_TELEMETRY_URL` is a base URL; the client appends `/v1/batch` and `/v1/installs/<id>`. Client test round-trips a batch through the collector's validator (`node` + `telemetry-collector/src/validate.js`) or checks against `example-batch.json` field-for-field.
 
 ## Known-failure list
 

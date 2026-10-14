@@ -13,7 +13,7 @@ Wave 1
 - [ ] I2 B9, C11
 - [ ] L1 A11
 - [x] X0 T-1a
-- [ ] X2 T-5
+- [x] X2 T-5
 - [x] D2 P3
 
 Wave 2
