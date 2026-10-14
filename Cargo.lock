@@ -1711,7 +1711,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "shadow-rs",
- "slab",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

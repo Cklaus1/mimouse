@@ -329,6 +329,7 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
@@ -540,8 +541,14 @@ impl Config {
                 }
                 continue;
             }
-            let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let event = match self.watch_rx.recv().await.expect("channel closed") {
+                Ok(event) => event,
+                // says nothing about the file: keep the running config
+                Err(e) => {
+                    log::warn!("config watcher: {e}");
+                    continue;
+                }
+            };
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -1513,6 +1520,25 @@ future_client_key = "kept"
         ]))
         .unwrap();
         assert_eq!(flagged.port(), 4400);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// B8: a watcher error neither reloads nor stops the service
+    #[tokio::test(start_paused = true)]
+    async fn watcher_error_does_not_reload() {
+        let dir = temp_dir("watch-error");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, COMMENTED).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        config.watch_rx = rx;
+        tx.send(Err(notify::Error::generic("queue overflow")))
+            .await
+            .unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        let reloaded = tokio::time::timeout(wait, config.changed()).await;
+        assert!(reloaded.is_err(), "reloaded on a watcher error");
+        assert_eq!(tx.capacity(), 1, "error not consumed");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
