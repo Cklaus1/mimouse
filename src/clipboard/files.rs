@@ -1,15 +1,19 @@
 //! Copied files: local file references and the store for received files.
 //!
-//! Received files are written to `<cache dir>/mimouse/files/<transfer id>/`;
-//! only the newest `KEEP_TRANSFERS` transfer directories are kept.
+//! Received files are written to `<cache dir>/mimouse/files/<transfer id>/`
+//! while they arrive; only the newest `KEEP_TRANSFERS` complete transfer
+//! directories are kept.
 
 use std::{
     collections::HashSet,
     env, fs, io,
     io::Write,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use tokio::task::spawn_blocking;
 
 /// longest accepted file name in bytes (NAME_MAX on Linux)
 pub(super) const MAX_NAME_LEN: usize = 255;
@@ -105,35 +109,46 @@ fn numbered(name: &str, n: usize) -> String {
     }
 }
 
-/// names to store received files under: made safe for Windows if
-/// `sanitize`, and unique even where names differing only in case collide
-/// (`fold_case`: Windows, and macOS by default)
-fn local_names(names: &[&str], sanitize: bool, fold_case: bool) -> Vec<String> {
-    let key = |n: &str| {
-        if fold_case {
-            n.to_lowercase()
-        } else {
-            n.to_owned()
+/// names to store the received files of one transfer under: made safe for
+/// Windows if `sanitize`, and unique even where names differing only in
+/// case collide (`fold_case`: Windows, and macOS by default)
+struct LocalNames {
+    used: HashSet<String>,
+    sanitize: bool,
+    fold_case: bool,
+}
+
+impl LocalNames {
+    fn new(sanitize: bool, fold_case: bool) -> Self {
+        Self {
+            used: HashSet::new(),
+            sanitize,
+            fold_case,
         }
-    };
-    let mut used = HashSet::new();
-    names
-        .iter()
-        .map(|&name| {
-            let name = if sanitize {
-                windows_file_name(name)
+    }
+
+    /// the local name of the next file, named `name` on the wire
+    fn next(&mut self, name: &str) -> String {
+        let name = if self.sanitize {
+            windows_file_name(name)
+        } else {
+            name.to_owned()
+        };
+        let key = |n: &str| {
+            if self.fold_case {
+                n.to_lowercase()
             } else {
-                name.to_owned()
-            };
-            let mut unique = name.clone();
-            let mut n = 2;
-            while !used.insert(key(&unique)) {
-                unique = numbered(&name, n);
-                n += 1;
+                n.to_owned()
             }
-            unique
-        })
-        .collect()
+        };
+        let mut unique = name.clone();
+        let mut n = 2;
+        while !self.used.insert(key(&unique)) {
+            unique = numbered(&name, n);
+            n += 1;
+        }
+        unique
+    }
 }
 
 /// a valid wire name made safe for the Windows file system: reserved
@@ -178,6 +193,8 @@ pub(crate) fn cache_dir() -> Option<PathBuf> {
 #[derive(Clone, Debug)]
 pub(super) struct FileStore {
     root: PathBuf,
+    /// transfers being received: not pruned
+    receiving: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl FileStore {
@@ -186,20 +203,22 @@ impl FileStore {
     }
 
     fn at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            receiving: Default::default(),
+        }
     }
 
-    /// write `files` into a new transfer directory and prune old transfers
-    /// (blocking)
-    pub(super) fn store(&self, files: &[(&str, &[u8])]) -> io::Result<Vec<FileRef>> {
-        create_private_dir_all(&self.root)?;
-        let dir = self.create_transfer_dir()?;
-        let stored = write_files(&dir, files);
-        if stored.is_err() {
-            let _ = fs::remove_dir_all(&dir);
+    /// receive the files of one update; its transfer directory is created
+    /// with the first file
+    pub(super) fn receive(&self) -> Receiving {
+        Receiving {
+            store: self.clone(),
+            dir: None,
+            names: LocalNames::new(cfg!(windows), cfg!(any(windows, target_os = "macos"))),
+            file: None,
+            paths: Vec::new(),
         }
-        self.prune();
-        stored
     }
 
     /// existing transfer ids, ascending
@@ -213,27 +232,46 @@ impl FileStore {
         Ok(ids)
     }
 
-    fn create_transfer_dir(&self) -> io::Result<PathBuf> {
+    /// create the directory of a new transfer, kept until `received`
+    /// (blocking)
+    fn begin(&self) -> io::Result<(u64, PathBuf)> {
+        create_private_dir_all(&self.root)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
+        let mut receiving = self.receiving.lock().expect("lock");
         let mut id = next_transfer_id(&self.transfers()?, now);
         loop {
             let dir = self.root.join(id.to_string());
             match fs::create_dir(&dir) {
-                Ok(()) => return Ok(dir),
+                Ok(()) => {
+                    receiving.insert(id);
+                    return Ok((id, dir));
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => id += 1,
                 Err(e) => return Err(e),
             }
         }
     }
 
+    /// transfer `id` is complete (or removed)
+    fn received(&self, id: u64) {
+        self.receiving.lock().expect("lock").remove(&id);
+    }
+
+    /// remove all but the newest `KEEP_TRANSFERS` complete transfers
+    /// (blocking)
     fn prune(&self) {
+        let receiving = self.receiving.lock().expect("lock");
         let ids = match self.transfers() {
             Ok(ids) => ids,
             Err(e) => return log::warn!("clipboard: {}: {e}", self.root.display()),
         };
-        for id in &ids[..ids.len().saturating_sub(KEEP_TRANSFERS)] {
+        let complete: Vec<_> = ids
+            .into_iter()
+            .filter(|id| !receiving.contains(id))
+            .collect();
+        for id in &complete[..complete.len().saturating_sub(KEEP_TRANSFERS)] {
             let dir = self.root.join(id.to_string());
             if let Err(e) = fs::remove_dir_all(&dir) {
                 log::warn!("clipboard: could not remove {}: {e}", dir.display());
@@ -247,25 +285,107 @@ fn next_transfer_id(existing: &[u64], now: u64) -> u64 {
     existing.last().map_or(now, |&last| now.max(last + 1))
 }
 
-fn write_files(dir: &Path, files: &[(&str, &[u8])]) -> io::Result<Vec<FileRef>> {
-    let mut stored = Vec::with_capacity(files.len());
-    let names: Vec<&str> = files.iter().map(|&(name, _)| name).collect();
-    let names = local_names(
-        &names,
-        cfg!(windows),
-        cfg!(any(windows, target_os = "macos")),
-    );
-    for (name, &(_, bytes)) in names.iter().zip(files) {
-        let path = dir.join(name);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        file.write_all(bytes)?;
-        drop(file);
-        stored.extend(FileRef::stat(&path)?);
+/// runs blocking file system work off the async thread
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    spawn_blocking(f).await.map_err(io::Error::other)?
+}
+
+/// the files of one update being received into a new transfer directory;
+/// dropped before `finish`, the directory is removed
+pub(super) struct Receiving {
+    store: FileStore,
+    /// id and directory of the transfer, once created
+    dir: Option<(u64, PathBuf)>,
+    names: LocalNames,
+    /// the file being written
+    file: Option<fs::File>,
+    paths: Vec<PathBuf>,
+}
+
+impl Receiving {
+    /// start the next file, named `name` (a valid wire name)
+    pub(super) async fn create(&mut self, name: &str) -> io::Result<()> {
+        self.file = None;
+        let dir = match &self.dir {
+            Some((_, dir)) => dir.clone(),
+            None => {
+                let store = self.store.clone();
+                let (id, dir) = blocking(move || store.begin()).await?;
+                self.dir = Some((id, dir.clone()));
+                dir
+            }
+        };
+        let path = dir.join(self.names.next(name));
+        let (file, path) = blocking(move || {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            Ok((file, path))
+        })
+        .await?;
+        self.file = Some(file);
+        self.paths.push(path);
+        Ok(())
     }
-    Ok(stored)
+
+    /// append `chunk` to the file started last; gives the buffer back
+    pub(super) async fn append(&mut self, chunk: Vec<u8>) -> io::Result<Vec<u8>> {
+        let mut file = self.file.take().expect("a file was created");
+        let (file, chunk) = blocking(move || {
+            file.write_all(&chunk)?;
+            Ok((file, chunk))
+        })
+        .await?;
+        self.file = Some(file);
+        Ok(chunk)
+    }
+
+    /// the received files; older transfers are pruned
+    pub(super) async fn finish(mut self) -> io::Result<Vec<FileRef>> {
+        self.file = None;
+        let Some((id, _)) = self.dir else {
+            return Ok(Vec::new());
+        };
+        let paths = std::mem::take(&mut self.paths);
+        let stored = blocking(move || {
+            let mut stored = Vec::with_capacity(paths.len());
+            for path in &paths {
+                stored.extend(FileRef::stat(path)?);
+            }
+            Ok(stored)
+        })
+        .await?;
+        self.dir = None;
+        let store = self.store.clone();
+        blocking(move || {
+            store.received(id);
+            store.prune();
+            Ok(())
+        })
+        .await?;
+        Ok(stored)
+    }
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        let Some((id, dir)) = self.dir.take() else {
+            return;
+        };
+        self.file = None;
+        let store = self.store.clone();
+        let remove = move || {
+            let _ = fs::remove_dir_all(&dir);
+            store.received(id);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
 }
 
 /// received files may be private: the store is readable by the user only
@@ -405,6 +525,10 @@ pub(super) mod tests {
 
     #[test]
     fn local_names_collide_after_sanitizing_or_case_folding() {
+        let local_names = |names: &[&str], sanitize, fold_case| {
+            let mut local = LocalNames::new(sanitize, fold_case);
+            names.iter().map(|n| local.next(n)).collect::<Vec<_>>()
+        };
         let names = [
             "Readme", "README", "a:b", "a_b", "x.", "x", "c.TXT", "C.txt",
         ];
@@ -437,17 +561,31 @@ pub(super) mod tests {
         assert_eq!(next_transfer_id(&[5, 2000], 1000), 2001);
     }
 
-    #[test]
-    fn store_writes_files_and_keeps_last_three_transfers() {
+    /// receive `files` into `store`, each in chunks of at most two bytes
+    async fn store_files(store: &FileStore, files: &[(&str, &[u8])]) -> io::Result<Vec<FileRef>> {
+        let mut receiving = store.receive();
+        for (name, contents) in files {
+            receiving.create(name).await?;
+            for chunk in contents.chunks(2) {
+                receiving.append(chunk.to_vec()).await?;
+            }
+        }
+        receiving.finish().await
+    }
+
+    #[tokio::test]
+    async fn store_writes_files_and_keeps_last_three_transfers() {
         let tmp = TempDir::new();
         let store = FileStore::at(tmp.path().join("files"));
         let mut dirs = Vec::new();
         for i in 0..5u8 {
-            let stored = store.store(&[("a.txt", &[i]), ("b.bin", &[i, i])]).unwrap();
+            let stored = store_files(&store, &[("a.txt", &[i]), ("b.bin", &[i, i, i])])
+                .await
+                .unwrap();
             assert_eq!(stored.len(), 2);
             assert_eq!(fs::read(&stored[0].path).unwrap(), [i]);
-            assert_eq!(fs::read(&stored[1].path).unwrap(), [i, i]);
-            assert_eq!(stored[1].size, 2);
+            assert_eq!(fs::read(&stored[1].path).unwrap(), [i, i, i]);
+            assert_eq!(stored[1].size, 3);
             dirs.push(stored[0].path.parent().unwrap().to_owned());
         }
         assert_eq!(store.transfers().unwrap().len(), 3);
@@ -456,12 +594,48 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn failed_store_leaves_no_transfer() {
+    /// a transfer still being received is neither pruned nor counted as one
+    /// of the kept ones; one that is dropped unfinished is removed
+    #[tokio::test]
+    async fn transfers_in_progress_are_not_pruned() {
+        let tmp = TempDir::new();
+        let store = FileStore::at(tmp.path().join("files"));
+        let mut slow = store.receive();
+        slow.create("slow").await.unwrap();
+        let slow_dir = store.transfers().unwrap();
+        for i in 0..KEEP_TRANSFERS as u8 + 1 {
+            store_files(&store, &[("a", &[i])]).await.unwrap();
+        }
+        assert_eq!(store.transfers().unwrap().len(), KEEP_TRANSFERS + 1);
+        assert!(store.transfers().unwrap().starts_with(&slow_dir));
+
+        drop(slow);
+        // removal runs on the blocking pool
+        for _ in 0..100 {
+            if store.transfers().unwrap().len() == KEEP_TRANSFERS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!store.transfers().unwrap().starts_with(&slow_dir));
+    }
+
+    #[tokio::test]
+    async fn failed_store_leaves_no_transfer() {
         let tmp = TempDir::new();
         let store = FileStore::at(tmp.path().to_owned());
         // the second file cannot be created (no such directory)
-        assert!(store.store(&[("a", b"1"), ("missing/b", b"2")]).is_err());
+        assert!(
+            store_files(&store, &[("a", b"1"), ("missing/b", b"2")])
+                .await
+                .is_err()
+        );
+        for _ in 0..100 {
+            if store.transfers().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(store.transfers().unwrap().is_empty());
     }
 }

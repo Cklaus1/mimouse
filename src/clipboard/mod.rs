@@ -30,6 +30,7 @@ mod windows;
 use std::{
     cell::Cell,
     collections::{HashMap, hash_map::DefaultHasher},
+    future::Future,
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     rc::Rc,
@@ -46,6 +47,7 @@ use webrtc_dtls::crypto::Certificate;
 
 use crate::{client::ClientManager, pair};
 use files::FileRef;
+use transport::TransportError;
 
 // mime types and accessors below are used by the platform backends only;
 // macOS has no clipboard backend yet
@@ -187,7 +189,51 @@ impl Offer {
     }
 }
 
-type Snapshot = (u64, Arc<ClipboardData>);
+/// clipboard contents with their digest. They are encoded for sending once,
+/// by the first client sender that needs it; the other senders share that.
+#[derive(Clone)]
+struct Snapshot {
+    digest: u64,
+    data: Arc<ClipboardData>,
+    encoded: Rc<tokio::sync::OnceCell<Rc<wire::Encoded>>>,
+}
+
+impl Snapshot {
+    fn new(data: Arc<ClipboardData>) -> Self {
+        Self {
+            digest: data.digest(),
+            data,
+            encoded: Default::default(),
+        }
+    }
+
+    /// the update to send, at most `max_file_size` bytes of files
+    async fn encoded(&self, max_file_size: u64) -> Result<Rc<wire::Encoded>, TransportError> {
+        self.encoded_with(|data| async move {
+            // copies up to `MAX_CLIPBOARD_SIZE` bytes
+            tokio::task::spawn_blocking(move || wire::encode(&data, max_file_size))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+        .await
+    }
+
+    /// the update made by `encode` on first use; a failed encode is retried
+    /// by the next caller
+    async fn encoded_with<F>(
+        &self,
+        encode: impl FnOnce(Arc<ClipboardData>) -> F,
+    ) -> Result<Rc<wire::Encoded>, TransportError>
+    where
+        F: Future<Output = Result<wire::Encoded, TransportError>>,
+    {
+        let encoded = self
+            .encoded
+            .get_or_try_init(|| async { encode(self.data.clone()).await.map(Rc::new) });
+        encoded.await.cloned()
+    }
+}
+
 /// digest of the snapshot a client sender is transferring
 type Sending = Rc<Cell<Option<u64>>>;
 
@@ -349,8 +395,9 @@ impl Clipboard {
 
 /// a local clipboard backend: receives clipboard contents to set locally,
 /// reports local clipboard changes through the sender passed to `spawn`;
-/// closed once the backend ended for good
-type BackendTx = mpsc::UnboundedSender<Arc<ClipboardData>>;
+/// closed once the backend ended for good. Only the latest contents are
+/// kept until the backend takes them (it may be slow or wait for approval).
+type BackendTx = watch::Sender<Option<Arc<ClipboardData>>>;
 /// local clipboard changes reported by a backend
 type ChangesTx = mpsc::UnboundedSender<LocalChange>;
 /// the backend's state, shown by `cli list` and `cli doctor`
@@ -365,7 +412,6 @@ enum LocalChange {
     /// secret, no supported format)
     Changed(Instant, Option<Arc<ClipboardData>>),
     /// the contents when the backend started; not sent
-    #[cfg_attr(not(windows), allow(dead_code))]
     Startup(Arc<ClipboardData>),
 }
 
@@ -374,7 +420,7 @@ impl LocalChange {
     /// after a change noticed at `changed` (`data` as for `Changed`): the
     /// contents at startup are not sent, and a clipboard empty at startup
     /// was not cleared by anyone
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn read(changed: Option<Instant>, data: Option<ClipboardData>) -> Option<Self> {
         let data = data.map(Arc::new);
         match changed {
@@ -382,6 +428,42 @@ impl LocalChange {
             None => data.filter(|data| !data.is_empty()).map(Self::Startup),
         }
     }
+}
+
+/// receiving end of a backend's set channel
+struct SetRx(watch::Receiver<Option<Arc<ClipboardData>>>);
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn set_channel() -> (BackendTx, SetRx) {
+    let (tx, rx) = watch::channel(None);
+    (tx, SetRx(rx))
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+impl SetRx {
+    /// the latest contents to set that were not taken yet; `None` once the
+    /// clipboard task is gone
+    async fn recv(&mut self) -> Option<Arc<ClipboardData>> {
+        loop {
+            self.0.changed().await.ok()?;
+            if let Some(data) = self.0.borrow_and_update().clone() {
+                return Some(data);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn blocking_recv(&mut self) -> Option<Arc<ClipboardData>> {
+        futures::executor::block_on(self.recv())
+    }
+}
+
+/// the sequence number to remember as that of our latest write, after a
+/// write attempt that changed the clipboard (`wrote`) or not; `now` is the
+/// clipboard's sequence number after the attempt
+#[cfg_attr(not(windows), allow(dead_code))]
+fn own_seq_after_write(previous: u32, wrote: bool, now: u32) -> u32 {
+    if wrote { now } else { previous }
 }
 
 fn spawn_backend(changes: ChangesTx, status: StatusTx) -> Option<BackendTx> {
@@ -517,7 +599,7 @@ impl ClipboardTask {
     fn local_changed(&mut self, change: LocalChange) {
         let (at, change) = match change {
             LocalChange::Startup(data) => {
-                self.current = Some((data.digest(), data));
+                self.current = Some(Snapshot::new(data));
                 self.seeded = true;
                 return;
             }
@@ -532,7 +614,7 @@ impl ClipboardTask {
             return;
         };
         let digest = data.digest();
-        if !seeded && self.current.as_ref().is_some_and(|(d, _)| *d == digest) {
+        if !seeded && self.current.as_ref().is_some_and(|s| s.digest == digest) {
             return;
         }
         if data.is_empty() {
@@ -554,7 +636,7 @@ impl ClipboardTask {
             return;
         }
         let has_files = !data.files().is_empty();
-        self.current = Some((digest, data));
+        self.current = Some(Snapshot::new(data));
         // files go only to the client the cursor enters
         if has_files {
             return;
@@ -593,17 +675,17 @@ impl ClipboardTask {
             log::info!("clipboard from {from} dropped: the local clipboard changed since");
             return;
         }
-        if self.current.as_ref().is_some_and(|(d, _)| *d == digest) {
+        if self.current.as_ref().is_some_and(|s| s.digest == digest) {
             return;
         }
-        self.current = Some((digest, data.clone()));
+        self.current = Some(Snapshot::new(data.clone()));
         self.seeded = false;
-        let _ = backend.send(data);
+        let _ = backend.send(Some(data));
     }
 
     /// send the current clipboard to `handle` unless it already has it
     fn update_if_stale(&mut self, handle: ClientHandle) {
-        let Some((digest, _)) = &self.current else {
+        let Some(Snapshot { digest, .. }) = &self.current else {
             return;
         };
         if !self.seeded && self.delivered.get(&handle) != Some(digest) {
@@ -616,10 +698,10 @@ impl ClipboardTask {
         if let Some((tx, sending)) = self.senders.get(&handle).filter(|(tx, _)| !tx.is_closed()) {
             // skip if exactly this clipboard is being sent, with nothing
             // else queued behind it
-            let digest = snapshot.as_ref().map(|(d, _)| *d);
+            let digest = snapshot.as_ref().map(|s| s.digest);
             let in_flight = digest.is_some()
                 && sending.get() == digest
-                && tx.borrow().as_ref().map(|(d, _)| *d) == digest;
+                && tx.borrow().as_ref().map(|s| s.digest) == digest;
             if !in_flight {
                 tx.send_replace(snapshot);
             }
@@ -652,28 +734,31 @@ async fn client_sender(
 ) {
     loop {
         let snapshot = rx.borrow_and_update().clone();
-        if let Some((digest, data)) = snapshot {
+        if let Some(snapshot) = snapshot {
+            let Snapshot { digest, data, .. } = &snapshot;
             match client_addrs(&client_manager, handle) {
                 None => return, /* client removed */
                 Some(addrs) if addrs.is_empty() => {
                     log::debug!("clipboard: no address known for client {handle}")
                 }
                 Some(addrs) => {
-                    sending.set(Some(digest));
+                    sending.set(Some(*digest));
                     let Some(policy) = client_manager.server_policy(handle) else {
                         return; /* client removed */
                     };
                     let trust =
                         |addr, fingerprint: &str| client_manager.pin(handle, addr, fingerprint);
-                    let sent =
-                        transport::send(&tls, &addrs, data.clone(), max_file_size, policy, trust);
+                    let sent = async {
+                        let encoded = snapshot.encoded(max_file_size).await?;
+                        transport::send(&tls, &addrs, &encoded, max_file_size, policy, trust).await
+                    };
                     match sent.await {
                         Ok(addr) => {
                             log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
                             let _ = delivered_tx.send(Delivered {
                                 handle,
-                                digest,
-                                event: Transfer::new(ClipboardDirection::Sent, addr.ip(), &data),
+                                digest: *digest,
+                                event: Transfer::new(ClipboardDirection::Sent, addr.ip(), data),
                             });
                         }
                         Err(e) => {
@@ -710,6 +795,7 @@ fn client_addrs(client_manager: &ClientManager, handle: ClientHandle) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
 
     fn portal(mimes: &[&str]) -> Offer {
         Offer::from_mime_types(&mimes.iter().map(|m| m.to_string()).collect::<Vec<_>>())
@@ -768,7 +854,16 @@ mod tests {
         assert_eq!(windows(1, &[]), Offer::Formats);
     }
 
-    fn task() -> ClipboardTask {
+    /// C8: a write that did not change the clipboard (it could not be
+    /// opened or emptied) is not taken for ours, so the copy the user made
+    /// meanwhile is still sent
+    #[test]
+    fn failed_write_is_not_taken_for_ours() {
+        assert_eq!(own_seq_after_write(5, false, 9), 5);
+        assert_eq!(own_seq_after_write(5, true, 9), 9);
+    }
+
+    pub(super) fn task() -> ClipboardTask {
         let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
         ClipboardTask {
             tls: Rc::new(transport::Tls::new(&cert, Default::default()).unwrap()),
@@ -799,17 +894,65 @@ mod tests {
     #[test]
     fn older_transfer_does_not_replace_a_newer_copy() {
         let mut task = task();
-        let (backend, mut set) = mpsc::unbounded_channel();
+        let (backend, mut set) = set_channel();
         let accepted = Instant::now();
         let copied = accepted + std::time::Duration::from_millis(1);
         task.local_changed(LocalChange::Changed(copied, Some(text("fresh"))));
 
         task.received(from_peer(text("slow"), accepted), &backend);
-        assert!(set.try_recv().is_err(), "older transfer set");
+        assert!(set.recv().now_or_never().is_none(), "older transfer set");
 
         let later = copied + std::time::Duration::from_millis(1);
         task.received(from_peer(text("newer"), later), &backend);
-        assert_eq!(set.try_recv().ok(), Some(text("newer")));
+        assert_eq!(set.recv().now_or_never().flatten(), Some(text("newer")));
+    }
+
+    /// C6: of the updates received before the backend reads, only the
+    /// latest is set; the backend ending is still noticed
+    #[tokio::test]
+    async fn backend_sets_only_the_latest() {
+        let mut task = task();
+        let (backend, mut set) = set_channel();
+        let accepted = Instant::now();
+        for i in 0..100 {
+            task.received(from_peer(text(&i.to_string()), accepted), &backend);
+        }
+        assert_eq!(set.recv().await, Some(text("99")));
+        assert!(set.recv().now_or_never().is_none(), "older contents queued");
+
+        drop(set);
+        assert!(
+            backend.closed().now_or_never().is_some(),
+            "ended backend not noticed"
+        );
+    }
+
+    /// C7: the client senders a copy goes to share one encoding of it
+    #[tokio::test]
+    async fn senders_share_one_encode() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut task = task();
+                let handles: Vec<_> = (0..3)
+                    .map(|_| {
+                        let handle = task.client_manager.add_client();
+                        task.client_manager.activate_client(handle);
+                        handle
+                    })
+                    .collect();
+                task.local_changed(LocalChange::Changed(Instant::now(), Some(text("copied"))));
+                let encodes = Cell::new(0);
+                for handle in &handles {
+                    let snapshot = task.senders[handle].0.borrow().clone().expect("sent");
+                    let encoded = snapshot.encoded_with(|data| {
+                        encodes.set(encodes.get() + 1);
+                        async move { wire::encode(&data, 0) }
+                    });
+                    encoded.await.expect("encoded");
+                }
+                assert_eq!(encodes.get(), 1);
+            })
+            .await;
     }
 
     /// B23: what the clipboard holds when the service starts is not sent,

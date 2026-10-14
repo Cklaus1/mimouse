@@ -21,11 +21,11 @@ use clipboard_win::{
     raw,
 };
 use image::ImageFormat;
-use tokio::sync::mpsc;
 
 use super::{
     BackendTx, ChangesTx, ClipboardData, LocalChange, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
-    MIME_TEXT, Offer, StatusTx, WIN_MARKERS, files::local_files,
+    MIME_TEXT, Offer, SetRx, StatusTx, WIN_MARKERS, files::local_files, own_seq_after_write,
+    set_channel,
 };
 use crate::ipc::{ClipboardState, ClipboardStatus};
 
@@ -43,7 +43,7 @@ const SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SETTLE_ROUNDS: usize = 10;
 
 pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = set_channel();
     // sequence number of the clipboard after our latest write; the lock
     // serializes clipboard access between the two threads, so the monitor
     // sees the final value of a write before deciding whether it was ours
@@ -227,7 +227,7 @@ fn markers() -> Vec<(&'static str, Vec<u8>)> {
         .collect()
 }
 
-fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mutex<u32>>) {
+fn writer(mut rx: SetRx, own_seq: Arc<Mutex<u32>>) {
     while let Some(data) = rx.blocking_recv() {
         let text = data.get(MIME_TEXT).map(String::from_utf8_lossy);
         let html = data.get(MIME_HTML).map(String::from_utf8_lossy);
@@ -254,9 +254,12 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
             .collect();
 
         let mut seq = own_seq.lock().expect("lock");
+        // whether the clipboard changed: it was opened and emptied
+        let mut wrote = false;
         let result = (|| -> SysResult<()> {
             let _clipboard = open()?;
             raw::empty()?;
+            wrote = true;
             if let Some(text) = &text {
                 raw::set_string_with(text, NoClear)?;
             }
@@ -274,9 +277,9 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
             }
             Ok(())
         })();
-        // the clipboard is closed now: this is the sequence number
-        // the monitor will see for our write
-        *seq = seq_num();
+        // the clipboard is closed now: this is the sequence number the
+        // monitor will see for our write; without a write it is the user's
+        *seq = own_seq_after_write(*seq, wrote, seq_num());
         drop(seq);
         if let Err(e) = result {
             log::warn!("clipboard: failed to set clipboard: {e}");
