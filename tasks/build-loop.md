@@ -29,7 +29,7 @@ Tracks group tasks by file scope; each track runs in its own worktree `/home/ckl
 |---|---|---|---|---|
 | N1 | A1 | net | src/listen.rs | - |
 | N2 | A6, B1 | net | vendor/webrtc-util/src/conn/conn_udp_listener.rs, src/listen.rs | N1 |
-| N3 | A-arch-2, A2, B4 | net | src/crypto.rs (+`crypto::peers`), src/connect.rs, src/listen.rs, src/clipboard/transport.rs, src/pair.rs, src/doctor.rs, src/config.rs (`fingerprint` key), src/service.rs (`paired`) | N2, G1 |
+| N3 | A-arch-2, A2, B4 | net | src/crypto.rs (+`crypto::peers`), src/connect.rs, src/listen.rs, src/clipboard/transport.rs, src/pair.rs, src/doctor.rs, src/config.rs (`fingerprint` key), src/service.rs (`paired`) [REVISED 2026-10-14: + src/ipc/mod.rs (`ClientConfig.fingerprint`), src/client.rs (pin), src/clipboard/mod.rs (`client_sender` passes the pin)] | N2, G1 |
 | N4 | B2, B3, B5 | net | src/listen.rs, src/clipboard/transport.rs, src/notify.rs, src/emulation.rs (`rejected_connections`), src/service.rs (revocation) | N3, E2 |
 | N5 | C4, C10 | net | src/connect.rs, src/discover.rs, src/doctor.rs, src/pair.rs | N3 |
 | E1 | A9 | emu | src/proto.rs, input-emulation/src/wlroots.rs | - |
