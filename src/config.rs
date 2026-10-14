@@ -206,7 +206,13 @@ pub fn restore_command(path: &Path) -> String {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version=build::CLAP_LONG_VERSION, about, long_about = None)]
+#[command(
+    author,
+    version = build::CLAP_LONG_VERSION,
+    about,
+    long_about = None,
+    after_help = "MiMouse is originally forked from Lan Mouse (https://github.com/feschber/lan-mouse) by Ferdinand Schober, GPL-3.0-or-later."
+)]
 struct Args {
     /// the listen port for mimouse
     #[arg(short, long)]
