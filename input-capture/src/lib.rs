@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
+    future::Future,
     task::{Poll, ready},
 };
 
@@ -164,6 +165,14 @@ impl Display for Backend {
     }
 }
 
+/// the backend an [`InputCapture`] runs on and how it was chosen
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selected {
+    pub backend: Backend,
+    /// tried in order because none was configured
+    pub auto: bool,
+}
+
 pub struct InputCapture {
     /// capture backend
     capture: Box<dyn Capture>,
@@ -180,6 +189,8 @@ pub struct InputCapture {
     /// the client a requested focus goes to: the next `Begin` at its
     /// position is for it alone
     focus: Option<CaptureHandle>,
+    /// `None`: a backend injected through [`InputCapture::with_backend`]
+    selected: Option<Selected>,
 }
 
 impl InputCapture {
@@ -330,9 +341,13 @@ impl InputCapture {
         backend: Option<Backend>,
         permission_pending: tokio::sync::watch::Sender<bool>,
     ) -> Result<Self, CaptureCreationError> {
-        Ok(Self::with_backend(
-            create(backend, permission_pending).await?,
-        ))
+        let (capture, selected) = select(backend, AUTO_BACKENDS, |backend| {
+            create_backend(backend, permission_pending.clone())
+        })
+        .await?;
+        let mut capture = Self::with_backend(capture);
+        capture.selected = Some(selected);
+        Ok(capture)
     }
 
     /// an [`InputCapture`] over an injected backend (tests and embedders)
@@ -345,7 +360,13 @@ impl InputCapture {
             pressed_keys: HashSet::new(),
             hotkeys: Vec::new(),
             focus: None,
+            selected: None,
         }
+    }
+
+    /// the backend in use and how it was chosen (`None`: injected)
+    pub fn selected(&self) -> Option<Selected> {
+        self.selected
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -662,37 +683,54 @@ async fn create_backend(
     }
 }
 
-async fn create(
-    backend: Option<Backend>,
-    permission_pending: tokio::sync::watch::Sender<bool>,
-) -> Result<
-    Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
-    CaptureCreationError,
-> {
-    if let Some(backend) = backend {
-        let b = create_backend(backend, permission_pending).await;
-        if b.is_ok() {
-            log::info!("using capture backend: {backend}");
-        }
-        return b;
-    }
+/// backends tried in order when none is configured; never Dummy, which
+/// captures nothing
+const AUTO_BACKENDS: &[Backend] = &[
+    #[cfg(libei)]
+    Backend::InputCapturePortal,
+    #[cfg(layer_shell)]
+    Backend::LayerShell,
+    #[cfg(x11)]
+    Backend::X11,
+    #[cfg(windows)]
+    Backend::Windows,
+    #[cfg(target_os = "macos")]
+    Backend::MacOs,
+];
 
-    for backend in [
-        #[cfg(libei)]
-        Backend::InputCapturePortal,
-        #[cfg(layer_shell)]
-        Backend::LayerShell,
-        #[cfg(x11)]
-        Backend::X11,
-        #[cfg(windows)]
-        Backend::Windows,
-        #[cfg(target_os = "macos")]
-        Backend::MacOs,
-    ] {
-        match create_backend(backend, permission_pending.clone()).await {
-            Ok(b) => {
-                log::info!("using capture backend: {backend}");
-                return Ok(b);
+/// the `configured` backend, else the first of `auto` that `create`
+/// succeeds with, stopping early when the user denied a permission request
+async fn select<T, F, Fut>(
+    configured: Option<Backend>,
+    auto: &[Backend],
+    mut create: F,
+) -> Result<(T, Selected), CaptureCreationError>
+where
+    F: FnMut(Backend) -> Fut,
+    Fut: Future<Output = Result<T, CaptureCreationError>>,
+{
+    if let Some(backend) = configured {
+        let capture = create(backend).await?;
+        log::info!("using capture backend: {backend} (configured)");
+        return Ok((
+            capture,
+            Selected {
+                backend,
+                auto: false,
+            },
+        ));
+    }
+    for &backend in auto {
+        match create(backend).await {
+            Ok(capture) => {
+                log::info!("using capture backend: {backend} (auto)");
+                return Ok((
+                    capture,
+                    Selected {
+                        backend,
+                        auto: true,
+                    },
+                ));
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
             Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
@@ -764,15 +802,7 @@ mod tests {
 
     fn input_capture() -> (InputCapture, Arc<Mutex<Shared>>) {
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let capture = InputCapture {
-            capture: Box::new(TestCapture(shared.clone())),
-            pressed_keys: HashSet::new(),
-            position_map: Default::default(),
-            id_map: Default::default(),
-            pending: Default::default(),
-            hotkeys: Vec::new(),
-            focus: None,
-        };
+        let capture = InputCapture::with_backend(Box::new(TestCapture(shared.clone())));
         (capture, shared)
     }
 
@@ -885,5 +915,56 @@ mod tests {
         // input of the released capture never reaches the caller after it
         capture.release().await.unwrap();
         assert_eq!(capture.next().await.map(Result::unwrap), None);
+    }
+
+    /// T5: a configured backend is reported as configured and never
+    /// replaced; without one, the first auto backend that works is
+    /// reported as auto
+    #[test]
+    fn selection_reports_configured_or_auto() {
+        use futures::executor::block_on;
+        let configured = Selected {
+            backend: Backend::Dummy,
+            auto: false,
+        };
+        let mut tried = 0;
+        let result = block_on(select(Some(Backend::Dummy), AUTO_BACKENDS, |_| {
+            tried += 1;
+            async { Ok::<_, CaptureCreationError>("dummy") }
+        }));
+        assert_eq!(result.unwrap(), ("dummy", configured));
+        assert_eq!(tried, 1);
+
+        // a configured backend that fails is not replaced by an auto one
+        let mut tried = 0;
+        let result = block_on(select(Some(Backend::Dummy), &[Backend::Dummy], |_| {
+            tried += 1;
+            async { Err::<(), _>(CaptureCreationError::NoAvailableBackend) }
+        }));
+        assert!(matches!(
+            result,
+            Err(CaptureCreationError::NoAvailableBackend)
+        ));
+        assert_eq!(tried, 1);
+
+        // auto: the backend that worked, after one that did not
+        let mut tried = 0;
+        let result = block_on(select(None, &[Backend::Dummy, Backend::Dummy], |_| {
+            tried += 1;
+            let attempt = tried;
+            async move {
+                match attempt {
+                    1 => Err(CaptureCreationError::NoAvailableBackend),
+                    n => Ok(n),
+                }
+            }
+        }));
+        let auto = Selected {
+            backend: Backend::Dummy,
+            auto: true,
+        };
+        assert_eq!(result.unwrap(), (2, auto));
+        // auto never picks the dummy, which captures nothing
+        assert!(!AUTO_BACKENDS.contains(&Backend::Dummy));
     }
 }

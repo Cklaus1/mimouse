@@ -241,10 +241,22 @@ pub enum FrontendEvent {
     Deleted { id: ClientHandle },
     /// listen port, with the reason if changing it failed
     Port { port: u16, error: Option<String> },
-    /// input capture state; `enabled` is `status == "enabled"`
-    Capture { enabled: bool, status: Status },
-    /// input emulation state; `enabled` is `status == "enabled"`
-    Emulation { enabled: bool, status: Status },
+    /// input capture state; `enabled` is `status == "enabled"`; `backend`:
+    /// the one in use while enabled (absent from older services)
+    Capture {
+        enabled: bool,
+        status: Status,
+        #[serde(default)]
+        backend: Option<BackendInUse>,
+    },
+    /// input emulation state; `enabled` is `status == "enabled"`; `backend`:
+    /// the one in use while enabled (absent from older services)
+    Emulation {
+        enabled: bool,
+        status: Status,
+        #[serde(default)]
+        backend: Option<BackendInUse>,
+    },
     /// clipboard sharing state: `{"status": .., "reason": ..}`
     ClipboardStatus(ClipboardStatus),
     /// authorized certificate fingerprints (fingerprint -> description)
@@ -304,6 +316,77 @@ pub enum Reply {
     Done,
     Client(Box<ClientInfo>),
     Clients(Vec<ClientInfo>),
+    /// the config in effect (`config`)
+    Config(ConfigReport),
+}
+
+/// the capture or emulation backend in use: `{"name": .., "auto": ..}`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendInUse {
+    pub name: String,
+    /// picked from the backends that work here, since none is configured
+    pub auto: bool,
+}
+
+impl Display for BackendInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let selection = if self.auto { "auto" } else { "configured" };
+        write!(f, "{}, {selection}", self.name)
+    }
+}
+
+/// where the value in effect of a config key comes from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// a command line flag of the service
+    Flag,
+    /// the config file
+    File,
+    /// the built-in default
+    Default,
+    /// `mimouse cli change-port`
+    Cli,
+}
+
+impl Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Source::Flag => "flag",
+            Source::File => "file",
+            Source::Default => "default",
+            Source::Cli => "cli",
+        })
+    }
+}
+
+/// a config key in effect
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigValue {
+    pub key: String,
+    /// `null`: unset (e.g. no backend configured)
+    pub value: serde_json::Value,
+    pub source: Source,
+    /// a changed value takes effect only when the service restarts
+    pub restart: bool,
+}
+
+/// a restart-only key whose value in the file differs from the one in effect
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartPending {
+    pub key: String,
+    pub in_effect: serde_json::Value,
+    pub on_disk: serde_json::Value,
+}
+
+/// the config of the running service
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigReport {
+    /// the config file
+    pub path: std::path::PathBuf,
+    pub keys: Vec<ConfigValue>,
+    /// keys changed in the file that need a restart to take effect
+    pub awaiting_restart: Vec<RestartPending>,
 }
 
 /// a request on the wire: `{"seq": n, "request": {...}}`, answered by a
@@ -391,12 +474,14 @@ pub enum FrontendRequest {
     },
     /// abort the current pairing
     PairCancel,
+    /// the config in effect, with the source of each key
+    Config,
 }
 
 impl FrontendRequest {
     /// read-only requests are not audited
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::List)
+        matches!(self, Self::List | Self::Config)
     }
 
     /// the client this request refers to, which must exist
@@ -542,4 +627,56 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
         .join("Library")
         .join("Caches")
         .join(MIMOUSE_SOCKET_NAME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T5: the backend in use decodes; an older service's event without it
+    /// still does
+    #[test]
+    fn state_events_decode_with_and_without_backend() {
+        let new = r#"{"event":"capture","enabled":true,"status":"enabled","backend":{"name":"input-capture-portal","auto":true}}"#;
+        let libei = BackendInUse {
+            name: "input-capture-portal".into(),
+            auto: true,
+        };
+        match serde_json::from_str(new).unwrap() {
+            FrontendEvent::Capture {
+                status, backend, ..
+            } => assert_eq!((status, backend), (Status::Enabled, Some(libei))),
+            e => panic!("decoded as {e:?}"),
+        }
+        let old = r#"{"event":"emulation","enabled":true,"status":"enabled"}"#;
+        match serde_json::from_str(old).unwrap() {
+            FrontendEvent::Emulation {
+                status, backend, ..
+            } => assert_eq!((status, backend), (Status::Enabled, None)),
+            e => panic!("decoded as {e:?}"),
+        }
+    }
+
+    /// T5: an older CLI, which knows the event without `backend`, decodes
+    /// the newer one
+    #[test]
+    fn older_cli_decodes_state_event_with_backend() {
+        #[derive(Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum OldEvent {
+            Emulation { enabled: bool, status: Status },
+        }
+        let event = FrontendEvent::Emulation {
+            enabled: true,
+            status: Status::Enabled,
+            backend: Some(BackendInUse {
+                name: "libei".into(),
+                auto: false,
+            }),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let OldEvent::Emulation { enabled, status } = serde_json::from_str(&line).unwrap();
+        assert!(enabled);
+        assert_eq!(status, Status::Enabled);
+    }
 }

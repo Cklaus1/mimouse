@@ -9,9 +9,10 @@ use crate::{
     discover::{self, DiscoverError},
     doctor,
     ipc::{
-        AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ClientInfo,
-        ClipboardDirection, ClipboardStatus, ConnectionError, DEFAULT_PORT, FrontendEvent,
-        FrontendRequest, IpcError, Position, Reply, Status, connect_async,
+        AsyncFrontendEventReader, AsyncFrontendRequestWriter, BackendInUse, ClientHandle,
+        ClientInfo, ClipboardDirection, ClipboardStatus, ConfigReport, ConnectionError,
+        DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, Status,
+        connect_async,
     },
 };
 
@@ -160,6 +161,9 @@ enum CliSubcommand {
     },
     /// check the service, config, key, firewall and every active client
     Doctor,
+    /// print the config in effect: each key's value and its source (flag,
+    /// file, default), and the changes in the file that await a restart
+    Config,
     /// pair with another machine: `pair --accept` there, `pair <host>
     /// --position <side>` here, then confirm the code both show
     Pair(Pair),
@@ -277,6 +281,7 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
         }
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
         CliSubcommand::Focus { id } => FrontendRequest::Focus { id },
+        CliSubcommand::Config => FrontendRequest::Config,
         CliSubcommand::Watch
         | CliSubcommand::Discover { .. }
         | CliSubcommand::Doctor
@@ -389,6 +394,10 @@ async fn pair(
 struct ServiceState {
     capture: Status,
     emulation: Status,
+    /// the backends in use; `None` while disabled, or from services that
+    /// do not report them
+    capture_backend: Option<BackendInUse>,
+    emulation_backend: Option<BackendInUse>,
     /// `None` from services that do not report it
     clipboard: Option<ClipboardStatus>,
 }
@@ -406,8 +415,18 @@ async fn wait_for_reply(
                 FrontendEvent::Reply { seq: s, result } if s == seq => {
                     return Ok((result, state));
                 }
-                FrontendEvent::Capture { status, .. } => state.capture = status,
-                FrontendEvent::Emulation { status, .. } => state.emulation = status,
+                FrontendEvent::Capture {
+                    status, backend, ..
+                } => {
+                    state.capture = status;
+                    state.capture_backend = backend;
+                }
+                FrontendEvent::Emulation {
+                    status, backend, ..
+                } => {
+                    state.emulation = status;
+                    state.emulation_backend = backend;
+                }
                 FrontendEvent::ClipboardStatus(status) => state.clipboard = Some(status),
                 _ => {}
             }
@@ -430,7 +449,9 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
             serde_json::json!({
                 "clients": clients,
                 "capture": state.capture,
+                "capture_backend": state.capture_backend,
                 "emulation": state.emulation,
+                "emulation_backend": state.emulation_backend,
                 "clipboard": state.clipboard,
             })
         ),
@@ -438,12 +459,67 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
             for client in clients {
                 println!("{}", client_line(client));
             }
-            println!("capture: {}", state.capture);
-            println!("emulation: {}", state.emulation);
+            println!(
+                "capture: {}",
+                status_line(state.capture, state.capture_backend.as_ref())
+            );
+            println!(
+                "emulation: {}",
+                status_line(state.emulation, state.emulation_backend.as_ref())
+            );
             if let Some(clipboard) = &state.clipboard {
                 println!("clipboard: {clipboard}");
             }
         }
+        (Reply::Config(report), true) => println!("{}", to_json(report)),
+        (Reply::Config(report), false) => print!("{}", config_text(report)),
+    }
+}
+
+/// `enabled (libei, auto)`; the backend only where the service reports one
+fn status_line(status: Status, backend: Option<&BackendInUse>) -> String {
+    match backend {
+        Some(backend) => format!("{status} ({backend})"),
+        None => status.to_string(),
+    }
+}
+
+/// `key = value (source)` per key, then the changes awaiting a restart
+fn config_text(report: &ConfigReport) -> String {
+    let mut text = format!("config file: {}\n", report.path.display());
+    for key in &report.keys {
+        let restart = if key.restart { ", restart-only" } else { "" };
+        text += &format!(
+            "{} = {} ({}{restart})\n",
+            key.key,
+            value_text(&key.value),
+            key.source
+        );
+    }
+    if !report.awaiting_restart.is_empty() {
+        text += "changed in the file, applied at the next start:\n";
+    }
+    for pending in &report.awaiting_restart {
+        text += &format!(
+            "  {}: {} in the file, {} in effect\n",
+            pending.key,
+            value_text(&pending.on_disk),
+            value_text(&pending.in_effect)
+        );
+    }
+    text
+}
+
+/// a config value for reading: `none` for unset, a count for tables and
+/// lists of tables (`cli list` shows clients and keys)
+fn value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "none".to_owned(),
+        serde_json::Value::Object(entries) => format!("{} entries", entries.len()),
+        serde_json::Value::Array(items) if items.iter().any(|i| i.is_object()) => {
+            format!("{} entries", items.len())
+        }
+        value => value.to_string(),
     }
 }
 
@@ -476,8 +552,12 @@ fn print_event(event: &FrontendEvent) {
             port,
             error: Some(e),
         } => println!("port change failed, still on {port}: {e}"),
-        FrontendEvent::Capture { status, .. } => println!("capture: {status}"),
-        FrontendEvent::Emulation { status, .. } => println!("emulation: {status}"),
+        FrontendEvent::Capture {
+            status, backend, ..
+        } => println!("capture: {}", status_line(*status, backend.as_ref())),
+        FrontendEvent::Emulation {
+            status, backend, ..
+        } => println!("emulation: {}", status_line(*status, backend.as_ref())),
         FrontendEvent::ClipboardStatus(status) => println!("clipboard: {status}"),
         FrontendEvent::AuthorizedKeys { keys } => {
             for (fingerprint, description) in keys {

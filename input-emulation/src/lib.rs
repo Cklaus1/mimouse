@@ -86,21 +86,30 @@ impl Display for Backend {
     }
 }
 
+/// the backend an [`InputEmulation`] runs on and how it was chosen
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Selected {
+    pub backend: Backend,
+    /// tried in order because none was configured
+    pub auto: bool,
+}
+
 /// Emulates peers' input on a backend. Every event passes [`Peer::plan`]
 /// first, so backends only see protocol values, real key and button
 /// changes, and motion and scroll in steps they can emulate.
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
+    selected: Selected,
     steps: Steps,
     peers: HashMap<EmulationHandle, Peer>,
     terminated: bool,
 }
 
 impl InputEmulation {
-    async fn with_backend(
+    async fn create_backend(
         backend: Backend,
         permission_pending: &watch::Sender<bool>,
-    ) -> Result<InputEmulation, EmulationCreationError> {
+    ) -> Result<Box<dyn Emulation>, EmulationCreationError> {
         // only the portals ask for permission
         #[cfg(not(any(libei, rdp)))]
         let _ = permission_pending;
@@ -121,13 +130,14 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
-        Ok(Self::with_emulation(emulation))
+        Ok(emulation)
     }
 
-    fn with_emulation(emulation: Box<dyn Emulation>) -> Self {
+    fn with_emulation(emulation: Box<dyn Emulation>, selected: Selected) -> Self {
         Self {
             steps: emulation.steps(),
             emulation,
+            selected,
             peers: HashMap::new(),
             terminated: false,
         }
@@ -139,18 +149,16 @@ impl InputEmulation {
         backend: Option<Backend>,
         permission_pending: watch::Sender<bool>,
     ) -> Result<InputEmulation, EmulationCreationError> {
-        if let Some(backend) = backend {
-            let b = Self::with_backend(backend, &permission_pending).await;
-            if b.is_ok() {
-                log::info!("using emulation backend: {backend}");
-            }
-            return b;
-        }
-
-        first_available(AUTO_BACKENDS, |backend| {
-            Self::with_backend(backend, &permission_pending)
+        let (emulation, selected) = select(backend, AUTO_BACKENDS, |backend| {
+            Self::create_backend(backend, &permission_pending)
         })
-        .await
+        .await?;
+        Ok(Self::with_emulation(emulation, selected))
+    }
+
+    /// the backend in use and how it was chosen
+    pub fn selected(&self) -> Selected {
+        self.selected
     }
 
     /// Emulates `event` for `handle` (see [`Peer::plan`]); events for a
@@ -309,21 +317,39 @@ const AUTO_BACKENDS: &[Backend] = &[
     Backend::MacOs,
 ];
 
-/// the first of `backends` that `create` succeeds with; stops early when the
-/// user denied a permission request
-async fn first_available<T, F, Fut>(
-    backends: &[Backend],
+/// the `configured` backend, else the first of `auto` that `create`
+/// succeeds with, stopping early when the user denied a permission request
+async fn select<T, F, Fut>(
+    configured: Option<Backend>,
+    auto: &[Backend],
     mut create: F,
-) -> Result<T, EmulationCreationError>
+) -> Result<(T, Selected), EmulationCreationError>
 where
     F: FnMut(Backend) -> Fut,
     Fut: Future<Output = Result<T, EmulationCreationError>>,
 {
-    for &backend in backends {
+    if let Some(backend) = configured {
+        let emulation = create(backend).await?;
+        log::info!("using emulation backend: {backend} (configured)");
+        return Ok((
+            emulation,
+            Selected {
+                backend,
+                auto: false,
+            },
+        ));
+    }
+    for &backend in auto {
         match create(backend).await {
-            Ok(b) => {
-                log::info!("using emulation backend: {backend}");
-                return Ok(b);
+            Ok(emulation) => {
+                log::info!("using emulation backend: {backend} (auto)");
+                return Ok((
+                    emulation,
+                    Selected {
+                        backend,
+                        auto: true,
+                    },
+                ));
             }
             Err(e) if e.cancelled_by_user() => return Err(e),
             Err(e) => log::warn!("{e}"),
@@ -475,7 +501,7 @@ mod tests {
     #[test]
     fn auto_selection_without_a_working_backend_fails() {
         let mut tried = Vec::new();
-        let result = futures::executor::block_on(first_available(AUTO_BACKENDS, |backend| {
+        let result = futures::executor::block_on(select(None, AUTO_BACKENDS, |backend| {
             tried.push(backend);
             async { Err::<(), _>(EmulationCreationError::NoAvailableBackend) }
         }));
@@ -486,5 +512,54 @@ mod tests {
         assert_eq!(tried, AUTO_BACKENDS);
         // never silently replays remote input into the log
         assert!(!tried.contains(&Backend::Dummy));
+    }
+
+    /// T5: a configured backend is reported as configured and never
+    /// replaced; without one, the first auto backend that works is
+    /// reported as auto
+    #[test]
+    fn selection_reports_configured_or_auto() {
+        use futures::executor::block_on;
+        let mut tried = 0;
+        let result = block_on(select(Some(Backend::Dummy), AUTO_BACKENDS, |_| {
+            tried += 1;
+            async { Ok::<_, EmulationCreationError>("dummy") }
+        }));
+        let configured = Selected {
+            backend: Backend::Dummy,
+            auto: false,
+        };
+        assert_eq!(result.unwrap(), ("dummy", configured));
+        assert_eq!(tried, 1);
+
+        // a configured backend that fails is not replaced by an auto one
+        let mut tried = 0;
+        let result = block_on(select(Some(Backend::Dummy), &[Backend::Dummy], |_| {
+            tried += 1;
+            async { Err::<(), _>(EmulationCreationError::NoAvailableBackend) }
+        }));
+        assert!(matches!(
+            result,
+            Err(EmulationCreationError::NoAvailableBackend)
+        ));
+        assert_eq!(tried, 1);
+
+        // auto: the backend that worked, after one that did not
+        let mut tried = 0;
+        let result = block_on(select(None, &[Backend::Dummy, Backend::Dummy], |_| {
+            tried += 1;
+            let attempt = tried;
+            async move {
+                match attempt {
+                    1 => Err(EmulationCreationError::NoAvailableBackend),
+                    n => Ok(n),
+                }
+            }
+        }));
+        let auto = Selected {
+            backend: Backend::Dummy,
+            auto: true,
+        };
+        assert_eq!(result.unwrap(), (2, auto));
     }
 }
