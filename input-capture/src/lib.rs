@@ -215,6 +215,7 @@ impl InputCapture {
         if self.focus == Some(id) {
             self.focus = None;
         }
+        self.retain_live_pending();
 
         log::debug!("destroying capture {id} @ {pos}");
         let remaining = self.position_map.get_mut(&pos).expect("id vector");
@@ -290,9 +291,16 @@ impl InputCapture {
         ranges.fold(first, EdgeRange::hull)
     }
 
+    /// drop queued events of destroyed ids: the caller no longer knows them
+    fn retain_live_pending(&mut self) {
+        let id_map = &self.id_map;
+        self.pending.retain(|(id, _)| id_map.contains_key(id));
+    }
+
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        self.retain_live_pending();
         self.capture.release().await
     }
 
@@ -512,4 +520,117 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use input_event::PointerEvent;
+
+    use super::*;
+
+    /// what the test backend saw and will report
+    #[derive(Default)]
+    struct Shared {
+        events: VecDeque<(Position, CaptureEvent)>,
+        barriers: HashMap<Position, Option<EdgeRange>>,
+    }
+
+    struct TestCapture(Arc<Mutex<Shared>>);
+
+    #[async_trait]
+    impl Capture for TestCapture {
+        async fn create(
+            &mut self,
+            pos: Position,
+            range: Option<EdgeRange>,
+        ) -> Result<(), CaptureError> {
+            self.0.lock().unwrap().barriers.insert(pos, range);
+            Ok(())
+        }
+
+        async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+            self.0.lock().unwrap().barriers.remove(&pos);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn set_hotkeys(&mut self, _: Vec<(Chord, Position)>) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    impl Stream for TestCapture {
+        type Item = Result<(Position, CaptureEvent), CaptureError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.0.lock().unwrap().events.pop_front().map(Ok))
+        }
+    }
+
+    fn input_capture() -> (InputCapture, Arc<Mutex<Shared>>) {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let capture = InputCapture {
+            capture: Box::new(TestCapture(shared.clone())),
+            pressed_keys: HashSet::new(),
+            position_map: Default::default(),
+            id_map: Default::default(),
+            pending: Default::default(),
+            hotkeys: Vec::new(),
+            focus: None,
+        };
+        (capture, shared)
+    }
+
+    const MOTION: CaptureEvent = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+        time: 0,
+        dx: 1.,
+        dy: 1.,
+    }));
+
+    #[tokio::test]
+    async fn destroyed_id_never_yields_queued_event() {
+        let (mut capture, shared) = input_capture();
+        capture.create(0, Position::Left, None).await.unwrap();
+        capture.create(1, Position::Left, None).await.unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .events
+            .push_back((Position::Left, MOTION));
+
+        // one id gets the event now, the other's copy is queued
+        let (first, _) = capture.next().await.unwrap().unwrap();
+        let other = 1 - first;
+        capture.destroy(other).await.unwrap();
+
+        let mut yielded = Vec::new();
+        while let Some(event) = capture.next().await {
+            yielded.push(event.unwrap().0);
+        }
+        assert!(!yielded.contains(&other), "{yielded:?}");
+
+        // the caller recovers: the next event reaches the live id
+        shared
+            .lock()
+            .unwrap()
+            .events
+            .push_back((Position::Left, MOTION));
+        assert_eq!(capture.next().await.unwrap().unwrap(), (first, MOTION));
+    }
 }
