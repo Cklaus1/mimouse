@@ -15,11 +15,15 @@ pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCapt
         let (permission_pending, _) = tokio::sync::watch::channel(false);
         let mut input_capture = InputCapture::new(backend, permission_pending).await?;
         log::info!("creating clients");
-        input_capture.create(0, Position::Left, None).await?;
-        input_capture.create(4, Position::Left, None).await?;
-        input_capture.create(1, Position::Right, None).await?;
-        input_capture.create(2, Position::Top, None).await?;
-        input_capture.create(3, Position::Bottom, None).await?;
+        input_capture.create(0, Position::Left, None, false).await?;
+        input_capture.create(4, Position::Left, None, false).await?;
+        input_capture
+            .create(1, Position::Right, None, false)
+            .await?;
+        input_capture.create(2, Position::Top, None, false).await?;
+        input_capture
+            .create(3, Position::Bottom, None, false)
+            .await?;
         if let Err(e) = do_capture(&mut input_capture).await {
             log::warn!("{e} - recreating capture");
         }

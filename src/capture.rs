@@ -280,20 +280,11 @@ impl CaptureTask {
             .any(|&(_, p, t, _)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    fn get_capture(&self, handle: CaptureHandle) -> Option<(Position, CaptureType)> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|&(_, pos, capture_type, _)| (pos, capture_type))
     }
 
     async fn run(mut self) {
@@ -358,9 +349,10 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type, range) in captures {
+        for (handle, pos, capture_type, range) in captures {
+            let enter_only = capture_type == CaptureType::EnterOnly;
             tokio::select! {
-                r = capture.create(handle, pos, range) => r?,
+                r = capture.create(handle, pos, range, enter_only) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -411,7 +403,7 @@ impl CaptureTask {
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t, r) => {
                         self.add_capture(h, p, t, r);
-                        capture.create(h, p, r).await?;
+                        capture.create(h, p, r, t == CaptureType::EnterOnly).await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         // the backend's `End` for a destroyed client never
@@ -459,6 +451,11 @@ impl CaptureTask {
             return Ok(());
         }
 
+        let Some((pos, capture_type)) = self.get_capture(handle) else {
+            log::warn!("dropping {event:?} for unknown capture {handle}");
+            return Ok(());
+        };
+
         if let CaptureEvent::Input(e) = event {
             match self.hotkey_watch.action(&e, self.active_client) {
                 HotkeyAction::Forward => {}
@@ -481,10 +478,10 @@ impl CaptureTask {
         }
 
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
+        if capture_type == CaptureType::EnterOnly {
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(pos) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -524,7 +521,7 @@ impl CaptureTask {
             CaptureEvent::End => unreachable!("handled above"),
         };
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let event = match event {
             CaptureEvent::Begin(_) => enter_event(opposite_pos, self.enter_at),
