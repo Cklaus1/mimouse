@@ -433,8 +433,14 @@ impl Service {
                 clients.edit(&fx, id, |c| c.enter_hook = enter_hook).await?;
                 clients.reply(id)
             }
-            // a different port and focus are handled in `handle_ipc_event`
-            FrontendRequest::ChangePort { .. } | FrontendRequest::Focus { .. } => Reply::Done,
+            // the port in use: nothing to rebind, but the file may hold
+            // another (a `--port` flag, an edit awaiting a restart)
+            FrontendRequest::ChangePort { port } => {
+                clients.save_port(port).await?;
+                Reply::Done
+            }
+            // focus is handled in `handle_ipc_event`
+            FrontendRequest::Focus { .. } => Reply::Done,
             FrontendRequest::EnableCapture => {
                 self.capture.reenable();
                 Reply::Done
@@ -630,7 +636,11 @@ impl Service {
                         self.port = port;
                         self.clipboard.port_changed(port);
                         self.notify_frontend(FrontendEvent::Port { port, error: None });
-                        self.clients.save_port(port).await;
+                        if let Err(e) = self.clients.save_port(port).await {
+                            log::warn!(
+                                "listening on port {port}, but the config was not saved ({e}); fix it, then run `mimouse cli save-config`"
+                            );
+                        }
                         Ok(())
                     }
                     Err(e) => {
@@ -1004,6 +1014,44 @@ mod tests {
                     keys.read().expect("lock").contains_key("aa:01"),
                     "merged key not in effect"
                 );
+                service.terminate().await;
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
+    }
+
+    /// R-9: `change-port` to the port in use saves it when the file holds
+    /// another one (here an edit awaiting a restart), so the next start
+    /// stays on it
+    #[tokio::test]
+    async fn change_port_to_the_port_in_use_is_saved() {
+        LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("service-same-port");
+                let path = dir.join("config.toml");
+                let (mut service, _) = service(&dir, "port = 47311\n").await;
+                edit(&path, |doc| doc["port"] = toml_edit::value(47312));
+                let wait = Duration::from_secs(10);
+                let change = tokio::time::timeout(wait, service.clients.changed()).await;
+                assert!(matches!(change, Ok(Change::Config)), "edit not reloaded");
+                service.handle_config_change();
+                assert_eq!(service.clients.config().awaiting_restart().len(), 1);
+                let request = FrontendRequest::ChangePort { port: 47311 };
+                let event = IpcEvent::Request(0, Request { seq: 1, request });
+                service.handle_ipc_event(event).await;
+                let replied = std::iter::from_fn(|| service.frontend.pop()).any(|(_, e)| {
+                    matches!(
+                        e,
+                        FrontendEvent::Reply {
+                            seq: 1,
+                            result: Ok(Reply::Done)
+                        }
+                    )
+                });
+                assert!(replied, "change-port failed");
+                let saved = fs::read_to_string(&path).unwrap();
+                assert!(saved.contains("port = 47311"), "{saved}");
+                assert!(service.clients.config().awaiting_restart().is_empty());
                 service.terminate().await;
                 fs::remove_dir_all(&dir).unwrap();
             })
