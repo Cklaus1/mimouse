@@ -32,7 +32,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
@@ -187,6 +187,26 @@ impl WlrootsEmulation {
             }
         }
     }
+
+    /// Handles what the compositor sent since the last call (keymap and
+    /// output changes) without blocking.
+    fn read_events(&mut self) -> Result<(), EmulationError> {
+        if let Some(guard) = self.queue.prepare_read() {
+            match guard.read() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => {
+                    r?;
+                }
+            }
+        }
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|e| match e {
+                DispatchError::Backend(e) => EmulationError::Wayland(e),
+                e => io::Error::other(e.to_string()).into(),
+            })?;
+        Ok(())
+    }
 }
 
 impl State {
@@ -261,6 +281,7 @@ impl Emulation for WlrootsEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        self.read_events()?;
         if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
             if self.last_flush_failed {
                 match self.queue.flush() {
@@ -295,18 +316,7 @@ impl Emulation for WlrootsEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        // pick up output changes without blocking
-        if let Some(guard) = self.queue.prepare_read() {
-            match guard.read() {
-                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
-                r => {
-                    r?;
-                }
-            }
-        }
-        self.queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.read_events()?;
 
         let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
             return Ok(None);
@@ -362,6 +372,9 @@ impl Emulation for WlrootsEmulation {
     }
 
     async fn create(&mut self, handle: EmulationHandle) {
+        if let Err(e) = self.read_events() {
+            log::warn!("{e}");
+        }
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {
             log::error!("{e}");
@@ -533,7 +546,12 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event {
-            state.keymap = Some((u32::from(format), fd, size));
+            let format = u32::from(format);
+            // keyboards made before the change would type the old layout
+            for input in state.input_for_client.values() {
+                input.keyboard.keymap(format, fd.as_fd(), size);
+            }
+            state.keymap = Some((format, fd, size));
         }
     }
 }
@@ -634,12 +652,14 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// the globals the backend needs; the seat has no keyboard
+    /// the globals the backend binds; the seat has no keyboard
     const GLOBALS: &[(&str, u32)] = &[
         ("wl_seat", 7),
         ("zwlr_virtual_pointer_manager_v1", 1),
         ("zwp_virtual_keyboard_manager_v1", 1),
+        ("zxdg_output_manager_v1", 3),
     ];
 
     /// a Wayland message: object, opcode and the encoded arguments
@@ -651,56 +671,81 @@ mod tests {
         msg
     }
 
-    /// a Wayland string argument: length with the NUL, padded to 4 bytes
-    fn string(s: &str) -> Vec<u8> {
-        let mut arg = (s.len() as u32 + 1).to_ne_bytes().to_vec();
-        arg.extend(s.as_bytes());
-        arg.push(0);
-        arg.resize(arg.len().next_multiple_of(4), 0);
-        arg
+    /// a `wl_registry.global` event
+    fn global(registry: u32, name: u32, interface: &str, version: u32) -> Vec<u8> {
+        let mut args = name.to_ne_bytes().to_vec();
+        // a string: length with the NUL, padded to 4 bytes
+        args.extend((interface.len() as u32 + 1).to_ne_bytes());
+        args.extend(interface.as_bytes());
+        args.resize(args.len() + 4 - interface.len() % 4, 0);
+        args.extend(version.to_ne_bytes());
+        message(registry, 0, &args)
     }
 
-    /// A compositor that announces `GLOBALS` and answers `wl_display.sync`,
-    /// and sends nothing else.
-    fn fake_compositor() -> Connection {
-        let (client, mut server) = UnixStream::pair().unwrap();
-        std::thread::spawn(move || {
-            let mut header = [0; 8];
-            // ends when the client hangs up
-            while server.read_exact(&mut header).is_ok() {
-                let word = |b: &[u8]| u32::from_ne_bytes(b[..4].try_into().unwrap());
-                let (object, size_opcode) = (word(&header), word(&header[4..]));
-                let mut args = vec![0; (size_opcode >> 16) as usize - 8];
-                if server.read_exact(&mut args).is_err() {
-                    return;
+    /// The compositor end of a fake connection: it announces `GLOBALS` and
+    /// answers `wl_display.sync`, anything else the test sends.
+    struct Compositor {
+        stream: Arc<Mutex<UnixStream>>,
+        /// the client's `wl_registry`
+        registry: Arc<AtomicU32>,
+    }
+
+    impl Compositor {
+        fn start() -> (Connection, Self) {
+            let (client, server) = UnixStream::pair().unwrap();
+            let mut reader = server.try_clone().unwrap();
+            let compositor = Self {
+                stream: Arc::new(Mutex::new(server)),
+                registry: Arc::default(),
+            };
+            let (stream, registry) = (compositor.stream.clone(), compositor.registry.clone());
+            std::thread::spawn(move || {
+                let mut header = [0; 8];
+                // ends when the client hangs up
+                while reader.read_exact(&mut header).is_ok() {
+                    let word = |b: &[u8]| u32::from_ne_bytes(b[..4].try_into().unwrap());
+                    let (object, size_opcode) = (word(&header), word(&header[4..]));
+                    let mut args = vec![0; (size_opcode >> 16) as usize - 8];
+                    if reader.read_exact(&mut args).is_err() {
+                        return;
+                    }
+                    // both requests carry the new object's id first
+                    let id = || word(&args);
+                    let reply = match (object, size_opcode & 0xffff) {
+                        // wl_display.sync: wl_callback.done
+                        (1, 0) => message(id(), 0, &0u32.to_ne_bytes()),
+                        // wl_display.get_registry
+                        (1, 1) => {
+                            registry.store(id(), Ordering::SeqCst);
+                            (1..)
+                                .zip(GLOBALS)
+                                .flat_map(|(name, &(interface, version))| {
+                                    global(id(), name, interface, version)
+                                })
+                                .collect()
+                        }
+                        _ => continue,
+                    };
+                    if stream.lock().unwrap().write_all(&reply).is_err() {
+                        return;
+                    }
                 }
-                let reply = match (object, size_opcode & 0xffff) {
-                    // wl_display.sync(callback): wl_callback.done
-                    (1, 0) => message(word(&args), 0, &0u32.to_ne_bytes()),
-                    // wl_display.get_registry: wl_registry.global per global
-                    (1, 1) => (1u32..)
-                        .zip(GLOBALS)
-                        .flat_map(|(name, (interface, version))| {
-                            let mut global = name.to_ne_bytes().to_vec();
-                            global.extend(string(interface));
-                            global.extend(version.to_ne_bytes());
-                            message(word(&args), 0, &global)
-                        })
-                        .collect(),
-                    _ => continue,
-                };
-                if server.write_all(&reply).is_err() {
-                    return;
-                }
-            }
-        });
-        Connection::from_socket(client).unwrap()
+            });
+            (Connection::from_socket(client).unwrap(), compositor)
+        }
+
+        /// announces a new global
+        fn announce(&self, name: u32, interface: &str, version: u32) {
+            let registry = self.registry.load(Ordering::SeqCst);
+            let event = global(registry, name, interface, version);
+            self.stream.lock().unwrap().write_all(&event).unwrap();
+        }
     }
 
     #[tokio::test]
     async fn a_seat_without_keyboard_fails_in_time() {
-        let timeout = Duration::from_millis(200);
-        let result = WlrootsEmulation::start(fake_compositor(), timeout).await;
+        let (conn, _compositor) = Compositor::start();
+        let result = WlrootsEmulation::start(conn, Duration::from_millis(200)).await;
         assert!(matches!(
             result,
             Err(WlrootsEmulationCreationError::Timeout {
@@ -708,5 +753,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn compositor_changes_arrive_with_input() {
+        let (conn, compositor) = Compositor::start();
+        let mut emulation = WlrootsEmulation::bind(&conn).unwrap();
+        // the fake cannot send a keymap: that needs fd passing
+        let keymap = std::fs::File::open("/dev/null").unwrap();
+        emulation.state.keymap = Some((1, keymap.into(), 0));
+        emulation.create(1).await;
+        assert!(emulation.state.outputs.is_empty());
+
+        // a monitor plugged in while a peer only sends input, no `enter_at`
+        compositor.announce(GLOBALS.len() as u32 + 1, "wl_output", 4);
+        let motion = PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 0.,
+        };
+        emulation.consume(Event::Pointer(motion), 1).await.unwrap();
+        assert_eq!(emulation.state.outputs.len(), 1);
     }
 }
