@@ -199,8 +199,11 @@ impl MiMouseConnection {
             }
         }
 
-        // fallback for clients not kept connected (yet): connect in the background
-        c.start_connect(handle).await;
+        // a client kept connected may be waiting out its backoff: try now
+        let keeper = c.keepers.borrow().get(&handle).cloned();
+        if let Some(token) = keeper {
+            c.start_connect(handle, token).await;
+        }
         Err(MiMouseConnectionError::NotConnected)
     }
 }
@@ -302,7 +305,7 @@ impl Connector {
             first_attempt = false;
             // `send` may have connected meanwhile
             if !self.is_connected(handle).await {
-                self.start_connect(handle).await;
+                self.start_connect(handle, token.clone()).await;
             }
         }
     }
@@ -333,22 +336,27 @@ impl Connector {
         }
     }
 
-    /// starts a connection attempt in the background unless one is running
-    async fn start_connect(&self, handle: ClientHandle) {
+    /// starts a connection attempt in the background unless one is running;
+    /// cancelling `token` (the keeper's) abandons it
+    async fn start_connect(&self, handle: ClientHandle, token: CancellationToken) {
         if self.connecting.lock().await.insert(handle) {
-            spawn_local(self.clone().connect_to_handle(handle));
+            spawn_local(self.clone().connect_to_handle(handle, token));
         }
     }
 
-    async fn connect_to_handle(self, handle: ClientHandle) {
-        if let Err(e) = self.establish(handle).await {
+    async fn connect_to_handle(self, handle: ClientHandle, token: CancellationToken) {
+        if let Err(e) = self.establish(handle, &token).await {
             log::debug!("client {handle}: connection failed: {e}");
         }
         self.connecting.lock().await.remove(&handle);
         self.changed.notify_waiters();
     }
 
-    async fn establish(&self, handle: ClientHandle) -> Result<(), MiMouseConnectionError> {
+    async fn establish(
+        &self,
+        handle: ClientHandle,
+        token: &CancellationToken,
+    ) -> Result<(), MiMouseConnectionError> {
         log::info!("client {handle} connecting ...");
         let ips = self
             .client_manager
@@ -364,24 +372,35 @@ impl Connector {
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let (conn, addr, fingerprint) = connect_any(&addrs, self.cert.clone(), policy).await?;
-        // the client may have been removed or moved while connecting
-        let current = self
-            .client_manager
-            .get_ips(handle)
-            .is_some_and(|ips| ips.contains(&addr.ip()))
+        let (conn, addr, fingerprint) = tokio::select! {
+            result = connect_any(&addrs, self.cert.clone(), policy) => result?,
+            _ = token.cancelled() => return Err(MiMouseConnectionError::NotConnected),
+        };
+        let mut conns = self.conns.lock().await;
+        // checked and registered without an await in between: `stop` cancels
+        // the token before it closes the client's connections, so it either
+        // closes this one or this attempt sees it was stopped. The client may
+        // also have been moved while connecting.
+        let current = !token.is_cancelled()
+            && self
+                .client_manager
+                .get_ips(handle)
+                .is_some_and(|ips| ips.contains(&addr.ip()))
             && self.client_manager.get_port(handle) == Some(addr.port());
         if !current {
+            drop(conns);
             let _ = conn.close().await;
             return Err(MiMouseConnectionError::NotConnected);
         }
         if !self.client_manager.pin(handle, addr, &fingerprint) {
+            drop(conns);
             let _ = conn.close().await;
             return Err(MiMouseConnectionError::Untrusted(fingerprint));
         }
         log::info!("client ({handle}) connected @ {addr}");
         self.client_manager.set_active_addr(handle, Some(addr));
-        let replaced = self.conns.lock().await.insert(addr, (handle, conn.clone()));
+        let replaced = conns.insert(addr, (handle, conn.clone()));
+        drop(conns);
         if let Some((_, replaced)) = replaced {
             // e.g. the client was re-added on a config reload; its old
             // connection task ends once the closed connection fails
@@ -661,6 +680,77 @@ mod tests {
                 assert!(!connector.is_connected(handle).await);
                 assert_eq!(client_manager.active_addr(handle), None);
                 listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// a UDP relay on a free localhost port to `target` that holds the
+    /// first datagram, and everything after it, until `release`; `held`
+    /// fires once that datagram arrived
+    async fn holding_relay(target: u16) -> (u16, tokio::sync::oneshot::Receiver<()>, Rc<Notify>) {
+        let front = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let port = front.local_addr().expect("local addr").port();
+        let back = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        back.connect(("127.0.0.1", target)).await.expect("connect");
+        let (held, held_rx) = tokio::sync::oneshot::channel();
+        let release = Rc::new(Notify::new());
+        let released = release.clone();
+        spawn_local(async move {
+            let mut buf = [0u8; 4096];
+            let mut back_buf = [0u8; 4096];
+            let (n, client) = front.recv_from(&mut buf).await.expect("recv");
+            let _ = held.send(());
+            released.notified().await;
+            let _ = back.send(&buf[..n]).await;
+            loop {
+                tokio::select! {
+                    r = front.recv_from(&mut buf) => match r {
+                        Ok((n, _)) => { let _ = back.send(&buf[..n]).await; }
+                        Err(_) => return,
+                    },
+                    r = back.recv(&mut back_buf) => match r {
+                        Ok(n) => { let _ = front.send_to(&back_buf[..n], client).await; }
+                        Err(_) => return,
+                    },
+                }
+            }
+        });
+        (port, held_rx, release)
+    }
+
+    /// C4: a handshake that completes after `stop` must not register a
+    /// connection for the stopped client
+    #[tokio::test]
+    async fn stop_cancels_an_attempt_in_flight() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, client_manager, handle) = peer(&cert).await;
+                let target = client_manager.get_port(handle).unwrap();
+                let (port, held, release) = holding_relay(target).await;
+                client_manager.set_port(handle, port);
+                let conn = MiMouseConnection::new(cert, client_manager.clone());
+                let connector = conn.connector();
+                connector.keep_connected(handle);
+                // the ClientHello is waiting in the relay
+                tokio::time::timeout(Duration::from_secs(10), held)
+                    .await
+                    .expect("no handshake started")
+                    .expect("relay gone");
+                connector.stop(handle);
+                release.notify_one();
+                // the server keeps answering, so an attempt that survived
+                // `stop` completes its handshake here
+                spawn_local(async move { while listener.next().await.is_some() {} });
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while connector.connecting.lock().await.contains(&handle) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("attempt still running");
+                assert!(connector.conns.lock().await.is_empty());
+                assert_eq!(client_manager.active_addr(handle), None);
             })
             .await;
     }
