@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use std::{io::BufRead, net::IpAddr, time::Duration};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -27,11 +27,31 @@ pub enum CliError {
     Request(String),
     #[error("the service closed the connection")]
     Closed,
+    /// e.g. a service of another version that cannot decode the request
+    #[error("no reply from the service within {} s", REPLY_TIMEOUT.as_secs())]
+    Timeout,
     #[error(transparent)]
     Discover(#[from] DiscoverError),
     #[error("{0} check(s) failed")]
     ChecksFailed(usize),
 }
+
+impl CliError {
+    /// process exit code: 3 service not running, 4 request rejected,
+    /// 5 doctor checks failed, 1 anything else
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            CliError::ServiceNotRunning(_) => 3,
+            CliError::Request(_) => 4,
+            CliError::ChecksFailed(_) => 5,
+            _ => 1,
+        }
+    }
+}
+
+/// how long to wait for the reply to a request; longer than a `focus` takes
+/// (`FOCUS_TIMEOUT` in capture.rs)
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
 #[command(name = "mimouse-cli", about = "MiMouse CLI interface")]
@@ -146,6 +166,15 @@ enum CliSubcommand {
 }
 
 pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
+    let json = args.json;
+    let result = run_command(args, config).await;
+    if let (Err(e), true) = (&result, json) {
+        println!("{}", serde_json::json!({ "error": e.to_string() }));
+    }
+    result
+}
+
+async fn run_command(args: CliArgs, config: Config) -> Result<(), CliError> {
     match args.command {
         CliSubcommand::Discover { port } => {
             return Ok(discover::run(&config, port, args.json).await?);
@@ -198,19 +227,10 @@ pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
         cmd => request(cmd),
     };
     let seq = tx.request(request).await?;
-    let (result, state) = wait_for_reply(rx, seq).await?;
-    match result {
-        Ok(reply) => {
-            print_reply(&reply, &state, args.json);
-            Ok(())
-        }
-        Err(e) => {
-            if args.json {
-                println!("{}", serde_json::json!({ "error": e }));
-            }
-            Err(CliError::Request(e))
-        }
-    }
+    let (result, state) = wait_for_reply(rx, seq, REPLY_TIMEOUT).await?;
+    let reply = result.map_err(CliError::Request)?;
+    print_reply(&reply, &state, args.json);
+    Ok(())
 }
 
 fn request(cmd: CliSubcommand) -> FrontendRequest {
@@ -303,9 +323,6 @@ async fn pair(
                     FrontendEvent::Reply { seq, result } if pending.contains(seq) => {
                         pending.retain(|s| s != seq);
                         if let Err(e) = result {
-                            if json {
-                                println!("{}", serde_json::json!({ "error": e }));
-                            }
                             return Err(CliError::Request(e.clone()));
                         }
                     }
@@ -370,21 +387,29 @@ struct ServiceState {
     emulation: Status,
 }
 
-/// skip state events until the reply to `seq` arrives
+/// skip state events until the reply to `seq` arrives, at most `limit`
 async fn wait_for_reply(
-    mut rx: AsyncFrontendEventReader,
+    mut rx: impl Stream<Item = Result<FrontendEvent, IpcError>> + Unpin,
     seq: u64,
+    limit: Duration,
 ) -> Result<(Result<Reply, String>, ServiceState), CliError> {
-    let mut state = ServiceState::default();
-    while let Some(event) = rx.next().await {
-        match event? {
-            FrontendEvent::Reply { seq: s, result } if s == seq => return Ok((result, state)),
-            FrontendEvent::Capture { status, .. } => state.capture = status,
-            FrontendEvent::Emulation { status, .. } => state.emulation = status,
-            _ => {}
+    let wait = async {
+        let mut state = ServiceState::default();
+        while let Some(event) = rx.next().await {
+            match event? {
+                FrontendEvent::Reply { seq: s, result } if s == seq => {
+                    return Ok((result, state));
+                }
+                FrontendEvent::Capture { status, .. } => state.capture = status,
+                FrontendEvent::Emulation { status, .. } => state.emulation = status,
+                _ => {}
+            }
         }
-    }
-    Err(CliError::Closed)
+        Err(CliError::Closed)
+    };
+    tokio::time::timeout(limit, wait)
+        .await
+        .map_err(|_| CliError::Timeout)?
 }
 
 fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
@@ -496,4 +521,28 @@ fn client_line(client: &ClientInfo) -> String {
 
 fn to_json(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).expect("serializable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reply_wait_times_out() {
+        // a service that never answers, e.g. one that could not decode the request
+        let silent = futures::stream::pending::<Result<FrontendEvent, IpcError>>();
+        let result = wait_for_reply(silent, 1, Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(CliError::Timeout)));
+    }
+
+    #[test]
+    fn exit_codes_are_distinct() {
+        let codes = [
+            CliError::ServiceNotRunning(ConnectionError::Timeout).exit_code(),
+            CliError::Request("rejected".into()).exit_code(),
+            CliError::ChecksFailed(1).exit_code(),
+            CliError::Closed.exit_code(),
+        ];
+        assert_eq!(codes, [3, 4, 5, 1]);
+    }
 }
