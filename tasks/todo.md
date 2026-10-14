@@ -33,8 +33,8 @@ Wave 3
 - [x] S1 A-arch-1, B6, B8
 
 Wave 4
-- [ ] T5 T5
-- [ ] T3 T3
+- [x] T5 T5
+- [x] T3 T3
 - [ ] X1 T-1, T-2, T-3, T-4
 - [ ] T2 T2
 

@@ -34,3 +34,7 @@
 - `src/clients.rs` `Clients::paired`: pairing applies before the save (the peer already trusts us), so a failed save leaves an active trusted client that is gone after restart; only `not_saved` tells the user. (P3, from S1)
 - `src/service.rs` `Shutdown::recv`: `signal::ctrl_c()` is re-created every select iteration; a long-lived listener would be cleaner. (P3, from S1)
 - `src/config.rs:558,686`: the two baseline clippy `redundant reference in info!` warnings are trivial to fix. (P3, from S1)
+- `src/config.rs` `Config::changed`: a reload replaces `config_toml` wholesale, so a live unsaved `change-port` value is lost from `config_toml.port` on the next file edit and the next save writes the file's old port (C9-era; `Config::port` keeps the live value). (P3, from T5)
+- `src/doctor.rs` backend check: an auto-selected backend passes plainly; doctor could warn when the file configures a backend but a flag or the A8 fallback is in effect. (P3, from T5)
+- `src/inhibit.rs:146-152`: the worker mixes tokio `sleep_until` with `std::time::Instant::now()` for `Debounce`; tokio Instant throughout is consistent and would allow a paused-clock task test of the 5 s release (with a seam for the D-Bus inhibitor). (P3, from T3)
+- `src/connect.rs:661` `keep_connected_connects_without_input_and_reconnects` costs ~5 s real time per lib run (DTLS loopback), dominating the suite. (P3, from T3)
