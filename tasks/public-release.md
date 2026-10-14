@@ -84,3 +84,4 @@ Ship MiMouse as a publicly supported product. Decided by the product owner on 20
 | N2 | P1 on real hardware for desktops that can't run headless here (KDE/sway/Hyprland on a real GPU, macOS) | Smoke headless here; record real-hardware runs as they happen |
 | N3 | P4 go/no-go: merge `product-review` into `main`, push `v1.0.0` | Merge after the implementation review and smoke are green |
 | N4 | X11 capture backend (X11 can only receive today) | Not in v1; README says receive-only |
+| N5 | Windows logoff/shutdown with a peer under control (R-10; the smoke sent the messages, not a real session end) | Log off megapc while it controls gpumaster; gpumaster gets key-ups and megapc's log shows `WM_QUERYENDSESSION received` |
