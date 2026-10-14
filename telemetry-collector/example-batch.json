@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "install_id": "3f2b8c1e-9a4d-4e7f-8b21-6c0d5e9a1f34",
+  "version": "1.0.0",
+  "commit": "37a7126",
+  "os_family": "linux",
+  "os_version": "fedora 41",
+  "desktop": "GNOME",
+  "session_type": "wayland",
+  "days": [
+    {
+      "date": "2026-10-13",
+      "capture": { "backend": "input-capture-portal", "selection": "auto" },
+      "emulation": { "backend": "libei", "selection": "configured" },
+      "reliability": {
+        "reconnects": 2,
+        "ping_timeouts": 1,
+        "watchdog_releases": 0,
+        "capture_disables": 0,
+        "emulation_disables": 0,
+        "approval_waits": { "lt_10s": 1, "lt_60s": 0, "ge_60s": 0 },
+        "clipboard_failures": 0
+      },
+      "usage": {
+        "switches": { "edge": 41, "hotkey": 3, "cli_focus": 1 },
+        "peers": 2,
+        "clipboard_transfers": { "lt_1k": 12, "lt_64k": 2, "lt_1m": 0, "lt_64m": 0, "ge_64m": 0 },
+        "file_transfers": { "lt_1k": 0, "lt_64k": 0, "lt_1m": 1, "lt_64m": 0, "ge_64m": 0 },
+        "cli_commands": { "list": 4, "focus": 1 }
+      }
+    }
+  ],
+  "crashes": [
+    {
+      "location": "src/capture.rs:212",
+      "message": "<formatted>",
+      "capture_backend": "input-capture-portal",
+      "emulation_backend": "libei"
+    }
+  ]
+}
