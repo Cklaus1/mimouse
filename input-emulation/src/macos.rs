@@ -1,5 +1,6 @@
 use super::geometry::{Rect, entry_point};
 use super::macos_logic::{KeyAction, KeyPlanner};
+use super::normalize::Steps;
 use super::{Edge, Emulation, EmulationHandle, error::EmulationError};
 use async_trait::async_trait;
 use core_graphics::base::CGFloat;
@@ -11,7 +12,7 @@ use core_graphics::event::{
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use input_event::macos_scroll::MacosScroll;
+use input_event::macos_scroll::{MacosScroll, V120_PER_LINE};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
@@ -476,8 +477,15 @@ impl Emulation for MacOSEmulation {
                 }
             },
         }
-        // FIXME
         Ok(())
+    }
+
+    /// scroll wheel deltas are whole pixels or whole lines
+    fn steps(&self) -> Steps {
+        Steps {
+            whole_pixels: true,
+            v120: V120_PER_LINE,
+        }
     }
 
     fn enter_at(

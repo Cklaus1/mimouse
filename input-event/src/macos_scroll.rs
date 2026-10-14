@@ -7,8 +7,9 @@
 
 use crate::PointerEvent;
 
-/// One wheel line is one third of a 120 step.
-const V120_PER_LINE: i32 = 40;
+/// One wheel line is one third of a 120 step; emulation sends macOS
+/// discrete scroll in whole lines and keeps the rest per peer.
+pub const V120_PER_LINE: i32 = 40;
 
 const VERTICAL: u8 = 0;
 const HORIZONTAL: u8 = 1;
@@ -47,11 +48,14 @@ impl MacosScroll {
     }
 
     /// The macOS scroll event for a wire scroll event; `None` for other
-    /// events and unknown axes.
+    /// events and unknown axes. Discrete scroll below one line is lost, so
+    /// callers pass multiples of [`V120_PER_LINE`].
     pub fn from_wire(event: PointerEvent) -> Option<Self> {
         let (lines, axis, delta) = match event {
-            PointerEvent::Axis { axis, value, .. } => (false, axis, -(value as i32)),
-            PointerEvent::AxisDiscrete120 { axis, value } => (true, axis, -value / V120_PER_LINE),
+            PointerEvent::Axis { axis, value, .. } => {
+                (false, axis, (value as i32).saturating_neg())
+            }
+            PointerEvent::AxisDiscrete120 { axis, value } => (true, axis, -(value / V120_PER_LINE)),
             _ => return None,
         };
         let (vertical, horizontal) = match axis {

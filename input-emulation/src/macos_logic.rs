@@ -2,14 +2,8 @@
 //! become `CGEvent`s. Kept free of CoreGraphics types so it is tested on
 //! every platform.
 
-use input_event::scancode::Linux;
+use crate::keys::{CONTROL, LOCK, MOD1, MOD4, Repeat, RepeatPlanner, SHIFT, modifier_mask};
 
-/// X11 modifier masks, as carried by `KeyboardEvent::Modifiers`.
-pub(crate) const SHIFT: u32 = 1 << 0;
-pub(crate) const LOCK: u32 = 1 << 1;
-pub(crate) const CONTROL: u32 = 1 << 2;
-pub(crate) const MOD1: u32 = 1 << 3;
-pub(crate) const MOD4: u32 = 1 << 6;
 /// AltGr / ISO_Level3_Shift on most XKB layouts.
 pub(crate) const MOD5: u32 = 1 << 7;
 
@@ -19,19 +13,6 @@ pub(crate) const CG_SHIFT: u64 = 0x0002_0000;
 pub(crate) const CG_CONTROL: u64 = 0x0004_0000;
 pub(crate) const CG_ALTERNATE: u64 = 0x0008_0000;
 pub(crate) const CG_COMMAND: u64 = 0x0010_0000;
-
-/// The X11 modifier a key changes, `None` for ordinary keys.
-pub(crate) fn modifier_mask(key: u32) -> Option<u32> {
-    let mask = match Linux::try_from(key).ok()? {
-        Linux::KeyLeftShift | Linux::KeyRightShift => SHIFT,
-        Linux::KeyCapsLock => LOCK,
-        Linux::KeyLeftCtrl | Linux::KeyRightCtrl => CONTROL,
-        Linux::KeyLeftAlt | Linux::KeyRightalt => MOD1,
-        Linux::KeyLeftMeta | Linux::KeyRightmeta => MOD4,
-        _ => return None,
-    };
-    Some(mask)
-}
 
 /// `CGEventFlags` bits for a set of X11 modifiers.
 pub(crate) fn cg_flags(mods: u32) -> u64 {
@@ -75,7 +56,7 @@ pub(crate) struct KeyPlanner {
     mods: u32,
     /// modifiers of the modifier keys held down
     held: u32,
-    repeating: Option<u16>,
+    repeat: RepeatPlanner,
 }
 
 impl KeyPlanner {
@@ -99,18 +80,14 @@ impl KeyPlanner {
             };
         }
         let flags = self.flags();
+        let repeat = self.repeat.key(key, pressed);
         if pressed {
-            self.repeating = Some(code);
             KeyAction::Press { code, flags }
         } else {
-            let stop_repeat = self.repeating == Some(code);
-            if stop_repeat {
-                self.repeating = None;
-            }
             KeyAction::Release {
                 code,
                 flags,
-                stop_repeat,
+                stop_repeat: repeat == Repeat::Stop,
             }
         }
     }
@@ -129,6 +106,7 @@ impl KeyPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use input_event::scancode::Linux;
 
     const MAC_A: u16 = 0x00;
     const MAC_B: u16 = 0x0B;
