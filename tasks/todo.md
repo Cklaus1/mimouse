@@ -17,7 +17,7 @@ Wave 1
 - [x] D2 P3
 
 Wave 2
-- [ ] N3 A-arch-2, A2, B4
+- [x] N3 A-arch-2, A2, B4
 - [ ] N5 C4, C10
 - [ ] E3 A-arch-4, B15, B17, B18, B19, B20
 - [ ] E4 C13, C14

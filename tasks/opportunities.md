@@ -19,3 +19,5 @@
 - After `request_port_change`, conns on the old socket linger until PEER_IDLE_TIMEOUT (10 s); the service could close them right away. (P3, from N2)
 - Vendored webrtc-util tests are not in CI: add `exclude = ["vendor/webrtc-util"]` to the root workspace and run `cargo test --manifest-path vendor/webrtc-util/Cargo.toml --lib conn::` (pulls criterion/tokio-test dev-deps). (P3, from N2)
 - The release workflow publishes no checksums (`.github/workflows/release.yml`); unsigned binaries (D6) leave users nothing to verify a download against. Candidate for R1: a `SHA256SUMS` asset. (P2, from W1)
+- Startup ping timeout: within ~5 s of a service start the first outgoing connection is closed with `did not respond for 4s` and reconnects (gpumaster 15:04:03, 15:23:05, 15:34:42 on 2026-10-14, before and after N3). Costs one reconnect per start; cause not traced (megapc pongs during emulation/clipboard startup?). (P2, from N3 smoke)
+- No CLI to clear a pin: a peer with a legitimately new certificate needs a hand edit of `fingerprint` or a re-pair (`mimouse cli unpin <id>` candidate). After the edit, reconnect waits for the backoff (16 s observed). (P3, from N3)

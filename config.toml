@@ -31,6 +31,9 @@ position = "right" # left | right | top | bottom
 hostname = "iridium"
 activate_on_startup = true
 ips = ["192.168.178.156"] # optional if hostname resolves
+# certificate this client must present (set by `mimouse cli pair`); if absent,
+# the first certificate seen is pinned and saved here (trust on first use)
+# fingerprint = "aa:bb:cc:..."
 # chord that moves control to this client (Windows/macOS: also while local;
 # GNOME: bind `mimouse cli focus <id>` as a custom shortcut instead)
 # hotkey = ["KeyLeftCtrl", "KeyLeftAlt", "Key1"]
