@@ -309,6 +309,12 @@ impl Service {
                     .unwrap_or_default();
                 self.telemetry.count_request(&request);
                 if let FrontendRequest::ChangePort { port } = request {
+                    if let Err(e) = self.clients.config().check_port(port) {
+                        let error = e.to_string();
+                        self.audit.record(&peer, &request, &Err(error.clone()));
+                        self.reply(conn, seq, Err(error));
+                        return;
+                    }
                     if port != self.port {
                         // answered once the listener has rebound
                         self.emulation.request_port_change(port);

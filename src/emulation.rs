@@ -222,11 +222,16 @@ impl ListenTask {
     }
 }
 
-/// A connected peer pings every 500 ms, so 3 s of silence is 6 lost
-/// datagrams in a row, not a short loss burst (lan-mouse#307)
+/// A connected peer pings every `PING_INTERVAL` (500 ms), so 3 s of silence
+/// is 6 lost datagrams in a row, not a short loss burst (lan-mouse#307)
 const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
 /// keys of a vanished peer stay held at most `WATCHDOG_TIMEOUT + WATCHDOG_TICK`
 const WATCHDOG_TICK: Duration = Duration::from_millis(500);
+const _: () = assert!(
+    WATCHDOG_TIMEOUT.as_nanos() > 2 * crate::connect::PING_INTERVAL.as_nanos(),
+    "one lost ping must not release the keys"
+);
+const _: () = assert!(WATCHDOG_TICK.as_nanos() < WATCHDOG_TIMEOUT.as_nanos());
 
 /// removes and returns the peers not heard from for more than `timeout`
 fn take_expired(

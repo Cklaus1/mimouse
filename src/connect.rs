@@ -227,6 +227,8 @@ impl Backoff {
     }
 }
 
+const _: () = assert!(Backoff::MIN.as_nanos() <= Backoff::MAX.as_nanos());
+
 impl Default for Backoff {
     fn default() -> Self {
         Self(Self::MIN)
@@ -488,7 +490,7 @@ impl Connector {
 /// pings go out every `PING_INTERVAL`; the connection is closed only once
 /// `MAX_MISSED_PINGS` in a row went unanswered (4 s), so loss bursts shorter
 /// than that, e.g. 3 of every 4 pings lost, keep it open (lan-mouse#307)
-const PING_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const PING_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MISSED_PINGS: u32 = 8;
 
 /// consecutive ping intervals without a Pong
