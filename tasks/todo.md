@@ -1,17 +1,17 @@
 # Todo: public release v1 (derived from commit history; see tasks/build-loop.md)
 
 Wave 1
-- [ ] N1 A1
-- [ ] N2 A6, B1
-- [ ] E1 A9
-- [ ] E2 A7, A8, B16
+- [x] N1 A1
+- [x] N2 A6, B1
+- [x] E1 A9
+- [x] E2 A7, A8, B16
 - [x] K1 A4
 - [x] K2 B11
 - [x] K3 A10 (B10)
 - [ ] G1 A-arch-5, A3, T7, C3, B7
 - [x] I1 A5, B3b
 - [x] I2 B9, C11
-- [ ] L1 A11
+- [x] L1 A11
 - [x] X0 T-1a
 - [x] X2 T-5
 - [x] D2 P3

@@ -111,7 +111,8 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 # webrtc-util 0.11.0 with webrtc-rs/webrtc#812 backported (Windows WSAECONNRESET
-# tears down the DTLS listener, feschber/lan-mouse#262)
+# tears down the DTLS listener, feschber/lan-mouse#262) and MiMouse listener
+# limits (conn cap, per-conn buffer cap, idle timeout, close evicts the remote)
 [patch.crates-io]
 webrtc-util = { path = "vendor/webrtc-util" }
 
