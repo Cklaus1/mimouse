@@ -259,7 +259,7 @@ async fn run(changes: ChangesTx, status: StatusTx, mut set_rx: SetRx) {
             tokio::select! {
                 _ = &mut sleep => break,
                 data = set_rx.recv() => match data {
-                    Some(data) => owned = Some(data),
+                    Some(set) => owned = Some(set.data),
                     None => return,
                 },
             }
@@ -383,6 +383,10 @@ async fn use_session(
                 if step == Step::Ignore {
                     continue;
                 }
+                // the startup contents are not a copy made after any update
+                if step != Step::Seed {
+                    set_rx.noticed(at);
+                }
                 *owned = None;
                 match step {
                     Step::Wait | Step::Ignore => {}
@@ -431,13 +435,13 @@ async fn use_session(
                     clipboard.selection_write_done(session, serial, false).await?;
                 }
             }
-            data = set_rx.recv() => {
+            set = set_rx.recv() => {
                 // only the latest update is kept: every SetSelection cancels
                 // transfers requested from the previous one
-                let Some(data) = data else { return Ok(()) };
-                set_selection(clipboard, session, &data).await?;
+                let Some(set) = set else { return Ok(()) };
+                set_selection(clipboard, session, &set.data).await?;
                 owner_changes.set_by_us();
-                *owned = Some(data);
+                *owned = Some(set.data);
             }
             _ = closed.next() => return Err(PortalError::Closed),
         }

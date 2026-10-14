@@ -42,18 +42,27 @@ const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SETTLE_ROUNDS: usize = 10;
 
+/// what the monitor and the writer share; the lock serializes clipboard
+/// access between the two threads, so the monitor sees the final value of a
+/// write before deciding whether it was ours, and the writer sees a copy the
+/// monitor noticed before it overwrites the clipboard
+#[derive(Default)]
+struct Own {
+    /// sequence number of the clipboard after our latest write
+    seq: u32,
+    /// when the monitor last noticed a change that was not our write
+    local: Option<Instant>,
+}
+
 pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
     let (tx, rx) = set_channel();
-    // sequence number of the clipboard after our latest write; the lock
-    // serializes clipboard access between the two threads, so the monitor
-    // sees the final value of a write before deciding whether it was ours
-    let own_seq = Arc::new(Mutex::new(0u32));
-    let seq = own_seq.clone();
+    let own = Arc::new(Mutex::new(Own::default()));
+    let monitor_own = own.clone();
     thread::Builder::new()
         .name("clipboard-monitor".into())
         .spawn(move || {
             // received contents are still set when monitoring fails
-            if let Err(e) = monitor(changes, &status, seq) {
+            if let Err(e) = monitor(changes, &status, monitor_own) {
                 log::warn!("clipboard: {e}");
                 crate::telemetry::COUNTERS.clipboard_failures.bump();
                 status.send_replace(ClipboardStatus::disabled(format!(
@@ -64,7 +73,7 @@ pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
         .expect("spawn thread");
     thread::Builder::new()
         .name("clipboard-writer".into())
-        .spawn(move || writer(rx, own_seq))
+        .spawn(move || writer(rx, own))
         .expect("spawn thread");
     tx
 }
@@ -75,14 +84,23 @@ fn seq_num() -> u32 {
 
 /// reports clipboard changes until the receiving end is gone (Ok) or
 /// monitoring fails
-fn monitor(changes: ChangesTx, status: &StatusTx, own_seq: Arc<Mutex<u32>>) -> Result<(), String> {
+fn monitor(changes: ChangesTx, status: &StatusTx, own: Arc<Mutex<Own>>) -> Result<(), String> {
     let mut monitor =
         Monitor::new().map_err(|e| format!("failed to monitor the clipboard: {e}"))?;
     status.send_replace(ClipboardStatus::new(ClipboardState::Enabled));
+    // records a change noticed at `changed` unless the clipboard holds our
+    // write; returns whether it does
+    let ours = |own: &mut Own, changed: Option<Instant>| {
+        if own.seq == seq_num() {
+            return true;
+        }
+        own.local = own.local.max(changed);
+        false
+    };
     // returns false once the receiving end is gone
     let report = |changed: Option<Instant>| {
-        let own = own_seq.lock().expect("lock");
-        if *own == seq_num() {
+        let mut own = own.lock().expect("lock");
+        if ours(&mut own, changed) {
             return true;
         }
         let data = read_settled();
@@ -107,11 +125,14 @@ fn monitor(changes: ChangesTx, status: &StatusTx, own_seq: Arc<Mutex<u32>>) -> R
             Ok(false) => return Ok(()),
             Err(e) => return Err(format!("clipboard monitor failed: {e}")),
         }
-        let changed = Instant::now();
+        let changed = Some(Instant::now());
+        // B21: the writer must not overwrite this copy with an older update
+        // while it settles
+        ours(&mut own.lock().expect("lock"), changed);
         if let Err(e) = settle(&mut monitor) {
             return Err(format!("clipboard monitor failed: {e}"));
         }
-        if !report(Some(changed)) {
+        if !report(changed) {
             return Ok(());
         }
     }
@@ -228,8 +249,9 @@ fn markers() -> Vec<(&'static str, Vec<u8>)> {
         .collect()
 }
 
-fn writer(mut rx: SetRx, own_seq: Arc<Mutex<u32>>) {
-    while let Some(data) = rx.blocking_recv() {
+fn writer(mut rx: SetRx, own: Arc<Mutex<Own>>) {
+    while let Some(set) = rx.blocking_recv() {
+        let data = &set.data;
         let text = data.get(MIME_TEXT).map(String::from_utf8_lossy);
         let html = data.get(MIME_HTML).map(String::from_utf8_lossy);
         let png = data.get(MIME_PNG);
@@ -254,7 +276,10 @@ fn writer(mut rx: SetRx, own_seq: Arc<Mutex<u32>>) {
             })
             .collect();
 
-        let mut seq = own_seq.lock().expect("lock");
+        let mut own = own.lock().expect("lock");
+        if set.older_than(own.local) {
+            continue;
+        }
         // whether the clipboard changed: it was opened and emptied
         let mut wrote = false;
         let result = (|| -> SysResult<()> {
@@ -280,8 +305,8 @@ fn writer(mut rx: SetRx, own_seq: Arc<Mutex<u32>>) {
         })();
         // the clipboard is closed now: this is the sequence number the
         // monitor will see for our write; without a write it is the user's
-        *seq = own_seq_after_write(*seq, wrote, seq_num());
-        drop(seq);
+        own.seq = own_seq_after_write(own.seq, wrote, seq_num());
+        drop(own);
         if let Err(e) = result {
             log::warn!("clipboard: failed to set clipboard: {e}");
         }

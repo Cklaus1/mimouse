@@ -405,7 +405,7 @@ impl Clipboard {
 /// reports local clipboard changes through the sender passed to `spawn`;
 /// closed once the backend ended for good. Only the latest contents are
 /// kept until the backend takes them (it may be slow or wait for approval).
-type BackendTx = watch::Sender<Option<Arc<ClipboardData>>>;
+type BackendTx = watch::Sender<Option<SetRequest>>;
 /// local clipboard changes reported by a backend
 type ChangesTx = mpsc::UnboundedSender<LocalChange>;
 /// the backend's state, shown by `cli list` and `cli doctor`
@@ -438,30 +438,67 @@ impl LocalChange {
     }
 }
 
+/// contents to set locally, and when the connection that brought them was
+/// accepted
+#[derive(Clone, Debug, PartialEq)]
+struct SetRequest {
+    data: Arc<ClipboardData>,
+    accepted: Instant,
+}
+
+impl SetRequest {
+    /// whether a local change the backend noticed at `local` is newer: the
+    /// update is then dropped, as the task drops it once the change reached
+    /// it (B21: the backend may notice a copy before the task hears of it)
+    fn older_than(&self, local: Option<Instant>) -> bool {
+        let older = local.is_some_and(|local| self.accepted < local);
+        if older {
+            log::info!("clipboard update dropped: the local clipboard changed since");
+        }
+        older
+    }
+}
+
 /// receiving end of a backend's set channel
-struct SetRx(watch::Receiver<Option<Arc<ClipboardData>>>);
+struct SetRx {
+    rx: watch::Receiver<Option<SetRequest>>,
+    /// when the backend last noticed a local change
+    local: Option<Instant>,
+}
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn set_channel() -> (BackendTx, SetRx) {
     let (tx, rx) = watch::channel(None);
-    (tx, SetRx(rx))
+    (tx, SetRx { rx, local: None })
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 impl SetRx {
-    /// the latest contents to set that were not taken yet; `None` once the
-    /// clipboard task is gone
-    async fn recv(&mut self) -> Option<Arc<ClipboardData>> {
+    /// the backend noticed a local change at `at` (before reading it):
+    /// updates accepted before are older and not set
+    // the Windows writer checks under its clipboard lock instead
+    #[cfg_attr(windows, allow(dead_code))]
+    fn noticed(&mut self, at: Instant) {
+        self.local = self.local.max(Some(at));
+    }
+
+    /// the latest contents to set that were not taken yet and are newer
+    /// than the latest local change noticed; `None` once the clipboard
+    /// task is gone
+    async fn recv(&mut self) -> Option<SetRequest> {
         loop {
-            self.0.changed().await.ok()?;
-            if let Some(data) = self.0.borrow_and_update().clone() {
-                return Some(data);
+            self.rx.changed().await.ok()?;
+            let Some(set) = self.rx.borrow_and_update().clone() else {
+                continue;
+            };
+            if !set.older_than(self.local) {
+                return Some(set);
             }
         }
     }
 
     #[cfg(windows)]
-    fn blocking_recv(&mut self) -> Option<Arc<ClipboardData>> {
+    fn blocking_recv(&mut self) -> Option<SetRequest> {
         futures::executor::block_on(self.recv())
     }
 }
@@ -699,7 +736,7 @@ impl ClipboardTask {
         }
         self.current = Some(Snapshot::new(data.clone()));
         self.seeded = false;
-        let _ = backend.send(Some(data));
+        let _ = backend.send(Some(SetRequest { data, accepted }));
     }
 
     /// send the current clipboard to `handle` unless it already has it
@@ -930,7 +967,32 @@ mod tests {
 
         let later = copied + std::time::Duration::from_millis(1);
         task.received(from_peer(text("newer"), later), &backend);
-        assert_eq!(set.recv().now_or_never().flatten(), Some(text("newer")));
+        let set = set.recv().now_or_never().flatten().expect("set");
+        assert_eq!(set.data, text("newer"));
+    }
+
+    /// B21: the backend noticed a copy the task has not heard of yet; an
+    /// update accepted before it is not set, one accepted after it is
+    #[test]
+    fn backend_does_not_set_an_update_older_than_its_copy() {
+        let (backend, mut set) = set_channel();
+        let accepted = Instant::now();
+        let copied = accepted + std::time::Duration::from_millis(1);
+        set.noticed(copied);
+
+        let older = SetRequest {
+            data: text("slow"),
+            accepted,
+        };
+        backend.send_replace(Some(older));
+        assert_eq!(set.recv().now_or_never(), None, "older update set");
+
+        let newer = SetRequest {
+            data: text("newer"),
+            accepted: copied,
+        };
+        backend.send_replace(Some(newer.clone()));
+        assert_eq!(set.recv().now_or_never(), Some(Some(newer)));
     }
 
     /// C6: of the updates received before the backend reads, only the
@@ -943,7 +1005,8 @@ mod tests {
         for i in 0..100 {
             task.received(from_peer(text(&i.to_string()), accepted), &backend);
         }
-        assert_eq!(set.recv().await, Some(text("99")));
+        let latest = set.recv().await.expect("set");
+        assert_eq!(latest.data, text("99"));
         assert!(set.recv().now_or_never().is_none(), "older contents queued");
 
         drop(set);
