@@ -24,15 +24,23 @@ Ship MiMouse as a publicly supported product. Decided by the product owner on 20
 
 ### Content (schema version 1)
 - Identity: random install id (UUID v4, created at opt-in, stored in the config dir), schema version, MiMouse version (`CLAP_LONG_VERSION`), OS family + version, Linux desktop (`XDG_CURRENT_DESKTOP`) and session type.
+  [REVISED: send `PKG_VERSION` + `SHORT_COMMIT`, not `CLAP_LONG_VERSION` (multi-line, includes branch, build time with the builder's timezone, rustc version).]
 - Reliability: capture and emulation backend in use and whether it was configured, auto-selected or a fallback; panics (message, file:line, backend); count of reconnects, connection closes by missed pings, watchdog key releases, capture/emulation disable events, approval waits (duration bucket), clipboard backend failures.
 - Usage (per day): switches of control, number of configured peers, clipboard transfers (count, size bucket), file transfers (count, size bucket), names of CLI commands used (no arguments), hotkey vs edge vs `cli focus` switches.
+  [REVISED: "CLI commands used" counts IPC requests the service receives; `doctor` and `discover` run without the service and are counted only when the service is up (the CLI sends a `CountCommand` request, best effort, never blocking the command).]
 
 ### Behaviour
 - **T-1 Client.** Counters in a `telemetry` module, persisted to `<cache dir>/mimouse/telemetry.json` at most once a minute and on shutdown. One upload per day (and at start if a crash record is waiting): HTTPS POST of one JSON batch, timeout 10 s, retry next day on failure, queue capped at 7 days. Reuse `tokio-rustls`/`rustls`; a root-certificate crate is the only new dependency (license check against `deny.toml`). Upload runs in its own task and is dropped on shutdown.
+  [REVISED: no HTTP client in the tree, so the upload is a hand-written HTTP/1.1 POST over `tokio-rustls` (ring); no `HTTPS_PROXY` support (stated in README). Install id from `ring::rand::SystemRandom` (no `uuid` dependency). The runtime is current_thread + LocalSet and tokio has no `fs` feature: the `telemetry.json` write runs in `spawn_blocking`. Counters are atomics (bumped from the Windows hook / macOS tap threads too). Cache dir via `clipboard::files::cache_dir`. Root certificates: `rustls-native-certs` (MIT/Apache-2.0/ISC; `webpki-roots` is CDLA-Permissive-2.0, not on the allow-list).]
+- **T-1a deny.toml + CI.** [NEW, Step 1] Migrate `deny.toml` to the current cargo-deny format (version 2), allow the licenses actually in the tree (incl. the project's own GPL-3.0-or-later, Unicode-3.0, Zlib if present), add a `cargo deny check licenses bans sources` job to `rust.yml` and to the AGENTS gate.
 - **T-2 Crash capture.** Release builds use `panic = "abort"`, so a panic hook writes a crash record to the cache dir before abort; the next start uploads it if telemetry is on, otherwise `cli telemetry show` and `doctor` mention it.
+  [REVISED: the record holds `file:line` with everything before `src/` or the crate root removed, the backend from a global atomic, and the message only when the payload is `&'static str`; formatted `String` payloads become `"<formatted>"` (e.g. `wlroots.rs` formats input events into panics). Writes are synchronous `std::fs` in the hook. SIGSEGV, OOM and stack overflow are not captured. Records created while telemetry was off are never uploaded later; they are only shown locally. The no-PII test includes a panic carrying an event.]
 - **T-3 Endpoint.** The release workflow bakes the endpoint URL in at build time (`MIMOUSE_TELEMETRY_URL`); `telemetry_endpoint` in `config.toml` overrides it. Without either, telemetry can't be turned on and the CLI says why. Dev/CI builds have no endpoint.
+  [REVISED: set `MIMOUSE_TELEMETRY_URL` only on tag builds (not `main-<sha>` pre-releases); `option_env!` returning `Some("")` counts as unset; Homebrew/source builds need `telemetry_endpoint`.]
 - **T-4 CLI.** `mimouse cli telemetry on|off|status|show [--json]`; `on` prints what is collected and the endpoint. Changes are audited (`audit.jsonl`) and saved to `config.toml`.
+  [REVISED: `status` prints the install id; `off` also sends a best-effort `DELETE /v1/installs/<id>` so server rows go too; README names that route. Editing `telemetry = false` in the file (hot reload) runs the same purge as `cli telemetry off`. `show` prints the queued batch (completed days + pending crash records), which is exactly what the next upload sends.]
 - **T-5 Collector.** `telemetry-collector/`: Cloudflare Worker + D1. Validates the schema version and field set, rejects unknown fields, never stores the client IP or request headers, keeps rows 90 days, rate-limits per install id. Includes the D1 schema, a local `wrangler dev` test and a README with deploy steps. **needs-human:** Cloudflare account, domain and deployment.
+  [REVISED: also disable Workers Logs/observability and request logging in `wrangler.toml`; a cron trigger deletes rows older than 90 days; implements `DELETE /v1/installs/<id>`. Tests run with `wrangler dev`/miniflare locally. Writing and testing the collector is in scope; account, domain and deployment stay needs-human.]
 - **T-6 Docs.** README "Telemetry" section (opt-in, full field list, how to turn off, retention); AGENTS invariant: new fields only by updating the schema version, README list and the no-PII test.
 
 ### Acceptance
@@ -45,10 +53,14 @@ Ship MiMouse as a publicly supported product. Decided by the product owner on 20
 ## P: Public support
 
 - **P1 Supported-desktop smoke.** Record a two-machine (or loopback) smoke for each D5 desktop: GNOME Wayland (gpumaster, done), Windows 11 (megapc, done), KDE Plasma Wayland (`kwin_wayland --virtual`), sway/Hyprland (`WLR_BACKENDS=headless`), X11 (Xvfb + a window manager). Each: capture start, crossing both ways, held-key release on disconnect, clipboard text. Results go into the README platform table with the date and version tested. Desktops that can't be run headless here: **needs-human** test on real hardware.
+  [REVISED: X11 capture is a stub (`input-capture/src/x11.rs:13-15`), so the X11 row is receive-only: crossing into X11, held-key release, clipboard; README says "X11: receive only". A macOS row is listed as "experimental, not smoke-gated". An X11 capture backend is not in v1 (needs-human N4 below).]
 - **P2 README for strangers.** Install per platform (`.deb`, `.rpm`, Windows zip + SmartScreen note, from source), firewall per OS, first pairing in five steps, troubleshooting via `doctor`, supported platforms table (D5), Lan Mouse compatibility statement (D2), telemetry (T-6).
+  [REVISED: the release ships a bare `mimouse-windows-x86_64.exe`, not a zip; P2 documents the .exe, SmartScreen, and macOS Gatekeeper quarantine (`xattr -d com.apple.quarantine`).]
 - **P3 Issue intake.** `.github/ISSUE_TEMPLATE/` bug form asking for `mimouse --version`, OS/desktop, `mimouse cli doctor --json` and the log; feature form; `SECURITY.md` with a private reporting channel (GitHub private advisories); `CONTRIBUTING.md` with the gate commands from AGENTS.md.
 - **P4 Versioning and release.** Semantic versioning starting at 1.0.0; `CHANGELOG.md` from this branch's history; merge `product-review` into `main`; tag; the existing release workflow publishes `.deb`, `.rpm` and the Windows zip. Publishing the tag: **needs-human** (go/no-go).
+  [REVISED: bump `Cargo.toml`, `Cargo.lock` and the packaging manifests that `render-manifests.py` checks against the Cargo version to 1.0.0; CHANGELOG starts at the fork point (merge-base with Lan Mouse `0d2190e7`); `v0.11.0` already exists as an upstream tag, so the first MiMouse tag is `v1.0.0`; enable `rust.yml` CI on pull requests to `main` so `product-review` is checked before merge. Merging into `main` and pushing the tag are the go/no-go: needs-human.]
 - **P5 Lan Mouse wording (D2).** README and `--help` say "originally forked from Lan Mouse" (GPL attribution stays); remove claims about tracking upstream.
+  [REVISED: also remove `.github/FUNDING.yml` (it points at the Lan Mouse author; a hard fork must not imply his endorsement), update the winget locale text and README "Changes from upstream"; `--help` gets "originally forked from Lan Mouse" via clap `after_help` (there is no existing text to edit).]
 
 ## Order
 
@@ -56,3 +68,12 @@ Ship MiMouse as a publicly supported product. Decided by the product owner on 20
 2. T-1..T-4, T-6 (client side) after A-arch-1, since the counters hook into the client lifecycle.
 3. T-5 collector (independent; can run in parallel with step 1).
 4. P1 smoke matrix after step 1, P2/P3/P5 docs, P4 last.
+
+## Needs-human (excluded from the autonomous run)
+
+| # | Item | Recommendation |
+|---|---|---|
+| N1 | T-5 deployment: Cloudflare account, domain, `wrangler deploy`, setting `MIMOUSE_TELEMETRY_URL` as a repo secret | Deploy after v1 code lands; until then release builds have no endpoint and `telemetry on` explains why |
+| N2 | P1 on real hardware for desktops that can't run headless here (KDE/sway/Hyprland on a real GPU, macOS) | Smoke headless here; record real-hardware runs as they happen |
+| N3 | P4 go/no-go: merge `product-review` into `main`, push `v1.0.0` | Merge after the implementation review and smoke are green |
+| N4 | X11 capture backend (X11 can only receive today) | Not in v1; README says receive-only |
