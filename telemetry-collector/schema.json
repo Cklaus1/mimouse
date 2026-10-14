@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mimouse:telemetry:batch:1",
+  "title": "MiMouse telemetry batch, schema version 1",
+  "description": "Body of POST /v1/batch. Every object lists its complete field set: all fields are required (nullable ones are sent as null) and any other field is rejected. Adding a field means a new schema_version.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "description": "Always 1 for this schema.",
+      "const": 1
+    },
+    "install_id": {
+      "description": "Random UUID v4 created at opt-in, lowercase hex with dashes.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "version": {
+      "description": "MiMouse PKG_VERSION.",
+      "type": "string",
+      "pattern": "^[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,4}(-[0-9A-Za-z.-]{1,32})?$"
+    },
+    "commit": {
+      "description": "SHORT_COMMIT of the build; empty string when built outside git.",
+      "type": "string",
+      "pattern": "^([0-9a-f]{7,40})?$"
+    },
+    "os_family": {
+      "description": "std::env::consts::OS.",
+      "enum": ["linux", "windows", "macos"]
+    },
+    "os_version": {
+      "description": "OS release, e.g. \"fedora 41\", \"10.0.26100\", \"15.1\"; null if unknown.",
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9 ._()+-]{1,64}$"
+    },
+    "desktop": {
+      "description": "XDG_CURRENT_DESKTOP (Linux); null if unset or not Linux.",
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9:_.-]{1,64}$"
+    },
+    "session_type": {
+      "description": "XDG_SESSION_TYPE (Linux), e.g. wayland or x11; null if unset or not Linux.",
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9]{1,16}$"
+    },
+    "days": {
+      "description": "Completed days, oldest first, at most the 7 most recent.",
+      "type": "array",
+      "maxItems": 7,
+      "items": { "$ref": "#/$defs/day" }
+    },
+    "crashes": {
+      "description": "Crash records written by the panic hook while telemetry was on.",
+      "type": "array",
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/crash" }
+    }
+  },
+  "required": [
+    "schema_version",
+    "install_id",
+    "version",
+    "commit",
+    "os_family",
+    "os_version",
+    "desktop",
+    "session_type",
+    "days",
+    "crashes"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "count": {
+      "description": "Event count.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000
+    },
+    "capture_backend": {
+      "description": "Serialized config::CaptureBackend; null if none is running.",
+      "enum": ["input-capture-portal", "layer-shell", "x11", "windows", "macos", "dummy", null]
+    },
+    "emulation_backend": {
+      "description": "Serialized config::EmulationBackend; null if none is running.",
+      "enum": ["wlroots", "libei", "xdp", "x11", "windows", "macos", "dummy", null]
+    },
+    "selection": {
+      "description": "How the backend was chosen: set in config, picked automatically, or a fallback after the configured or first choice failed; null if no backend is running.",
+      "enum": ["configured", "auto", "fallback", null]
+    },
+    "capture": {
+      "type": "object",
+      "properties": {
+        "backend": { "$ref": "#/$defs/capture_backend" },
+        "selection": { "$ref": "#/$defs/selection" }
+      },
+      "required": ["backend", "selection"],
+      "additionalProperties": false
+    },
+    "emulation": {
+      "type": "object",
+      "properties": {
+        "backend": { "$ref": "#/$defs/emulation_backend" },
+        "selection": { "$ref": "#/$defs/selection" }
+      },
+      "required": ["backend", "selection"],
+      "additionalProperties": false
+    },
+    "duration_buckets": {
+      "description": "Counts by duration: under 10 s, 10 s to under 60 s, 60 s or more.",
+      "type": "object",
+      "properties": {
+        "lt_10s": { "$ref": "#/$defs/count" },
+        "lt_60s": { "$ref": "#/$defs/count" },
+        "ge_60s": { "$ref": "#/$defs/count" }
+      },
+      "required": ["lt_10s", "lt_60s", "ge_60s"],
+      "additionalProperties": false
+    },
+    "size_buckets": {
+      "description": "Transfer counts by size in bytes: < 1 KiB, < 64 KiB, < 1 MiB, < 64 MiB, >= 64 MiB. The total count is the sum.",
+      "type": "object",
+      "properties": {
+        "lt_1k": { "$ref": "#/$defs/count" },
+        "lt_64k": { "$ref": "#/$defs/count" },
+        "lt_1m": { "$ref": "#/$defs/count" },
+        "lt_64m": { "$ref": "#/$defs/count" },
+        "ge_64m": { "$ref": "#/$defs/count" }
+      },
+      "required": ["lt_1k", "lt_64k", "lt_1m", "lt_64m", "ge_64m"],
+      "additionalProperties": false
+    },
+    "reliability": {
+      "type": "object",
+      "properties": {
+        "reconnects": {
+          "description": "Reconnects to a peer after a lost connection.",
+          "$ref": "#/$defs/count"
+        },
+        "ping_timeouts": {
+          "description": "Connections closed because pings were missed.",
+          "$ref": "#/$defs/count"
+        },
+        "watchdog_releases": {
+          "description": "Held keys released by the watchdog.",
+          "$ref": "#/$defs/count"
+        },
+        "capture_disables": {
+          "description": "Times input capture was disabled after an error.",
+          "$ref": "#/$defs/count"
+        },
+        "emulation_disables": {
+          "description": "Times input emulation was disabled after an error.",
+          "$ref": "#/$defs/count"
+        },
+        "approval_waits": {
+          "description": "Waits for a connection approval, by duration.",
+          "$ref": "#/$defs/duration_buckets"
+        },
+        "clipboard_failures": {
+          "description": "Clipboard backend failures.",
+          "$ref": "#/$defs/count"
+        }
+      },
+      "required": [
+        "reconnects",
+        "ping_timeouts",
+        "watchdog_releases",
+        "capture_disables",
+        "emulation_disables",
+        "approval_waits",
+        "clipboard_failures"
+      ],
+      "additionalProperties": false
+    },
+    "switches": {
+      "description": "Switches of control to a peer, by trigger.",
+      "type": "object",
+      "properties": {
+        "edge": { "$ref": "#/$defs/count" },
+        "hotkey": { "$ref": "#/$defs/count" },
+        "cli_focus": { "$ref": "#/$defs/count" }
+      },
+      "required": ["edge", "hotkey", "cli_focus"],
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "switches": { "$ref": "#/$defs/switches" },
+        "peers": {
+          "description": "Number of configured peers at the end of the day.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "clipboard_transfers": {
+          "description": "Clipboard transfers by size.",
+          "$ref": "#/$defs/size_buckets"
+        },
+        "file_transfers": {
+          "description": "File transfers by size.",
+          "$ref": "#/$defs/size_buckets"
+        },
+        "cli_commands": {
+          "description": "IPC requests received by the service, keyed by request name in snake_case (no arguments).",
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+          "additionalProperties": { "$ref": "#/$defs/count" },
+          "maxProperties": 64
+        }
+      },
+      "required": ["switches", "peers", "clipboard_transfers", "file_transfers", "cli_commands"],
+      "additionalProperties": false
+    },
+    "day": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "description": "UTC day the counters cover.",
+          "type": "string",
+          "format": "date"
+        },
+        "capture": {
+          "description": "Capture backend in use at the end of the day.",
+          "$ref": "#/$defs/capture"
+        },
+        "emulation": {
+          "description": "Emulation backend in use at the end of the day.",
+          "$ref": "#/$defs/emulation"
+        },
+        "reliability": { "$ref": "#/$defs/reliability" },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "required": ["date", "capture", "emulation", "reliability", "usage"],
+      "additionalProperties": false
+    },
+    "crash": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "description": "file:line of the panic, relative to src/ or the crate root.",
+          "type": "string",
+          "pattern": "^(?!.*\\.\\.)[A-Za-z0-9_][A-Za-z0-9_./-]{0,159}\\.rs:[0-9]{1,6}$"
+        },
+        "message": {
+          "description": "Panic message if the payload was a &'static str, otherwise \"<formatted>\".",
+          "type": "string",
+          "maxLength": 256
+        },
+        "capture_backend": { "$ref": "#/$defs/capture_backend" },
+        "emulation_backend": { "$ref": "#/$defs/emulation_backend" }
+      },
+      "required": ["location", "message", "capture_backend", "emulation_backend"],
+      "additionalProperties": false
+    }
+  }
+}
