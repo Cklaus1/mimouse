@@ -349,9 +349,10 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type, range) in captures {
+        for (handle, pos, capture_type, range) in captures {
+            let enter_only = capture_type == CaptureType::EnterOnly;
             tokio::select! {
-                r = capture.create(handle, pos, range) => r?,
+                r = capture.create(handle, pos, range, enter_only) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -402,7 +403,7 @@ impl CaptureTask {
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t, r) => {
                         self.add_capture(h, p, t, r);
-                        capture.create(h, p, r).await?;
+                        capture.create(h, p, r, t == CaptureType::EnterOnly).await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         // the backend's `End` for a destroyed client never

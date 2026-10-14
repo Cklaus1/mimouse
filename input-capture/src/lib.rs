@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
-    mem::swap,
     task::{Poll, ready},
 };
 
@@ -172,8 +171,8 @@ pub struct InputCapture {
     pressed_keys: HashSet<scancode::Linux>,
     /// map from position to ids
     position_map: HashMap<Position, Vec<CaptureHandle>>,
-    /// map from id to position and range
-    id_map: HashMap<CaptureHandle, (Position, Option<EdgeRange>)>,
+    /// map from id to position, range and whether it is enter-only
+    id_map: HashMap<CaptureHandle, (Position, Option<EdgeRange>, bool)>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
     /// client hotkeys the backend starts capture with while input is local
@@ -185,12 +184,15 @@ pub struct InputCapture {
 
 impl InputCapture {
     /// create a new client with the given id; `range`: the part of the edge
-    /// that activates it (`None`: all of it)
+    /// that activates it (`None`: all of it); `enter_only`: it only wants
+    /// to see crossings (an inbound connection), so a normal client at the
+    /// same position alone shapes the barrier and gets the input
     pub async fn create(
         &mut self,
         id: CaptureHandle,
         pos: Position,
         range: Option<EdgeRange>,
+        enter_only: bool,
     ) -> Result<(), CaptureError> {
         assert!(!self.id_map.contains_key(&id));
 
@@ -198,7 +200,7 @@ impl InputCapture {
             .position_map
             .contains_key(&pos)
             .then(|| self.barrier_range(pos));
-        self.id_map.insert(id, (pos, range));
+        self.id_map.insert(id, (pos, range, enter_only));
         self.position_map.entry(pos).or_default().push(id);
         let new = self.barrier_range(pos);
         if old != Some(new) {
@@ -209,7 +211,7 @@ impl InputCapture {
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let (pos, _) = *self.id_map.get(&id).expect("no position for this handle");
+        let (pos, ..) = *self.id_map.get(&id).expect("no position for this handle");
         let old = self.barrier_range(pos);
         self.id_map.remove(&id);
         if self.focus == Some(id) {
@@ -241,7 +243,7 @@ impl InputCapture {
     /// caller then moves the pointer through the barrier, and the `Begin`
     /// that follows is for `id`.
     pub async fn focus(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let Some(&(pos, range)) = self.id_map.get(&id) else {
+        let Some(&(pos, range, _)) = self.id_map.get(&id) else {
             return Err(CaptureError::NoSuchClient(id));
         };
         self.focus = Some(id);
@@ -279,14 +281,10 @@ impl InputCapture {
         self.capture.set_hotkeys(hotkeys).await
     }
 
-    /// the range of the barrier at `pos`: covers every client there
+    /// the range of the barrier at `pos`: covers every steering client there
     fn barrier_range(&self, pos: Position) -> Option<EdgeRange> {
-        let mut ranges = self
-            .position_map
-            .get(&pos)
-            .into_iter()
-            .flatten()
-            .map(|id| self.id_map.get(id).and_then(|&(_, range)| range));
+        let mut ranges = ids_at(&self.position_map, &self.id_map, pos, true)
+            .map(|id| self.id_map.get(&id).and_then(|&(_, range, _)| range));
         let first = ranges.next()?;
         ranges.fold(first, EdgeRange::hull)
     }
@@ -384,45 +382,46 @@ impl Stream for InputCapture {
                 self.update_pressed_keys(key, state);
             }
 
-            let len = self
-                .position_map
-                .get(&pos)
-                .map(|ids| ids.len())
-                .unwrap_or(0);
-
             // a requested focus: the `Begin` is for the focused client only
             if matches!(event, CaptureEvent::Begin(_)) {
                 if let Some(id) = self.focus {
-                    if self.id_map.get(&id).is_some_and(|&(p, _)| p == pos) {
+                    if self.id_map.get(&id).is_some_and(|&(p, ..)| p == pos) {
                         self.focus = None;
                         return Poll::Ready(Some(Ok((id, event))));
                     }
                 }
             }
 
-            return match len {
+            // crossings and ends reach every id, input only the steering ones
+            let this = &mut *self;
+            let steering = matches!(event, CaptureEvent::Input(_));
+            let mut ids = ids_at(&this.position_map, &this.id_map, pos, steering);
+            let Some(first) = ids.next() else {
                 // no client at this position (destroyed meanwhile): poll
                 // again, returning Pending here would lose the wakeup
-                0 => continue,
-                1 => Poll::Ready(Some(Ok((
-                    self.position_map.get(&pos).expect("no id")[0],
-                    event,
-                )))),
-                _ => {
-                    let mut position_map = HashMap::new();
-                    swap(&mut self.position_map, &mut position_map);
-                    {
-                        for &id in position_map.get(&pos).expect("position") {
-                            self.pending.push_back((id, event));
-                        }
-                    }
-                    swap(&mut self.position_map, &mut position_map);
-
-                    Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
-                }
+                continue;
             };
+            this.pending.extend(ids.map(|id| (id, event)));
+            return Poll::Ready(Some(Ok((first, event))));
         }
     }
+}
+
+/// The ids at `pos`; `steering`: only those that shape its barrier and get
+/// its input, i.e. enter-only ids only while no other id is there (the way
+/// back to the peer that controls this machine).
+fn ids_at<'a>(
+    position_map: &'a HashMap<Position, Vec<CaptureHandle>>,
+    id_map: &'a HashMap<CaptureHandle, (Position, Option<EdgeRange>, bool)>,
+    pos: Position,
+    steering: bool,
+) -> impl Iterator<Item = CaptureHandle> + 'a {
+    let ids = position_map.get(&pos).map_or(&[][..], Vec::as_slice);
+    let enter_only = |id: &CaptureHandle| id_map.get(id).is_some_and(|&(.., e)| e);
+    let skip_enter_only = steering && !ids.iter().all(enter_only);
+    ids.iter()
+        .copied()
+        .filter(move |id| !(skip_enter_only && enter_only(id)))
 }
 
 #[async_trait]
@@ -606,8 +605,14 @@ mod tests {
     #[tokio::test]
     async fn destroyed_id_never_yields_queued_event() {
         let (mut capture, shared) = input_capture();
-        capture.create(0, Position::Left, None).await.unwrap();
-        capture.create(1, Position::Left, None).await.unwrap();
+        capture
+            .create(0, Position::Left, None, false)
+            .await
+            .unwrap();
+        capture
+            .create(1, Position::Left, None, false)
+            .await
+            .unwrap();
         shared
             .lock()
             .unwrap()
@@ -632,5 +637,55 @@ mod tests {
             .events
             .push_back((Position::Left, MOTION));
         assert_eq!(capture.next().await.unwrap().unwrap(), (first, MOTION));
+    }
+
+    #[tokio::test]
+    async fn enter_only_keeps_default_range_and_input() {
+        let (mut capture, shared) = input_capture();
+        let range = EdgeRange::new(0, 40);
+        capture
+            .create(0, Position::Left, range, false)
+            .await
+            .unwrap();
+        capture.create(1, Position::Left, None, true).await.unwrap();
+        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], range);
+
+        // the crossing reaches both, the input only the Default id
+        let begin = CaptureEvent::Begin(None);
+        shared
+            .lock()
+            .unwrap()
+            .events
+            .extend([(Position::Left, begin), (Position::Left, MOTION)]);
+        let mut yielded = Vec::new();
+        while let Some(event) = capture.next().await {
+            yielded.push(event.unwrap());
+        }
+        assert_eq!(yielded, [(0, begin), (1, begin), (0, MOTION)]);
+
+        // the Default id gone, the enter-only id gets the whole edge back
+        capture.destroy(0).await.unwrap();
+        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], None);
+    }
+
+    #[tokio::test]
+    async fn enter_only_alone_keeps_whole_edge() {
+        let (mut capture, shared) = input_capture();
+        capture.create(1, Position::Left, None, true).await.unwrap();
+        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], None);
+        shared
+            .lock()
+            .unwrap()
+            .events
+            .push_back((Position::Left, MOTION));
+        assert_eq!(capture.next().await.unwrap().unwrap(), (1, MOTION));
+
+        // a Default id joining narrows it to its range
+        let range = EdgeRange::new(0, 40);
+        capture
+            .create(0, Position::Left, range, false)
+            .await
+            .unwrap();
+        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], range);
     }
 }
