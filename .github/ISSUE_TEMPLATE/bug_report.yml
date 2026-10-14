@@ -74,6 +74,6 @@ body:
       label: Relevant log
       description: |
         Linux: `journalctl --user -u mimouse` (around the time of the problem).
-        Windows: `%LOCALAPPDATA%\mimouse\mimouse.log`.
-        Setting `MIMOUSE_LOG_LEVEL=debug` gives more detail. Do not include clipboard contents or keys.
+        Windows: MiMouse logs to stderr only, so the scheduled task's log is lost. End the task, then in PowerShell run `$env:MIMOUSE_LOG_LEVEL = "debug"; mimouse.exe daemon 2> mimouse.log`, reproduce the problem and attach `mimouse.log`.
+        On Linux, setting `MIMOUSE_LOG_LEVEL=debug` in the service environment gives more detail. Do not include clipboard contents or keys.
       render: text

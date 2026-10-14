@@ -4,11 +4,13 @@ MiMouse is a CLI-only software KVM, originally forked from Lan Mouse (hard fork:
 
 ## Gates
 
-Every change must pass, with no new warnings:
+Every change must pass these (the same commands as `AGENTS.md` and CI); warnings are errors:
 
 ```sh
-cargo fmt && cargo clippy --workspace --all-targets && cargo test --workspace
-cargo clippy --release --target x86_64-pc-windows-gnu --no-default-features
+cargo fmt && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace
+cargo clippy --release --target x86_64-pc-windows-gnu --no-default-features -- -D warnings
+cargo deny check licenses bans sources   # license allow-list in deny.toml; a new license needs a GPL-3.0 compatibility check
+cd telemetry-collector && npm ci && npm test   # collector tests
 ```
 
 Cross-target clippy (Windows and macOS code must compile even when you only touch Linux):
@@ -16,9 +18,9 @@ Cross-target clippy (Windows and macOS code must compile even when you only touc
 ```sh
 cargo fmt --check
 cargo test --workspace --release
-cargo clippy --workspace --all-targets --release
-cargo clippy --release --target x86_64-pc-windows-gnu --all-targets --no-default-features
-CC_aarch64_apple_darwin=/tmp/fakecc AR_aarch64_apple_darwin=/tmp/fakear cargo clippy --target aarch64-apple-darwin --all-targets --no-default-features
+cargo clippy --workspace --all-targets --all-features --release -- -D warnings
+cargo clippy --release --target x86_64-pc-windows-gnu --all-targets --no-default-features -- -D warnings
+CC_aarch64_apple_darwin=/tmp/fakecc AR_aarch64_apple_darwin=/tmp/fakear cargo clippy --target aarch64-apple-darwin --all-targets --no-default-features -- -D warnings
 ```
 
 The macOS line only type-checks; `/tmp/fakecc` and `/tmp/fakear` are stub scripts standing in for the Apple C toolchain.

@@ -170,7 +170,7 @@ Sending needs a capture backend; receiving needs an emulation backend. Both are 
 
 | Desktop | Capture | Emulation | Clipboard | Tested |
 |---|---|---|---|---|
-| GNOME (Wayland) | `input-capture-portal` | `libei`, `xdp` (remote-desktop portal) | yes | GNOME 50, against Windows 11, 2026-10-14: Windows -> GNOME crossing (commit f281e041); clipboard text and a 60 MiB file GNOME -> Windows via `cli focus` (commit 54a8d55a) |
+| GNOME (Wayland) | `input-capture-portal` | `libei`, `xdp` (remote-desktop portal) | yes | GNOME 50, against Windows 11, 2026-10-14: Windows -> GNOME crossing (commit 3e473ed); clipboard text and a 60 MiB file GNOME -> Windows via `cli focus` (commit 5f076ef) |
 | KDE Plasma (Wayland) | `input-capture-portal`, `layer-shell` | `libei`, `xdp` | yes | KWin 6.6.6 `--virtual`, 2026-10-14, commit 9703a5b: crossing both ways, Ctrl double-tap release, held-key release on disconnect, clipboard text both ways |
 | sway | `layer-shell` | `wlroots` | off | sway 1.11 headless, 2026-10-14, commit 9703a5b: crossing both ways, Ctrl double-tap release, held-key release on disconnect |
 | Hyprland | `layer-shell` | `wlroots` | off | Hyprland 0.53.3 nested, 2026-10-14, commit 9703a5b: crossing both ways, held-key release on disconnect |

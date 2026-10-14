@@ -45,4 +45,4 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - The certificate key `mimouse.pem` is owner-only (0600, or an owner-only DACL on Windows), and looser permissions are repaired at startup.
 - The Windows control channel is a per-user named pipe with an owner-only DACL. The CLI refuses a pipe owned by another user.
 - Each client's server certificate is pinned. Revoking a key closes that peer's input and clipboard connections.
-- DTLS handshakes time out, and the number of connections and buffered datagrams is capped. External hook commands time out and are killed.
+- DTLS handshakes time out, and the number of connections and buffered datagrams is capped. The `tailscale` and firewall tools run by `doctor`, `discover` and `pair` time out and are killed.
