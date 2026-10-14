@@ -378,6 +378,8 @@ impl Drop for PermissionPending<'_> {
     }
 }
 
+// async_trait returns a boxed future, itself `must_use`, from methods that return `Result`
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait Emulation: Send {
     async fn consume(
