@@ -30,7 +30,7 @@ use std::{
 use tokio::{
     sync::{
         Notify,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
         watch,
     },
     task::JoinHandle,
@@ -82,7 +82,7 @@ pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
-    notify_capture: Sender<LibeiNotifyEvent>,
+    notify_capture: UnboundedSender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     cancellation_token: CancellationToken,
     terminated: bool,
@@ -324,7 +324,7 @@ impl LibeiInputCapture {
             Some(create_session(unsafe { &*input_capture_ptr }, &permission_pending).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
-        let (notify_capture, notify_rx) = mpsc::channel(1);
+        let (notify_capture, notify_rx) = mpsc::unbounded_channel();
         let notify_release = Arc::new(Notify::new());
 
         let cancellation_token = CancellationToken::new();
@@ -354,9 +354,33 @@ impl LibeiInputCapture {
     }
 }
 
+/// Applies `first` and every update queued behind it, so that a burst (the
+/// service creates all clients at startup) restarts the session once. A
+/// client keeps its place when its range changes.
+fn apply_queued(
+    clients: &mut Vec<(Position, Option<EdgeRange>)>,
+    first: LibeiNotifyEvent,
+    queued: &mut UnboundedReceiver<LibeiNotifyEvent>,
+) {
+    let mut event = Some(first);
+    while let Some(e) = event {
+        log::debug!("capture event: {e:?}");
+        match e {
+            LibeiNotifyEvent::Create(p, range) => {
+                match clients.iter_mut().find(|(pos, _)| *pos == p) {
+                    Some(client) => client.1 = range,
+                    None => clients.push((p, range)),
+                }
+            }
+            LibeiNotifyEvent::Destroy(p) => clients.retain(|&(pos, _)| pos != p),
+        }
+        event = queued.try_recv().ok();
+    }
+}
+
 async fn do_capture(
     input_capture: *const InputCapture,
-    mut capture_event: Receiver<LibeiNotifyEvent>,
+    mut capture_event: UnboundedReceiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     mut session: Option<Session<InputCapture>>,
     event_tx: Sender<(Position, CaptureEvent)>,
@@ -375,26 +399,33 @@ async fn do_capture(
         let cancel_session = CancellationToken::new();
         let cancel_update = CancellationToken::new();
 
-        let mut capture_event_occured: Option<LibeiNotifyEvent> = None;
-        let mut zones_have_changed = false;
+        let mut next_clients = active_clients.clone();
 
         // kill session if clients need to be updated
         let handle_session_update_request = async {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::debug!("cancelled")
-                }, /* exit requested */
-                _ = cancel_update.cancelled() => {
-                    log::debug!("update task cancelled");
-                }, /* session exited */
-                _ = zones_changed.next() => {
-                    log::debug!("zones changed!");
-                    zones_have_changed = true
-                }, /* zones have changed */
-                e = capture_event.recv() => if let Some(e) = e { /* clients changed */
-                    log::debug!("capture event: {e:?}");
-                    capture_event_occured.replace(e);
-                },
+            loop {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        log::debug!("cancelled");
+                        break;
+                    }, /* exit requested */
+                    _ = cancel_update.cancelled() => {
+                        log::debug!("update task cancelled");
+                        break;
+                    }, /* session exited */
+                    _ = zones_changed.next() => {
+                        log::debug!("zones changed!");
+                        break;
+                    }, /* zones have changed */
+                    e = capture_event.recv() => { /* clients changed */
+                        let Some(e) = e else { break };
+                        apply_queued(&mut next_clients, e, &mut capture_event);
+                        if next_clients != active_clients {
+                            break;
+                        }
+                        log::debug!("clients unchanged, keeping the session");
+                    },
+                }
             }
             // kill session (might already be dead!)
             log::debug!("=> cancelling session");
@@ -436,16 +467,7 @@ async fn do_capture(
             handle_session_update_request.await;
         }
 
-        // update clients if requested
-        if let Some(event) = capture_event_occured.take() {
-            match event {
-                LibeiNotifyEvent::Create(p, range) => {
-                    active_clients.retain(|&(pos, _)| pos != p);
-                    active_clients.push((p, range));
-                }
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&(pos, _)| pos != p),
-            }
-        }
+        active_clients = next_clients;
 
         // break
         if cancellation_token.is_cancelled() {
@@ -708,16 +730,12 @@ impl MiMouseInputCapture for LibeiInputCapture {
     ) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
-            .send(LibeiNotifyEvent::Create(pos, range))
-            .await;
+            .send(LibeiNotifyEvent::Create(pos, range));
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let _ = self
-            .notify_capture
-            .send(LibeiNotifyEvent::Destroy(pos))
-            .await;
+        let _ = self.notify_capture.send(LibeiNotifyEvent::Destroy(pos));
         Ok(())
     }
 
@@ -771,5 +789,33 @@ impl Stream for LibeiInputCapture {
             },
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use LibeiNotifyEvent::{Create, Destroy};
+
+    #[test]
+    fn queued_client_updates_are_applied_at_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let left = EdgeRange::new(0, 50);
+        // the service creates every client at startup: one session for all
+        tx.send(Create(Position::Left, left)).unwrap();
+        tx.send(Create(Position::Right, None)).unwrap();
+        let mut clients = vec![];
+        let first = rx.try_recv().unwrap();
+        apply_queued(&mut clients, first, &mut rx);
+        assert_eq!(clients, [(Position::Left, left), (Position::Right, None)]);
+        assert!(rx.try_recv().is_err());
+
+        // a new range keeps the client's place; create + destroy cancel out
+        tx.send(Create(Position::Left, None)).unwrap();
+        tx.send(Create(Position::Top, None)).unwrap();
+        tx.send(Destroy(Position::Top)).unwrap();
+        let first = rx.try_recv().unwrap();
+        apply_queued(&mut clients, first, &mut rx);
+        assert_eq!(clients, [(Position::Left, None), (Position::Right, None)]);
     }
 }

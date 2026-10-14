@@ -5,16 +5,19 @@ use futures::Stream;
 use std::pin::Pin;
 
 use std::task::ready;
-use tokio::sync::mpsc::{Receiver, channel};
 
-use super::{Capture, CaptureError, CaptureEvent, Chord, EdgeRange, Position};
+use super::{
+    Capture, CaptureError, CaptureEvent, Chord, EdgeRange, Position,
+    event_queue::{self, EventReceiver},
+};
 
 mod display_util;
 mod event_thread;
 
 pub struct WindowsInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    /// dropped first: joins the hook thread, which sends to `event_rx`
     event_thread: EventThread,
+    event_rx: EventReceiver,
 }
 
 #[async_trait]
@@ -55,7 +58,7 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        let (event_tx, event_rx) = event_queue::channel(10);
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,

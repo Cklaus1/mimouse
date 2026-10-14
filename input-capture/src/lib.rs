@@ -295,10 +295,14 @@ impl InputCapture {
         self.pending.retain(|(id, _)| id_map.contains_key(id));
     }
 
-    /// release mouse
+    /// release mouse; queued input of the ended capture is dropped, so
+    /// nothing reaches a peer after its `Leave`
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
-        self.retain_live_pending();
+        let id_map = &self.id_map;
+        self.pending.retain(|(id, event)| {
+            id_map.contains_key(id) && !matches!(event, CaptureEvent::Input(_))
+        });
         self.capture.release().await
     }
 
@@ -422,6 +426,174 @@ fn ids_at<'a>(
     ids.iter()
         .copied()
         .filter(move |id| !(skip_enter_only && enter_only(id)))
+}
+
+/// Events from an OS input callback (the Windows hooks, the macOS event
+/// tap) to the capture task. Sending never blocks the callback: while
+/// `limit` events wait, those whose loss is harmless (motion, scrolling,
+/// presses, a crossing) are dropped; releases, modifier updates and `End`
+/// always queue, in order with the rest, as losing one leaves a key or
+/// button held on the peer.
+#[cfg(any(windows, target_os = "macos", test))]
+mod event_queue {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, ready},
+    };
+
+    use input_event::{Event, KeyboardEvent, PointerEvent};
+    use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+    use crate::{CaptureEvent, Position};
+
+    pub(crate) fn channel(limit: usize) -> (EventSender, EventReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let sender = EventSender {
+            tx,
+            queued: queued.clone(),
+            limit,
+        };
+        (sender, EventReceiver { rx, queued })
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct EventSender {
+        tx: UnboundedSender<(Position, CaptureEvent)>,
+        /// events sent and not yet received
+        queued: Arc<AtomicUsize>,
+        limit: usize,
+    }
+
+    impl EventSender {
+        /// Queues `event`; false (and logged) if it was dropped because the
+        /// capture task is not keeping up, or the receiver is gone.
+        pub(crate) fn send(&self, pos: Position, event: CaptureEvent) -> bool {
+            if self.queued.load(Ordering::Relaxed) >= self.limit && !must_arrive(&event) {
+                log::warn!("dropped {event}: the capture task is not keeping up");
+                return false;
+            }
+            // counted before it can be received, so the count never wraps
+            self.queued.fetch_add(1, Ordering::Relaxed);
+            let sent = self.tx.send((pos, event)).is_ok();
+            if !sent {
+                log::debug!("dropped {event}: input capture is gone");
+            }
+            sent
+        }
+    }
+
+    pub(crate) struct EventReceiver {
+        rx: UnboundedReceiver<(Position, CaptureEvent)>,
+        queued: Arc<AtomicUsize>,
+    }
+
+    impl EventReceiver {
+        pub(crate) fn poll_recv(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<(Position, CaptureEvent)>> {
+            let event = ready!(self.rx.poll_recv(cx));
+            if event.is_some() {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+            }
+            Poll::Ready(event)
+        }
+    }
+
+    /// events whose loss leaves something held on the peer
+    fn must_arrive(event: &CaptureEvent) -> bool {
+        matches!(
+            event,
+            CaptureEvent::End
+                | CaptureEvent::Input(
+                    Event::Keyboard(
+                        KeyboardEvent::Key { state: 0, .. } | KeyboardEvent::Modifiers { .. }
+                    ) | Event::Pointer(PointerEvent::Button { state: 0, .. })
+                )
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::future::poll_fn;
+
+        use super::*;
+
+        fn key(state: u8) -> CaptureEvent {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 30,
+                state,
+            }))
+        }
+
+        const MOTION: CaptureEvent = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 1.,
+        }));
+
+        fn button(state: u32) -> CaptureEvent {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: input_event::BTN_LEFT,
+                state,
+            }))
+        }
+
+        #[tokio::test]
+        async fn full_queue_keeps_releases_in_order() {
+            let (tx, mut rx) = channel(2);
+            let pos = Position::Left;
+            assert!(tx.send(pos, CaptureEvent::Begin(None)));
+            assert!(tx.send(pos, key(1)));
+
+            // full: presses, motion and crossings are dropped
+            assert!(!tx.send(pos, button(1)));
+            assert!(!tx.send(pos, MOTION));
+            assert!(!tx.send(pos, CaptureEvent::Begin(None)));
+            // releases and the end of capture still arrive
+            let modifiers = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            }));
+            for event in [key(0), button(0), modifiers, CaptureEvent::End] {
+                assert!(tx.send(pos, event), "{event:?}");
+            }
+
+            let mut received = Vec::new();
+            for _ in 0..6 {
+                let (_, event) = poll_fn(|cx| rx.poll_recv(cx)).await.unwrap();
+                received.push(event);
+            }
+            let expected = [
+                CaptureEvent::Begin(None),
+                key(1),
+                key(0),
+                button(0),
+                modifiers,
+                CaptureEvent::End,
+            ];
+            assert_eq!(received, expected);
+
+            // drained: there is room again
+            assert!(tx.send(pos, MOTION));
+        }
+
+        #[test]
+        fn send_without_receiver_fails_without_panic() {
+            let (tx, rx) = channel(2);
+            drop(rx);
+            assert!(!tx.send(Position::Left, key(0)));
+            assert!(!tx.send(Position::Left, CaptureEvent::End));
+        }
+    }
 }
 
 #[async_trait]
@@ -687,5 +859,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shared.lock().unwrap().barriers[&Position::Left], range);
+    }
+
+    #[tokio::test]
+    async fn release_drops_queued_input() {
+        let (mut capture, shared) = input_capture();
+        // two enter-only ids: both get the input, one copy is queued
+        capture.create(0, Position::Left, None, true).await.unwrap();
+        capture.create(1, Position::Left, None, true).await.unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .events
+            .push_back((Position::Left, MOTION));
+        capture.next().await.unwrap().unwrap();
+
+        // input of the released capture never reaches the caller after it
+        capture.release().await.unwrap();
+        assert_eq!(capture.next().await.map(Result::unwrap), None);
     }
 }
