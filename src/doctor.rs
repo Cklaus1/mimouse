@@ -6,6 +6,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
+    process::Output,
     sync::Arc,
     time::Duration,
 };
@@ -14,6 +15,7 @@ use futures::{StreamExt, future::join_all};
 use hickory_resolver::TokioResolver;
 use rustls_pki_types::ServerName;
 use serde::Serialize;
+use thiserror::Error;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpStream, UdpSocket},
@@ -31,6 +33,38 @@ use crate::{
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// external commands (firewall tools, tailscale) still running by then are
+/// killed; `netsh` listing hundreds of rules takes a few seconds
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("could not run `{command}`: {source}")]
+    Spawn { command: String, source: io::Error },
+    #[error("`{command}` did not finish within {limit:?}")]
+    Timeout { command: String, limit: Duration },
+}
+
+/// runs `program` with `args`; it is killed if it runs longer than `limit`
+pub(crate) async fn run_command(
+    program: &str,
+    args: &[&str],
+    limit: Duration,
+) -> Result<Output, CommandError> {
+    let command = || [&[program], args].concat().join(" ");
+    let output = Command::new(program).args(args).kill_on_drop(true).output();
+    match timeout(limit, output).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(source)) => Err(CommandError::Spawn {
+            command: command(),
+            source,
+        }),
+        Err(_) => Err(CommandError::Timeout {
+            command: command(),
+            limit,
+        }),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -492,71 +526,81 @@ pub(crate) fn parse_socketfilterfw(output: &str) -> Option<bool> {
     }
 }
 
-/// stdout of a successful command
-async fn output(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().await.ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+/// stdout of a successful command, `None` if it is missing or failed; a
+/// command that hangs is an error
+async fn output(program: &str, args: &[&str]) -> Result<Option<String>, CommandError> {
+    match run_command(program, args, COMMAND_TIMEOUT).await {
+        Ok(output) => Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())),
+        Err(CommandError::Spawn { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 async fn firewall(port: u16) -> (&'static str, Firewall, String) {
-    let ufw_conf = std::fs::read_to_string("/etc/ufw/ufw.conf");
-    if let Ok(conf) = ufw_conf {
+    if let Ok(conf) = std::fs::read_to_string("/etc/ufw/ufw.conf") {
         let fix = format!("sudo ufw allow {port}/udp && sudo ufw allow {port}/tcp");
-        if ufw_disabled(&conf) {
-            return ("ufw", Firewall::Off("ufw is disabled".into()), fix);
-        }
-        let status = match output("ufw", &["status", "verbose"]).await {
-            Some(s) => Some(s),
-            None => output("sudo", &["-n", "ufw", "status", "verbose"]).await,
-        };
-        let fw = match status {
-            Some(status) => parse_ufw(&status, port),
-            None => Firewall::Unknown(
-                "ufw is enabled; reading its rules needs root (`sudo ufw status`)".into(),
-            ),
-        };
+        let fw = ufw(&conf, port)
+            .await
+            .unwrap_or_else(|e| Firewall::Unknown(e.to_string()));
         return ("ufw", fw, fix);
     }
     let fix = format!(
         "sudo firewall-cmd --permanent --add-port={port}/udp --add-port={port}/tcp && sudo firewall-cmd --reload"
     );
-    match output("firewall-cmd", &["--state"]).await {
-        Some(_) => {}
-        None if Command::new("firewall-cmd")
-            .arg("--version")
-            .output()
-            .await
-            .is_ok() =>
-        {
-            return (
-                "firewalld",
-                Firewall::Off("firewalld is not running".into()),
-                fix,
-            );
-        }
-        None => {
-            return (
-                "firewall",
-                Firewall::Unknown("neither ufw nor firewalld found".into()),
-                format!("make sure nftables/iptables accept {port}/udp and {port}/tcp"),
-            );
-        }
+    match firewalld(port).await {
+        Ok(Some(fw)) => ("firewalld", fw, fix),
+        Ok(None) => (
+            "firewall",
+            Firewall::Unknown("neither ufw nor firewalld found".into()),
+            format!("make sure nftables/iptables accept {port}/udp and {port}/tcp"),
+        ),
+        Err(e) => ("firewalld", Firewall::Unknown(e.to_string()), fix),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+async fn ufw(conf: &str, port: u16) -> Result<Firewall, CommandError> {
+    if ufw_disabled(conf) {
+        return Ok(Firewall::Off("ufw is disabled".into()));
+    }
+    let status = match output("ufw", &["status", "verbose"]).await? {
+        Some(s) => Some(s),
+        None => output("sudo", &["-n", "ufw", "status", "verbose"]).await?,
+    };
+    Ok(match status {
+        Some(status) => parse_ufw(&status, port),
+        None => Firewall::Unknown(
+            "ufw is enabled; reading its rules needs root (`sudo ufw status`)".into(),
+        ),
+    })
+}
+
+/// `None` if firewalld is not installed
+#[cfg(not(any(windows, target_os = "macos")))]
+async fn firewalld(port: u16) -> Result<Option<Firewall>, CommandError> {
+    if output("firewall-cmd", &["--state"]).await?.is_none() {
+        return match run_command("firewall-cmd", &["--version"], COMMAND_TIMEOUT).await {
+            Ok(_) => Ok(Some(Firewall::Off("firewalld is not running".into()))),
+            Err(CommandError::Spawn { .. }) => Ok(None),
+            Err(e) => Err(e),
+        };
     }
     let (Some(ports), Some(services)) = (
-        output("firewall-cmd", &["--list-ports"]).await,
-        output("firewall-cmd", &["--list-services"]).await,
+        output("firewall-cmd", &["--list-ports"]).await?,
+        output("firewall-cmd", &["--list-services"]).await?,
     ) else {
-        let fw = Firewall::Unknown("could not read the firewalld zone".into());
-        return ("firewalld", fw, fix);
+        return Ok(Some(Firewall::Unknown(
+            "could not read the firewalld zone".into(),
+        )));
     };
     let mut sources = vec![("port rule".to_owned(), ports)];
     for service in services.split_whitespace() {
         let info = output("firewall-cmd", &[&format!("--info-service={service}")])
-            .await
+            .await?
             .unwrap_or_default();
         let ports = firewalld_service_ports(&info).to_owned();
         sources.push((format!("service {service}"), ports));
@@ -571,7 +615,7 @@ async fn firewall(port: u16) -> (&'static str, Firewall, String) {
             tcp.push(source);
         }
     }
-    ("firewalld", Firewall::Rules { udp, tcp }, fix)
+    Ok(Some(Firewall::Rules { udp, tcp }))
 }
 
 #[cfg(windows)]
@@ -579,17 +623,24 @@ async fn firewall(port: u16) -> (&'static str, Firewall, String) {
     let fix = format!(
         "in an admin shell: `netsh advfirewall firewall add rule name=MiMouse dir=in action=allow protocol=UDP localport={port}` and the same with protocol=TCP"
     );
-    let state = output("netsh", &["advfirewall", "show", "currentprofile", "state"]).await;
+    let fw = windows_firewall(port)
+        .await
+        .unwrap_or_else(|e| Firewall::Unknown(e.to_string()));
+    ("Windows Firewall", fw, fix)
+}
+
+#[cfg(windows)]
+async fn windows_firewall(port: u16) -> Result<Firewall, CommandError> {
+    let state = output("netsh", &["advfirewall", "show", "currentprofile", "state"]).await?;
     let Some((profile, on)) = state.as_deref().and_then(parse_netsh_state) else {
-        return (
-            "Windows Firewall",
-            Firewall::Unknown("could not read the firewall state".into()),
-            fix,
-        );
+        return Ok(Firewall::Unknown(
+            "could not read the firewall state".into(),
+        ));
     };
     if !on {
-        let fw = Firewall::Off(format!("Windows Firewall is off ({profile} profile)"));
-        return ("Windows Firewall", fw, fix);
+        return Ok(Firewall::Off(format!(
+            "Windows Firewall is off ({profile} profile)"
+        )));
     }
     let rules = output(
         "netsh",
@@ -603,13 +654,12 @@ async fn firewall(port: u16) -> (&'static str, Firewall, String) {
             "verbose",
         ],
     )
-    .await
+    .await?
     .unwrap_or_default();
-    let fw = match parse_netsh_rules(&rules, port, &profile) {
+    Ok(match parse_netsh_rules(&rules, port, &profile) {
         Some((udp, tcp)) => Firewall::Rules { udp, tcp },
         None => Firewall::Unknown("could not parse the firewall rules".into()),
-    };
-    ("Windows Firewall", fw, fix)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -622,12 +672,13 @@ async fn firewall(_port: u16) -> (&'static str, Firewall, String) {
         &["--getglobalstate"],
     )
     .await;
-    let fw = match state.as_deref().and_then(parse_socketfilterfw) {
-        Some(false) => Firewall::Off("the application firewall is off".into()),
-        Some(true) => Firewall::Unknown(
+    let fw = match state.map(|s| s.as_deref().and_then(parse_socketfilterfw)) {
+        Err(e) => Firewall::Unknown(e.to_string()),
+        Ok(Some(false)) => Firewall::Off("the application firewall is off".into()),
+        Ok(Some(true)) => Firewall::Unknown(
             "the application firewall is on; per-app rules are not readable".into(),
         ),
-        None => Firewall::Unknown("could not read the firewall state".into()),
+        Ok(None) => Firewall::Unknown("could not read the firewall state".into()),
     };
     ("firewall", fw, fix)
 }
@@ -1355,5 +1406,38 @@ Ok.
         assert_eq!(unpinned.status, Outcome::Warn);
         assert!(unpinned.detail.contains("bb:02"));
         assert!(check(Some("aa:01"), None).detail.contains("aa:01"));
+    }
+
+    /// C10: a hung command fails once the limit passed and is killed
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hung_command_times_out_and_is_killed() {
+        let pidfile = std::env::temp_dir().join(format!("mimouse-hung-{}", std::process::id()));
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let start = std::time::Instant::now();
+        let err = run_command("sh", &["-c", &script], Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(matches!(err, CommandError::Timeout { .. }), "{err}");
+        assert!(err.to_string().contains("sleep 30") && err.to_string().contains("300ms"));
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let _ = std::fs::remove_file(&pidfile);
+        // gone, or a zombie until tokio reaps it
+        let killed = || {
+            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .map_or(true, |stat| stat.contains(") Z "))
+        };
+        for _ in 0..100 {
+            if killed() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("`sleep 30` still running");
     }
 }
