@@ -233,6 +233,9 @@ async fn run(changes: ChangesTx, status: StatusTx, mut set_rx: SetRx) {
                 Some(format!("permission request failed: {e}"))
             }
             Err(e @ PortalError::NotGranted) => Some(e.to_string()),
+            // the running portal does not export the interface (sway,
+            // Hyprland, X11); that never changes while it runs
+            Err(PortalError::Ashpd(e @ ashpd::Error::PortalNotFound(_))) => Some(e.to_string()),
             Err(e) => {
                 log::warn!("clipboard portal: {e}, retrying in {RETRY_DELAY:?}");
                 crate::telemetry::COUNTERS.clipboard_failures.bump();
