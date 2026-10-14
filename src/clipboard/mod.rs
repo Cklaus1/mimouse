@@ -608,6 +608,15 @@ impl ClipboardTask {
     fn local_changed(&mut self, change: LocalChange) {
         let (at, change) = match change {
             LocalChange::Startup(data) => {
+                // a portal session restart announces the copy still being
+                // delivered: it stays a change, not startup contents
+                if self
+                    .current
+                    .as_ref()
+                    .is_some_and(|s| s.digest == data.digest())
+                {
+                    return;
+                }
                 self.current = Some(Snapshot::new(data));
                 self.seeded = true;
                 return;
@@ -993,6 +1002,25 @@ mod tests {
                 let again = LocalChange::read(Some(Instant::now()), Some((*text("old")).clone()));
                 task.local_changed(again.expect("change"));
                 assert!(task.senders.contains_key(&handle), "copy not sent");
+            })
+            .await;
+    }
+
+    /// B23 is only the service start: a portal session restart announcing
+    /// the copy still being delivered does not make it startup contents
+    #[tokio::test]
+    async fn session_restart_keeps_the_copy_pending() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut task = task();
+                let handle = task.client_manager.add_client();
+                task.local_changed(LocalChange::Changed(Instant::now(), Some(text("x"))));
+                assert!(task.senders.is_empty(), "sent to an inactive client");
+
+                task.local_changed(LocalChange::Startup(text("x")));
+                task.client_manager.activate_client(handle);
+                task.update_if_stale(handle);
+                assert!(task.senders.contains_key(&handle), "copy not sent on enter");
             })
             .await;
     }
