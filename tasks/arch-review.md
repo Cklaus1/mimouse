@@ -120,6 +120,7 @@ Clipboard:
 - **B22 Portal clipboard leaks RemoteDesktop sessions.** reported (`src/clipboard/portal.rs:131-214`, 107). Errors after session creation retry after 10 s without `session.close()` (one failed paste is enough); GNOME accumulates sessions. Fix: close on every exit path (guard).
   [REVISED: one failed paste only logs (`portal.rs:196-199`); the leak needs a D-Bus error after `create_session`. Fix unchanged.]
 - **B23 Windows broadcasts a stale clipboard at startup.** reported (`src/clipboard/windows.rs:86-90`). The initial `report()` pushes whatever is on the clipboard to all clients on every service restart. Fix: seed `current` without sending.
+  [REVISED 2026-10-14, build loop L2: the seed is also not pushed when the cursor enters a client (otherwise the stale contents still overwrite a peer, later). A real re-copy of the same contents is sent.]
 - **B24 Clipboard backend status invisible.** reported (`src/clipboard/portal.rs:96-107`, 129-145; `src/clipboard/mod.rs:409`). A pending or denied portal dialog is not in approval.rs; after NotGranted updates are ACKed to the peer and dropped. Fix: status watch like capture/emulation, shown in `cli list`/`doctor`; don't ACK when the backend is down.
   [REVISED: keep ACKing while the dialog is pending (data is queued in `owned`); refuse only once the backend has ended.]
 
