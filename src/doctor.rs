@@ -28,7 +28,7 @@ use webrtc_dtls::{conn::DTLSConn, crypto::Certificate};
 use crate::{
     config::{self, Config},
     crypto::{self, peers::Policy},
-    ipc::{ClientInfo, FrontendEvent, connect_async},
+    ipc::{ClientInfo, ClipboardState, ClipboardStatus, FrontendEvent, connect_async},
 };
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -120,6 +120,8 @@ struct ServiceState {
     clients: Option<Vec<ClientInfo>>,
     capture: Option<String>,
     emulation: Option<String>,
+    /// `None` from services that do not report it
+    clipboard: Option<ClipboardStatus>,
     port: Option<u16>,
     fingerprint: Option<String>,
     keys: Option<HashMap<String, String>>,
@@ -167,6 +169,7 @@ async fn service_state() -> Result<ServiceState, String> {
                         .ok()
                         .and_then(|v| status_of(&v))
                 }
+                FrontendEvent::ClipboardStatus(status) => state.clipboard = Some(status.clone()),
                 FrontendEvent::Port { port, .. } => state.port = Some(*port),
                 FrontendEvent::Fingerprint { fingerprint } => {
                     state.fingerprint = Some(fingerprint.clone())
@@ -207,6 +210,28 @@ fn status_check(name: &str, status: &str, enable: &str) -> Check {
             name,
             other,
             format!("`mimouse cli {enable}`; the service log names the cause"),
+        ),
+    }
+}
+
+fn clipboard_check(clipboard: &ClipboardStatus) -> Check {
+    const NAME: &str = "clipboard";
+    match clipboard.status {
+        ClipboardState::Off | ClipboardState::Enabled => Check::pass(NAME, clipboard.to_string()),
+        ClipboardState::Starting => Check::warn(
+            NAME,
+            "the clipboard backend is starting",
+            "run `mimouse cli doctor` again in a few seconds",
+        ),
+        ClipboardState::AwaitingApproval => Check::warn(
+            NAME,
+            "waiting for approval of the desktop portal dialog",
+            "approve the remote desktop (clipboard) dialog on this machine; copies received meanwhile are applied then",
+        ),
+        ClipboardState::Disabled => Check::fail(
+            NAME,
+            clipboard.to_string(),
+            "the service log names the cause; restart the service once it is fixed",
         ),
     }
 }
@@ -1079,6 +1104,9 @@ pub async fn checks(config: &Config) -> Vec<Check> {
         }
         if let Some(emulation) = &s.emulation {
             checks.push(status_check("emulation", emulation, "enable-emulation"));
+        }
+        if let Some(clipboard) = &s.clipboard {
+            checks.push(clipboard_check(clipboard));
         }
     }
 

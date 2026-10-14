@@ -11,7 +11,7 @@ use std::{
     io::Cursor,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clipboard_win::{
@@ -24,9 +24,10 @@ use image::ImageFormat;
 use tokio::sync::mpsc;
 
 use super::{
-    BackendTx, ChangesTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT, Offer,
-    WIN_MARKERS, files::local_files,
+    BackendTx, ChangesTx, ClipboardData, LocalChange, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
+    MIME_TEXT, Offer, StatusTx, WIN_MARKERS, files::local_files,
 };
+use crate::ipc::{ClipboardState, ClipboardStatus};
 
 const OPEN_ATTEMPTS: usize = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -41,7 +42,7 @@ const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SETTLE_ROUNDS: usize = 10;
 
-pub(super) fn spawn(changes: ChangesTx) -> BackendTx {
+pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
     // sequence number of the clipboard after our latest write; the lock
     // serializes clipboard access between the two threads, so the monitor
@@ -50,7 +51,15 @@ pub(super) fn spawn(changes: ChangesTx) -> BackendTx {
     let seq = own_seq.clone();
     thread::Builder::new()
         .name("clipboard-monitor".into())
-        .spawn(move || monitor(changes, seq))
+        .spawn(move || {
+            // received contents are still set when monitoring fails
+            if let Err(e) = monitor(changes, &status, seq) {
+                log::warn!("clipboard: {e}");
+                status.send_replace(ClipboardStatus::disabled(format!(
+                    "{e}; local copies are not sent"
+                )));
+            }
+        })
         .expect("spawn thread");
     thread::Builder::new()
         .name("clipboard-writer".into())
@@ -63,14 +72,14 @@ fn seq_num() -> u32 {
     raw::seq_num().map_or(0, |n| n.get())
 }
 
-fn monitor(changes: ChangesTx, own_seq: Arc<Mutex<u32>>) {
-    let mut monitor = match Monitor::new() {
-        Ok(m) => m,
-        Err(e) => return log::warn!("clipboard: failed to monitor clipboard: {e}"),
-    };
-    // returns false once the receiving end is gone; a clipboard that is
-    // empty at startup was not cleared by anyone
-    let report = |startup: bool| {
+/// reports clipboard changes until the receiving end is gone (Ok) or
+/// monitoring fails
+fn monitor(changes: ChangesTx, status: &StatusTx, own_seq: Arc<Mutex<u32>>) -> Result<(), String> {
+    let mut monitor =
+        Monitor::new().map_err(|e| format!("failed to monitor the clipboard: {e}"))?;
+    status.send_replace(ClipboardStatus::new(ClipboardState::Enabled));
+    // returns false once the receiving end is gone
+    let report = |changed: Option<Instant>| {
         let own = own_seq.lock().expect("lock");
         if *own == seq_num() {
             return true;
@@ -78,28 +87,31 @@ fn monitor(changes: ChangesTx, own_seq: Arc<Mutex<u32>>) {
         let data = read_settled();
         drop(own);
         match data {
-            Ok(Some(data)) if startup && data.is_empty() => true,
-            Ok(update) => changes.send(update.map(Arc::new)).is_ok(),
+            Ok(data) => match LocalChange::read(changed, data) {
+                Some(change) => changes.send(change).is_ok(),
+                None => true,
+            },
             Err(e) => {
                 log::warn!("clipboard: failed to read clipboard: {e}");
                 true
             }
         }
     };
-    if !report(true) {
-        return;
+    if !report(None) {
+        return Ok(());
     }
     loop {
         match monitor.recv() {
             Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => return log::warn!("clipboard: monitor failed: {e}"),
+            Ok(false) => return Ok(()),
+            Err(e) => return Err(format!("clipboard monitor failed: {e}")),
         }
+        let changed = Instant::now();
         if let Err(e) = settle(&mut monitor) {
-            return log::warn!("clipboard: monitor failed: {e}");
+            return Err(format!("clipboard monitor failed: {e}"));
         }
-        if !report(false) {
-            return;
+        if !report(Some(changed)) {
+            return Ok(());
         }
     }
 }
