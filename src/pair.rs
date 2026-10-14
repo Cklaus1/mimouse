@@ -52,6 +52,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// time each user has to compare the codes
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+const _: () = assert!(FRAME_TIMEOUT.as_nanos() < CONFIRM_TIMEOUT.as_nanos());
+const _: () = assert!(CONFIRM_TIMEOUT.as_nanos() <= MAX_WINDOW.as_nanos());
 
 /// a pairing connection whose TLS handshake has not completed yet, the
 /// address it came from, and its slot among the TCP listener's connections;

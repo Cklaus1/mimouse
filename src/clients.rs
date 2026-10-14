@@ -887,6 +887,28 @@ enter_hook = "true"
             .await;
     }
 
+    /// T2: `cli set-port <id> 0` and `cli add-client --port 0` would save an
+    /// invalid file: refused, the file byte-identical, the runtime unchanged
+    #[tokio::test]
+    async fn change_to_an_invalid_config_is_refused() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("clients-invalid");
+                let fx = Recorded::default();
+                let mut clients = clients(&dir, TWO);
+                clients.start(&fx);
+                let e = clients.edit(&fx, 0, |c| c.port = 0).await.unwrap_err();
+                assert!(e.contains("client a: `port` = 0"), "{e}");
+                let e = clients.add(&fx, Some("c".into()), 0, vec![], None).await;
+                assert!(e.is_err(), "{e:?}");
+                assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), TWO);
+                let ports: Vec<_> = clients.infos().into_iter().map(|i| i.config.port).collect();
+                assert_eq!(ports, [4242, 4242]);
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
+    }
+
     /// B8: a lookup started for the host name a client had before is
     /// dropped; one for its current name is applied
     #[tokio::test]

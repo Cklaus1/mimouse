@@ -18,7 +18,7 @@ use toml_edit::{self, DocumentMut};
 
 use crate::cli::CliArgs;
 use crate::ipc::{ConfigReport, ConfigValue, DEFAULT_PORT, Position, RestartPending, Source};
-
+use input_capture::Chord;
 use input_event::scancode::{
     self,
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
@@ -90,20 +90,59 @@ impl ConfigToml {
         Ok((config.normalized(), text))
     }
 
-    /// checks what serde can't: each client's `range`
+    /// checks what serde can't: each client's `range` and `port`, client
+    /// `hotkey`s distinct from each other, from `local_hotkey` and from
+    /// `release_bind`, the listen `port`, `max_file_size` and
+    /// `telemetry_endpoint`
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == Some(0) {
+            return Err(ConfigError::Port { client: None });
+        }
+        if self.max_file_size == Some(0) {
+            return Err(ConfigError::MaxFileSize);
+        }
+        // empty: the built-in endpoint
+        if let Some(url) = self.telemetry_endpoint.as_deref().filter(|u| !u.is_empty()) {
+            crate::telemetry::endpoint(Some(url)).map_err(ConfigError::TelemetryEndpoint)?;
+        }
+        let release_bind = match &self.release_bind {
+            Some(keys) => (keys.as_slice(), "`release_bind`"),
+            None => (DEFAULT_RELEASE_KEYS.as_slice(), "`release_bind` (default)"),
+        };
+        // chords as capture matches them: order and repeats don't count
+        let mut taken: Vec<(Chord, String)> = [
+            Some(release_bind),
+            self.local_hotkey.as_deref().map(|k| (k, "`local_hotkey`")),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|(keys, name)| Some((Chord::new(keys.iter().copied())?, name.to_owned())))
+        .collect();
         for (i, c) in self.clients.iter().flatten().enumerate() {
-            let Some(range) = c.range else {
+            if let Some(range) = c.range {
+                if input_capture::EdgeRange::new(range[0], range[1]).is_none() {
+                    let client = c.name(i);
+                    return Err(ConfigError::Range { client, range });
+                }
+            }
+            if c.port == Some(0) {
+                let client = Some(c.name(i));
+                return Err(ConfigError::Port { client });
+            }
+            let Some(hotkey) = &c.hotkey else {
                 continue;
             };
-            if input_capture::EdgeRange::new(range[0], range[1]).is_none() {
-                let client = c
-                    .hostname
-                    .clone()
-                    .or(c.host_name.clone())
-                    .unwrap_or_else(|| format!("#{i}"));
-                return Err(ConfigError::Range { client, range });
+            let Some(chord) = Chord::new(hotkey.iter().copied()) else {
+                continue;
+            };
+            if let Some((_, other)) = taken.iter().find(|(taken, _)| *taken == chord) {
+                return Err(ConfigError::Hotkey {
+                    client: c.name(i),
+                    hotkey: hotkey.clone(),
+                    other: other.clone(),
+                });
             }
+            taken.push((chord, format!("the `hotkey` of client {}", c.name(i))));
         }
         Ok(())
     }
@@ -131,6 +170,16 @@ impl ConfigToml {
     /// largest total size of copied files sent to a client (default: 100 MiB)
     fn max_file_size(&self) -> u64 {
         self.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE)
+    }
+}
+
+impl TomlClient {
+    /// how errors name the client at index `i`: its host name, else `#i`
+    fn name(&self, i: usize) -> String {
+        self.hostname
+            .clone()
+            .or(self.host_name.clone())
+            .unwrap_or_else(|| format!("#{i}"))
     }
 }
 
@@ -434,6 +483,18 @@ pub enum ConfigError {
     Watcher(#[from] notify::Error),
     #[error("client {client}: invalid range {range:?}: need [start, end] with start < end <= 100")]
     Range { client: String, range: [u8; 2] },
+    #[error("{}`port` = 0: need a port in 1..=65535", client.as_ref().map(|c| format!("client {c}: ")).unwrap_or_default())]
+    Port { client: Option<String> },
+    #[error("client {client}: `hotkey` {hotkey:?} is also {other}")]
+    Hotkey {
+        client: String,
+        hotkey: Vec<scancode::Linux>,
+        other: String,
+    },
+    #[error("`max_file_size` = 0: need at least 1 (bytes of copied files sent at once)")]
+    MaxFileSize,
+    #[error("`telemetry_endpoint`: {0}")]
+    TelemetryEndpoint(String),
     #[error("{} is invalid, fix it first (`mimouse cli doctor` shows the last good copy): {error}", path.display())]
     Invalid { path: PathBuf, error: String },
     #[error("`{key}` changed both in {} and in the service; retry once the service has reloaded the file", path.display())]
@@ -670,6 +731,16 @@ impl Config {
         self.port = port;
         self.port_source = Source::Cli;
         self.config_toml.port = Some(port);
+    }
+
+    /// whether `set_port(port)` keeps the config valid; checked before the
+    /// listener rebinds, since the save comes after
+    pub fn check_port(&self, port: u16) -> Result<(), ConfigError> {
+        let config = ConfigToml {
+            port: Some(port),
+            ..self.config_toml.clone()
+        };
+        config.validate()
     }
 
     /// each key's value in effect and where it comes from, and the
@@ -971,7 +1042,10 @@ fn write_merged(
     };
     let (mut doc, merged) = match fs::read_to_string(&target) {
         // nothing on disk to keep
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (DocumentMut::new(), memory.clone()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            memory.validate()?;
+            (DocumentMut::new(), memory.clone())
+        }
         Err(e) => return Err(e.into()),
         Ok(current) => {
             let doc = current
@@ -1409,6 +1483,170 @@ port = 4243
         assert!(with_range("[-1, 50]").is_err());
         assert!(with_range("[0, 300]").is_err());
     }
+
+    /// `check_file` (as startup, reload and `doctor` load) on `text`
+    fn check(name: &str, text: &str) -> Result<(), ConfigError> {
+        let dir = temp_dir(name);
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, text).unwrap();
+        let result = check_file(&path);
+        fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    /// `text` is refused with an error naming each of `names`
+    fn rejected(name: &str, text: &str, names: &[&str]) {
+        let e = check(name, text).expect_err(name).to_string();
+        for n in names {
+            assert!(e.contains(n), "{name}: {e:?} lacks {n:?}");
+        }
+    }
+
+    const HOTKEYS: &str = r#"
+[[clients]]
+hostname = "a"
+position = "left"
+hotkey = ["KeyLeftCtrl", "Key1"]
+
+[[clients]]
+hostname = "b"
+position = "right"
+hotkey = ["KeyLeftCtrl", "Key2"]
+"#;
+
+    /// two clients with one chord (in any key order): one of them could
+    /// never be reached by it. Such a file is never overwritten
+    #[tokio::test]
+    async fn duplicate_client_hotkey_is_rejected() {
+        check("hotkeys", HOTKEYS).unwrap();
+        let duplicate = HOTKEYS.replace(r#"["KeyLeftCtrl", "Key2"]"#, r#"["Key1", "KeyLeftCtrl"]"#);
+        rejected(
+            "duplicate-hotkey",
+            &duplicate,
+            &["client b: `hotkey`", "the `hotkey` of client a"],
+        );
+
+        let dir = temp_dir("duplicate-hotkey-save");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, &duplicate).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let mut keys = config.authorized_fingerprints();
+        keys.insert("cc:dd".into(), "phone".into());
+        let e = config.save(config.clients(), keys).await.unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid { .. }), "{e}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), duplicate);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// a client hotkey that is also `local_hotkey` would both return control
+    /// and move it on
+    #[test]
+    fn client_hotkey_equal_to_local_hotkey_is_rejected() {
+        let text = format!("local_hotkey = [\"Key2\", \"KeyLeftCtrl\"]\n{HOTKEYS}");
+        rejected(
+            "local-hotkey",
+            &text,
+            &["client b: `hotkey`", "is also `local_hotkey`"],
+        );
+    }
+
+    /// a client hotkey that is also the release bind, set or default
+    #[test]
+    fn client_hotkey_equal_to_release_bind_is_rejected() {
+        let text = format!("release_bind = [\"Key1\", \"KeyLeftCtrl\"]\n{HOTKEYS}");
+        rejected(
+            "release-bind",
+            &text,
+            &["client a: `hotkey`", "is also `release_bind`"],
+        );
+        let default = HOTKEYS.replace(
+            r#"["KeyLeftCtrl", "Key2"]"#,
+            r#"["KeyLeftAlt", "KeyLeftMeta", "KeyLeftShift", "KeyLeftCtrl"]"#,
+        );
+        rejected(
+            "default-release-bind",
+            &default,
+            &["client b: `hotkey`", "is also `release_bind` (default)"],
+        );
+    }
+
+    /// port 0 is no port to listen on or connect to; `change-port 0` is
+    /// refused before the listener rebinds
+    #[test]
+    fn port_zero_is_rejected() {
+        rejected(
+            "port-zero",
+            &format!("port = 0\n{HOTKEYS}"),
+            &["`port` = 0"],
+        );
+        let client = HOTKEYS.replace("position = \"right\"", "position = \"right\"\nport = 0");
+        rejected("client-port-zero", &client, &["client b: `port` = 0"]);
+
+        let dir = temp_dir("change-port-zero");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, COMMENTED).unwrap();
+        let config = Config::at(&path).unwrap();
+        assert!(config.check_port(0).is_err());
+        config.check_port(4300).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `max_file_size = 0` is no "files off": it drops every copy with
+    /// files, text included
+    #[test]
+    fn max_file_size_zero_is_rejected() {
+        check("max-file-size-one", "max_file_size = 1\n").unwrap();
+        rejected(
+            "max-file-size-zero",
+            "max_file_size = 0\n",
+            &["`max_file_size` = 0"],
+        );
+    }
+
+    /// a plain-text telemetry endpoint fails at load, not at the first
+    /// upload; empty means the built-in one
+    #[test]
+    fn non_https_telemetry_endpoint_is_rejected() {
+        check(
+            "https-endpoint",
+            "telemetry_endpoint = \"https://t.example\"\n",
+        )
+        .unwrap();
+        check("empty-endpoint", "telemetry_endpoint = \"\"\n").unwrap();
+        rejected(
+            "http-endpoint",
+            "telemetry_endpoint = \"http://t.example\"\n",
+            &["`telemetry_endpoint`", "only https://"],
+        );
+    }
+
+    /// B10: alternate clients at one position, overlapping ranges included,
+    /// are a valid config
+    #[test]
+    fn alternate_clients_at_one_position_load() {
+        let text = HOTKEYS.replace(
+            "position = \"right\"",
+            "position = \"left\"\nrange = [0, 50]",
+        );
+        let text = text.replacen(
+            "position = \"left\"",
+            "position = \"left\"\nactivate_on_startup = true",
+            1,
+        );
+        let dir = temp_dir("alternates");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, &text).unwrap();
+        check_file(&path).unwrap();
+        let positions: Vec<_> = Config::at(&path)
+            .unwrap()
+            .clients()
+            .into_iter()
+            .map(|c| c.pos)
+            .collect();
+        assert_eq!(positions, [Position::Left, Position::Left]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// set-position / set-host edit the client's table in place
     #[test]
     fn moved_or_renamed_client_keeps_its_table() {
