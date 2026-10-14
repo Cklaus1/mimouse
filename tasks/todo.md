@@ -36,7 +36,7 @@ Wave 4
 - [x] T5 T5
 - [x] T3 T3
 - [x] X1 T-1, T-2, T-3, T-4
-- [ ] T2 T2
+- [x] T2 T2
 
 Wave 5
 - [ ] P1 smoke matrix
