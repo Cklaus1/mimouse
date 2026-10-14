@@ -37,6 +37,9 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Weak networks ([lan-mouse#307](https://github.com/feschber/lan-mouse/issues/307)): undecodable datagrams are skipped, and short bursts of packet loss no longer drop the connection.
 - Keys and modifiers are released on every way control can end, including disconnects ([lan-mouse#205](https://github.com/feschber/lan-mouse/issues/205)).
 - wlroots (sway, Hyprland): the virtual keyboard no longer loops on keymap uploads, and an empty (`NO_KEYMAP`) keymap no longer ends the connection.
+- wlroots: a key-up or button-up is no longer dropped when the compositor falls behind, which left the key held and auto-repeating. A compositor that reads nothing for 1 s makes the backend restart.
+- With no `emulation_backend` configured, a wlroots compositor whose seat has no keyboard yet no longer falls back to X11 emulation on Xwayland, which never moved the Wayland cursor. Emulation retries wlroots until a keyboard appears.
+- Windows: logoff and shutdown stop the service cleanly, releasing held keys on the controlled machine. A process that uses user32 never gets the console logoff/shutdown events.
 - Malformed datagrams, DTLS certificate chains and IPC requests are rejected instead of panicking. Event streams of a destroyed capture are dropped. Windows drops input that `SendInput` refuses instead of retrying it forever.
 - Clipboard: updates arrive in order, the newest wins, and file names are de-duplicated after Windows sanitizing.
 
