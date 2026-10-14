@@ -14,7 +14,7 @@ ShortDescription: Software KVM switch - share one mouse and keyboard between com
 Description: |-
   MiMouse shares one mouse and keyboard between Linux, Windows and macOS machines over the local network.
   A single background binary runs the service (mimouse daemon); mimouse cli controls it.
-  Fork of Lan Mouse; interoperates with Lan Mouse 0.11.
+  Originally forked from Lan Mouse (GPL-3.0-or-later); its input protocol interoperates with Lan Mouse 0.11.
 Moniker: mimouse
 Tags:
 - kvm
