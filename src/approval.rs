@@ -41,6 +41,7 @@ pub(crate) async fn forward(
         if pending.wait_for(|p| *p).await.is_err() {
             return;
         }
+        let asked = Instant::now();
         tokio::select! {
             answered = pending.wait_for(|p| !*p) => match answered {
                 Ok(_) => continue,
@@ -59,6 +60,7 @@ pub(crate) async fn forward(
                 }
             }
         };
+        crate::telemetry::COUNTERS.approval_waited(asked.elapsed());
         report(false);
         if !answered {
             return;

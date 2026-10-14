@@ -210,6 +210,7 @@ impl ListenTask {
                 _ = interval.tick() => {
                     for addr in take_expired(&mut last_response, Instant::now(), WATCHDOG_TIMEOUT) {
                         log::warn!("releasing keys: {addr} not responding!");
+                        crate::telemetry::COUNTERS.watchdog_releases.bump();
                         self.emulation_proxy.remove(addr);
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }

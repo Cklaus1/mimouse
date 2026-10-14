@@ -18,6 +18,7 @@ use crate::{
     listen::{ListenerCreationError, MiMouseListener},
     notify::Notifier,
     pair::{self, PairEvent, Pairing},
+    telemetry::{self, Settings, Telemetry},
 };
 use hickory_resolver::ResolveError;
 use input_capture::EdgeRange;
@@ -97,6 +98,8 @@ pub struct Service {
     inhibit: IdleInhibit,
     /// pairing with other machines (`mimouse cli pair`)
     pairing: Pairing,
+    /// opt-in usage statistics
+    telemetry: Telemetry,
 }
 
 #[derive(Debug)]
@@ -169,6 +172,10 @@ impl Service {
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
+        // the running service only: crashes of CLI commands are not recorded
+        telemetry::install_panic_hook(config.config_dir());
+        let telemetry = Telemetry::new(&config);
+        telemetry::COUNTERS.set_peers(config.clients().len());
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
         // listener + connection
@@ -239,6 +246,7 @@ impl Service {
             notifier,
             inhibit,
             pairing,
+            telemetry,
         };
         Ok(service)
     }
@@ -280,6 +288,8 @@ impl Service {
         self.clipboard.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("saving telemetry counters ...");
+        self.telemetry.shutdown().await;
 
         Ok(())
     }
@@ -297,6 +307,7 @@ impl Service {
                     .peer(conn)
                     .cloned()
                     .unwrap_or_default();
+                self.telemetry.count_request(&request);
                 if let FrontendRequest::ChangePort { port } = request {
                     if port != self.port {
                         // answered once the listener has rebound
@@ -310,6 +321,7 @@ impl Service {
                         // answered once capture started, or failed to
                         None => {
                             self.capture.focus(id);
+                            crate::telemetry::COUNTERS.switch_cli_focus.bump();
                             self.focus_requests.push((conn, seq, peer, request, id));
                         }
                         Some(e) => {
@@ -326,6 +338,7 @@ impl Service {
                 }
                 self.reply(conn, seq, result);
                 self.reload_if_merged();
+                telemetry::COUNTERS.set_peers(self.clients.infos().len());
             }
         }
     }
@@ -440,6 +453,27 @@ impl Service {
                 self.pairing.cancel()?;
                 Reply::Done
             }
+            FrontendRequest::TelemetryOn => {
+                // fails, saying why, if there is no endpoint to send to
+                telemetry::endpoint(clients.config().telemetry_endpoint())?;
+                clients.set_telemetry(true).await?;
+                if let Err(e) = self.telemetry.apply(Settings::of(clients.config())).await {
+                    if let Err(revert) = clients.set_telemetry(false).await {
+                        log::warn!("telemetry: {revert}");
+                    }
+                    return Err(e);
+                }
+                Reply::Telemetry(self.telemetry.status())
+            }
+            FrontendRequest::TelemetryOff => {
+                clients.set_telemetry(false).await?;
+                self.telemetry.apply(Settings::of(clients.config())).await?;
+                Reply::Telemetry(self.telemetry.status())
+            }
+            FrontendRequest::TelemetryStatus => Reply::Telemetry(self.telemetry.status()),
+            FrontendRequest::TelemetryShow => Reply::TelemetryShow(self.telemetry.show()),
+            // counted in `handle_ipc_event`
+            FrontendRequest::CountCommand { .. } => Reply::Done,
         };
         Ok(reply)
     }
@@ -471,6 +505,8 @@ impl Service {
         self.capture.set_release_bind(config.release_bind());
         self.notifier.set_switch_enabled(config.notify_switch());
         self.inhibit.set_enabled(config.idle_inhibit());
+        self.telemetry.configure(Settings::of(config));
+        telemetry::COUNTERS.set_peers(config.clients().len());
         let pending = config.awaiting_restart();
         if !pending.is_empty() {
             let keys: Vec<_> = pending.iter().map(|p| p.key.as_str()).collect();
@@ -533,6 +569,7 @@ impl Service {
         };
         self.notify_frontend(event);
         self.reload_if_merged();
+        telemetry::COUNTERS.set_peers(self.clients.infos().len());
     }
 
     async fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -579,6 +616,8 @@ impl Service {
                 }
             }
             EmulationEvent::EmulationDisabled => {
+                crate::telemetry::COUNTERS.emulation_disables.bump();
+                crate::telemetry::COUNTERS.set_emulation(None);
                 self.emulation_status = Status::Disabled;
                 self.emulation_backend = None;
                 self.notify_frontend(self.emulation_event());
@@ -586,6 +625,7 @@ impl Service {
             EmulationEvent::EmulationEnabled(backend) => {
                 self.emulation_status = Status::Enabled;
                 self.emulation_backend = Some(backend);
+                crate::telemetry::COUNTERS.set_emulation(self.emulation_backend.as_ref());
                 self.notify_frontend(self.emulation_event());
             }
             EmulationEvent::AwaitingApproval(awaiting) => {
@@ -632,6 +672,8 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                crate::telemetry::COUNTERS.capture_disables.bump();
+                crate::telemetry::COUNTERS.set_capture(None);
                 self.capture_status = Status::Disabled;
                 self.capture_backend = None;
                 self.notify_frontend(self.capture_event());
@@ -640,6 +682,7 @@ impl Service {
             ICaptureEvent::CaptureEnabled(backend) => {
                 self.capture_status = Status::Enabled;
                 self.capture_backend = backend;
+                crate::telemetry::COUNTERS.set_capture(self.capture_backend.as_ref());
                 self.notify_frontend(self.capture_event());
             }
             ICaptureEvent::AwaitingApproval(awaiting) => {

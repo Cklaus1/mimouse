@@ -31,6 +31,7 @@ use crate::{
     ipc::{
         BackendInUse, ClientInfo, ClipboardState, ClipboardStatus, FrontendEvent, connect_async,
     },
+    telemetry::{self, Dirs},
 };
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1088,6 +1089,28 @@ fn pin_check(label: &str, pin: Option<&str>, peer: Option<&str>) -> Check {
     }
 }
 
+/// crashes of earlier runs recorded while telemetry was off: kept on this
+/// machine, never uploaded
+fn crash_check(config_dir: &Path) -> Option<Check> {
+    let dirs = Dirs::new(config_dir);
+    let crashes = telemetry::local_crashes(&dirs);
+    let newest = crashes.last()?;
+    Some(Check::warn(
+        "crashes",
+        format!(
+            "{} crash record(s) of earlier runs, the newest at {} ({}); kept on this machine, never uploaded",
+            crashes.len(),
+            newest.location,
+            newest.message
+        ),
+        format!(
+            "report the location at {}/issues, then delete {}",
+            env!("CARGO_PKG_REPOSITORY"),
+            dirs.cache.join("crash-*.json").display()
+        ),
+    ))
+}
+
 /// run all checks
 pub async fn checks(config: &Config) -> Vec<Check> {
     let mut checks = vec![];
@@ -1108,6 +1131,8 @@ pub async fn checks(config: &Config) -> Vec<Check> {
     checks.push(config_check(config.config_path()));
 
     checks.push(key_check(config.cert_path()));
+
+    checks.extend(crash_check(config.config_dir()));
 
     let port = state.as_ref().and_then(|s| s.port).unwrap_or(config.port());
     let (frontend, fw, fix) = firewall(port).await;

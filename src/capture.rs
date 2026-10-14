@@ -475,6 +475,7 @@ impl CaptureTask {
                 }
                 HotkeyAction::Switch(h) => {
                     log::info!("hotkey pressed: moving control to client {h}");
+                    crate::telemetry::COUNTERS.switch_hotkey.bump();
                     return self.focus(capture, h).await;
                 }
             }
@@ -503,6 +504,14 @@ impl CaptureTask {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.announced = false;
+            // not a focus (hotkey, `cli focus`), which counts on its own
+            if self
+                .pending_focus
+                .as_ref()
+                .is_none_or(|p| p.handle != handle)
+            {
+                crate::telemetry::COUNTERS.switch_edge.bump();
+            }
         }
 
         // a focus for this client started capture

@@ -318,6 +318,69 @@ pub enum Reply {
     Clients(Vec<ClientInfo>),
     /// the config in effect (`config`)
     Config(ConfigReport),
+    /// telemetry state (`telemetry on|off|status`)
+    Telemetry(TelemetryStatus),
+    /// the next upload (`telemetry show`)
+    TelemetryShow(TelemetryShow),
+}
+
+/// telemetry as the service runs it
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryStatus {
+    /// `telemetry = true` in the config
+    pub enabled: bool,
+    /// random id of this installation; `None` while off
+    #[serde(default)]
+    pub install_id: Option<String>,
+    /// base URL uploads go to
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// why there is no usable endpoint
+    #[serde(default)]
+    pub endpoint_error: Option<String>,
+    /// why telemetry is enabled but not running
+    #[serde(default)]
+    pub error: Option<String>,
+    /// completed days waiting for the next upload
+    #[serde(default)]
+    pub queued_days: usize,
+    #[serde(default)]
+    pub queued_crashes: usize,
+    /// UTC date the current day's counts started
+    #[serde(default)]
+    pub counting_since: Option<String>,
+    /// UTC date of the last upload attempt
+    #[serde(default)]
+    pub last_attempt: Option<String>,
+    /// why the last upload failed
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// crashes recorded while telemetry was off: never uploaded
+    #[serde(default)]
+    pub local_crashes: Vec<TelemetryCrash>,
+}
+
+/// the next telemetry upload
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryShow {
+    pub enabled: bool,
+    /// the exact body of the next upload; `None`: nothing to send
+    #[serde(default)]
+    pub batch: Option<String>,
+    /// UTC date the current day's counts started (sent once it is over)
+    #[serde(default)]
+    pub counting_since: Option<String>,
+    /// crashes recorded while telemetry was off: never uploaded
+    #[serde(default)]
+    pub local_crashes: Vec<TelemetryCrash>,
+}
+
+/// a crash record, as shown
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryCrash {
+    /// `src/file.rs:line`
+    pub location: String,
+    pub message: String,
 }
 
 /// the capture or emulation backend in use: `{"name": .., "auto": ..}`
@@ -476,12 +539,31 @@ pub enum FrontendRequest {
     PairCancel,
     /// the config in effect, with the source of each key
     Config,
+    /// turn telemetry on (saved to the config)
+    TelemetryOn,
+    /// turn telemetry off, deleting the install id and the queue
+    TelemetryOff,
+    TelemetryStatus,
+    /// the next upload
+    TelemetryShow,
+    /// `command` (`doctor`, `discover`) ran without the service; only
+    /// counted for telemetry
+    CountCommand {
+        command: String,
+    },
 }
 
 impl FrontendRequest {
     /// read-only requests are not audited
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::List | Self::Config)
+        matches!(
+            self,
+            Self::List
+                | Self::Config
+                | Self::TelemetryStatus
+                | Self::TelemetryShow
+                | Self::CountCommand { .. }
+        )
     }
 
     /// the client this request refers to, which must exist

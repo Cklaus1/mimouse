@@ -55,6 +55,7 @@ pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
             // received contents are still set when monitoring fails
             if let Err(e) = monitor(changes, &status, seq) {
                 log::warn!("clipboard: {e}");
+                crate::telemetry::COUNTERS.clipboard_failures.bump();
                 status.send_replace(ClipboardStatus::disabled(format!(
                     "{e}; local copies are not sent"
                 )));

@@ -12,8 +12,9 @@ use crate::{
         AsyncFrontendEventReader, AsyncFrontendRequestWriter, BackendInUse, ClientHandle,
         ClientInfo, ClipboardDirection, ClipboardStatus, ConfigReport, ConnectionError,
         DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, Status,
-        connect_async,
+        TelemetryCrash, TelemetryShow, TelemetryStatus, connect_async,
     },
+    telemetry,
 };
 
 #[derive(Debug, Error)]
@@ -167,6 +168,23 @@ enum CliSubcommand {
     /// pair with another machine: `pair --accept` there, `pair <host>
     /// --position <side>` here, then confirm the code both show
     Pair(Pair),
+    /// anonymous usage statistics, off unless turned on
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
+}
+
+#[derive(Clone, Copy, Subcommand, Debug, PartialEq, Eq)]
+enum TelemetryAction {
+    /// send usage statistics once a day (lists what is collected)
+    On,
+    /// stop sending; deletes the install id and everything queued
+    Off,
+    /// whether it is on, the install id, the endpoint and the queue
+    Status,
+    /// print the exact JSON the next upload sends
+    Show,
 }
 
 pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
@@ -181,9 +199,11 @@ pub async fn run(args: CliArgs, config: Config) -> Result<(), CliError> {
 async fn run_command(args: CliArgs, config: Config) -> Result<(), CliError> {
     match args.command {
         CliSubcommand::Discover { port } => {
+            count_command("discover");
             return Ok(discover::run(&config, port, args.json).await?);
         }
         CliSubcommand::Doctor => {
+            count_command("doctor");
             return match doctor::run(&config, args.json).await {
                 0 => Ok(()),
                 failed => Err(CliError::ChecksFailed(failed)),
@@ -230,11 +250,32 @@ async fn run_command(args: CliArgs, config: Config) -> Result<(), CliError> {
         }
         cmd => request(cmd),
     };
+    let turned_on = request == FrontendRequest::TelemetryOn;
     let seq = tx.request(request).await?;
     let (result, state) = wait_for_reply(rx, seq, REPLY_TIMEOUT).await?;
     let reply = result.map_err(CliError::Request)?;
+    if turned_on && !args.json {
+        println!("{}\n", telemetry::COLLECTED);
+    }
     print_reply(&reply, &state, args.json);
     Ok(())
+}
+
+/// how long `doctor` and `discover` try to reach the service to have the
+/// command counted
+const COUNT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// counts `command`, which runs without the service, for telemetry: in the
+/// background, best effort, never delaying the command
+fn count_command(command: &str) {
+    let request = FrontendRequest::CountCommand {
+        command: command.to_owned(),
+    };
+    tokio::task::spawn_local(async move {
+        if let Ok((_rx, mut tx)) = connect_async(Some(COUNT_TIMEOUT)).await {
+            let _ = tx.request(request).await;
+        }
+    });
 }
 
 fn request(cmd: CliSubcommand) -> FrontendRequest {
@@ -282,6 +323,12 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
         CliSubcommand::SaveConfig => FrontendRequest::SaveConfig,
         CliSubcommand::Focus { id } => FrontendRequest::Focus { id },
         CliSubcommand::Config => FrontendRequest::Config,
+        CliSubcommand::Telemetry { action } => match action {
+            TelemetryAction::On => FrontendRequest::TelemetryOn,
+            TelemetryAction::Off => FrontendRequest::TelemetryOff,
+            TelemetryAction::Status => FrontendRequest::TelemetryStatus,
+            TelemetryAction::Show => FrontendRequest::TelemetryShow,
+        },
         CliSubcommand::Watch
         | CliSubcommand::Discover { .. }
         | CliSubcommand::Doctor
@@ -473,7 +520,77 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
         }
         (Reply::Config(report), true) => println!("{}", to_json(report)),
         (Reply::Config(report), false) => print!("{}", config_text(report)),
+        (Reply::Telemetry(status), true) => println!("{}", to_json(status)),
+        (Reply::Telemetry(status), false) => print!("{}", telemetry_text(status)),
+        (Reply::TelemetryShow(show), true) => println!("{}", to_json(show)),
+        (Reply::TelemetryShow(show), false) => {
+            // stdout: exactly the bytes the upload sends
+            if let Some(batch) = &show.batch {
+                print!("{batch}");
+            }
+            eprint!("{}", show_notes(show));
+        }
     }
+}
+
+/// `telemetry status` for reading
+fn telemetry_text(status: &TelemetryStatus) -> String {
+    let mut text = match status.enabled {
+        true => "telemetry: on\n".to_owned(),
+        false => "telemetry: off (nothing is collected or sent)\n".to_owned(),
+    };
+    if let Some(error) = &status.error {
+        text += &format!("not running: {error}\n");
+    }
+    if let Some(id) = &status.install_id {
+        text += &format!("install id: {id}\n");
+    }
+    match (&status.endpoint, &status.endpoint_error) {
+        (Some(endpoint), _) => text += &format!("endpoint: {endpoint}\n"),
+        (None, Some(error)) => text += &format!("endpoint: none ({error})\n"),
+        (None, None) => {}
+    }
+    if status.install_id.is_some() {
+        text += &format!(
+            "queued: {} completed day(s), {} crash record(s)\n",
+            status.queued_days, status.queued_crashes
+        );
+    }
+    if let Some(date) = &status.counting_since {
+        text += &format!("counting since: {date} (UTC)\n");
+    }
+    match (&status.last_attempt, &status.last_error) {
+        (Some(date), Some(error)) => text += &format!("last upload: {date}, failed: {error}\n"),
+        (Some(date), None) => text += &format!("last upload: {date}\n"),
+        _ => {}
+    }
+    text += &local_crashes_text(&status.local_crashes);
+    text
+}
+
+/// what `telemetry show` adds on stderr around the batch
+fn show_notes(show: &TelemetryShow) -> String {
+    let mut text = match (show.enabled, &show.batch) {
+        (false, _) => "telemetry is off: nothing is sent\n".to_owned(),
+        (true, None) => "nothing to send yet: only completed days are sent\n".to_owned(),
+        (true, Some(_)) => String::new(),
+    };
+    if let (true, Some(date)) = (show.enabled, &show.counting_since) {
+        text += &format!("counting {date} (UTC), sent once the day is over\n");
+    }
+    text += &local_crashes_text(&show.local_crashes);
+    text
+}
+
+fn local_crashes_text(crashes: &[TelemetryCrash]) -> String {
+    if crashes.is_empty() {
+        return String::new();
+    }
+    let mut text = "crashes recorded while telemetry was off (never uploaded):\n".to_owned();
+    for crash in crashes {
+        text += &format!("  {} ({})\n", crash.location, crash.message);
+    }
+    text
 }
 
 /// `enabled (libei, auto)`; the backend only where the service reports one

@@ -23,3 +23,4 @@ mod notify;
 mod pair;
 mod proto;
 pub mod service;
+mod telemetry;
