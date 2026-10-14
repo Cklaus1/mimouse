@@ -6,7 +6,9 @@
 //!
 //! One connection carries one update: the client sends a frame
 //! (`len: u32 BE | payload`, payload see `wire`), the server answers with a
-//! single ack byte once the update (including copied files) is stored.
+//! single ack byte once the update (including copied files) is stored. A
+//! connection whose peer's fingerprint gets removed from
+//! `authorized_fingerprints` is closed without an ack.
 //!
 //! Pairing connections (`crate::pair`) arrive on the same listener and are
 //! told apart by their ALPN protocol before the handshake completes.
@@ -26,7 +28,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     task::{JoinHandle, spawn_blocking, spawn_local},
     time::timeout,
 };
@@ -45,6 +47,11 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// slowest link a large transfer is given time for, in bytes per second
 const MIN_TRANSFER_RATE: u64 = 1024 * 1024;
 const ACK: u8 = 1;
+/// live inbound connections, authenticated or not (pairing included); more
+/// are closed at once
+const MAX_CONNECTIONS: usize = 16;
+/// how often an open connection checks that its peer is still authorized
+const REVOCATION_CHECK: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -72,6 +79,8 @@ pub(crate) enum TransportError {
     Untrusted(String),
     #[error("peer presented no certificate")]
     NoCertificate,
+    #[error("certificate {0} is no longer authorized")]
+    Revoked(String),
 }
 
 impl From<tokio::time::error::Elapsed> for TransportError {
@@ -211,46 +220,76 @@ pub(crate) fn listen(
             Some(_) => log::info!("clipboard: listening on tcp {addr}"),
             None => log::info!("listening on tcp {addr} for pairing"),
         }
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("clipboard: accept failed: {e}");
-                    continue;
-                }
-            };
-            let tls = tls.clone();
-            let tx = tx.clone();
-            let pair_tx = pair_tx.clone();
-            let store = store.clone();
-            spawn_local(async move {
-                let start = match client_hello(stream).await {
-                    Ok(start) => start,
-                    // also reachability probes (`cli discover`, `cli doctor`)
-                    Err(e) => return log::debug!("tcp {peer}: {e}"),
+        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        accept_loop(
+            async || listener.accept().await,
+            |stream, peer| {
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    return log::debug!("tcp {peer}: {MAX_CONNECTIONS} connections open, closing");
                 };
-                if pair::is_pairing(&start) {
-                    let _ = pair_tx.send((start, peer));
-                    return;
-                }
-                let Some(tx) = tx else {
-                    return log::debug!("tcp {peer}: clipboard sharing is disabled");
-                };
-                match receive(&tls, start, max_file_size, store).await {
-                    Ok((data, fingerprint)) => {
-                        log::info!(
-                            "clipboard received from {} ({} bytes: {})",
-                            tls.describe(&fingerprint),
-                            data.total_size(),
-                            data.mime_types().collect::<Vec<_>>().join(", ")
-                        );
-                        let _ = tx.send((Arc::new(data), peer.ip(), fingerprint));
+                let tls = tls.clone();
+                let tx = tx.clone();
+                let pair_tx = pair_tx.clone();
+                let store = store.clone();
+                spawn_local(async move {
+                    let start = match client_hello(stream).await {
+                        Ok(start) => start,
+                        // also reachability probes (`cli discover`, `cli doctor`)
+                        Err(e) => return log::debug!("tcp {peer}: {e}"),
+                    };
+                    if pair::is_pairing(&start) {
+                        let _ = pair_tx.send((start, peer, permit));
+                        return;
                     }
-                    Err(e) => log::warn!("clipboard: {peer}: {e}"),
-                }
-            });
-        }
+                    let Some(tx) = tx else {
+                        return log::debug!("tcp {peer}: clipboard sharing is disabled");
+                    };
+                    match receive(&tls, start, max_file_size, store).await {
+                        Ok((data, fingerprint)) => {
+                            log::info!(
+                                "clipboard received from {} ({} bytes: {})",
+                                tls.describe(&fingerprint),
+                                data.total_size(),
+                                data.mime_types().collect::<Vec<_>>().join(", ")
+                            );
+                            let _ = tx.send((Arc::new(data), peer.ip(), fingerprint));
+                        }
+                        Err(e) => log::warn!("clipboard: {peer}: {e}"),
+                    }
+                });
+            },
+        )
+        .await;
     })
+}
+
+/// accepts connections with `accept` and hands each to `serve`
+async fn accept_loop<S>(
+    mut accept: impl AsyncFnMut() -> io::Result<(S, SocketAddr)>,
+    mut serve: impl FnMut(S, SocketAddr),
+) {
+    let mut failures = 0;
+    loop {
+        match accept().await {
+            Ok((stream, peer)) => {
+                failures = 0;
+                serve(stream, peer);
+            }
+            Err(e) => {
+                log::warn!("clipboard: accept failed: {e}");
+                tokio::time::sleep(accept_backoff(failures)).await;
+                failures = failures.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// delay after `failures` consecutive accept errors; at the open file limit
+/// accept fails instantly, and retrying at once would spin (as in `ipc`)
+fn accept_backoff(failures: u32) -> Duration {
+    Duration::from_millis(10)
+        .saturating_mul(1 << failures.min(7))
+        .min(Duration::from_secs(1))
 }
 
 async fn client_hello(stream: TcpStream) -> Result<StartHandshake<TcpStream>, TransportError> {
@@ -259,7 +298,8 @@ async fn client_hello(stream: TcpStream) -> Result<StartHandshake<TcpStream>, Tr
     Ok(timeout(HANDSHAKE_TIMEOUT, acceptor).await??)
 }
 
-/// a clipboard update and the fingerprint of the peer that sent it
+/// a clipboard update and the fingerprint of the peer that sent it; the
+/// connection is dropped once that fingerprint is no longer authorized
 async fn receive(
     tls: &Tls,
     start: StartHandshake<TcpStream>,
@@ -269,21 +309,40 @@ async fn receive(
     let config = tls.acceptor.config().clone();
     let mut stream = timeout(HANDSHAKE_TIMEOUT, start.into_stream(config)).await??;
     let from = fingerprint(stream.get_ref().1.peer_certificates())?;
-    let payload = read_frame(&mut stream, wire::max_frame_len(max_file_size)).await?;
-    let data = spawn_blocking(move || {
-        let frame = wire::decode(&payload, max_file_size).ok_or(TransportError::Invalid)?;
-        let mut data = frame.data;
-        if !frame.files.is_empty() {
-            let store = store.ok_or(TransportError::NoFileStore)?;
-            data.set_files(store.store(&frame.files)?);
-        }
-        Ok::<_, TransportError>(data)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let policy = Policy::Authorized(tls.authorized_keys.clone());
+    let transfer = async {
+        let payload = read_frame(&mut stream, wire::max_frame_len(max_file_size)).await?;
+        spawn_blocking(move || {
+            let frame = wire::decode(&payload, max_file_size).ok_or(TransportError::Invalid)?;
+            let mut data = frame.data;
+            if !frame.files.is_empty() {
+                let store = store.ok_or(TransportError::NoFileStore)?;
+                data.set_files(store.store(&frame.files)?);
+            }
+            Ok::<_, TransportError>(data)
+        })
+        .await
+        .map_err(io::Error::other)?
+    };
+    let data = tokio::select! {
+        data = transfer => data?,
+        () = revoked(&policy, &from) => return Err(TransportError::Revoked(from)),
+    };
+    // revoked since the last check
+    if policy.check(&from).is_err() {
+        return Err(TransportError::Revoked(from));
+    }
     stream.write_u8(ACK).await?;
     stream.shutdown().await?;
     Ok((data, from))
+}
+
+/// resolves once `policy` no longer trusts `fingerprint`
+async fn revoked(policy: &Policy, fingerprint: &str) {
+    let mut check = tokio::time::interval(REVOCATION_CHECK);
+    while policy.check(fingerprint).is_ok() {
+        check.tick().await;
+    }
 }
 
 async fn read_frame(
@@ -297,4 +356,115 @@ async fn read_frame(
     let mut payload = vec![0; len as usize];
     timeout(transfer_timeout(len), stream.read_exact(&mut payload)).await??;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use tokio::task::LocalSet;
+
+    /// a clipboard listener on a free loopback port trusting `client`, and
+    /// its authorized keys
+    async fn server(
+        client: &Certificate,
+    ) -> (
+        SocketAddr,
+        Arc<RwLock<HashMap<String, String>>>,
+        JoinHandle<()>,
+    ) {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+            .port();
+        let fingerprint = crypto::certificate_fingerprint(client);
+        let keys = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
+        let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+        let tls = Rc::new(Tls::new(&cert, keys.clone()).unwrap());
+        let (tx, _) = mpsc::unbounded_channel();
+        let (pair_tx, _) = mpsc::unbounded_channel();
+        let task = listen(port, tls, 0, Some(tx), pair_tx);
+        // the listener binds on its first poll
+        tokio::task::yield_now().await;
+        (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), keys, task)
+    }
+
+    /// whether the server closes `stream` within `within`
+    async fn closed(stream: &mut (impl AsyncRead + Unpin), within: Duration) -> bool {
+        let mut buf = [0; 64];
+        loop {
+            match timeout(within, stream.read(&mut buf)).await {
+                Ok(Ok(0) | Err(_)) => return true,
+                Ok(Ok(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// B2: removing the key of a connected peer closes its connection,
+    /// also while it sends nothing
+    #[tokio::test]
+    async fn revoked_key_closes_open_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (addr, keys, server) = server(&cert).await;
+                let connector = TlsConnector::from(Arc::new(
+                    crypto::peers::tls_client_config(&cert, Policy::Any).unwrap(),
+                ));
+                let stream = TcpStream::connect(addr).await.unwrap();
+                let name = ServerName::try_from("mimouse").unwrap();
+                let mut stream = connector.connect(name, stream).await.unwrap();
+                // the handshake completed and the server waits for a frame
+                assert!(!closed(&mut stream, Duration::from_millis(200)).await);
+
+                keys.write().unwrap().clear();
+                assert!(
+                    closed(&mut stream, Duration::from_secs(2)).await,
+                    "revoked connection kept open"
+                );
+                server.abort();
+            })
+            .await;
+    }
+
+    /// B3: connections over the cap are closed at once, the others stay
+    #[tokio::test]
+    async fn connections_over_the_cap_are_closed() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (addr, _keys, server) = server(&cert).await;
+                let mut open = vec![];
+                for _ in 0..MAX_CONNECTIONS {
+                    open.push(TcpStream::connect(addr).await.unwrap());
+                }
+                let mut excess = TcpStream::connect(addr).await.unwrap();
+                assert!(
+                    closed(&mut excess, Duration::from_secs(1)).await,
+                    "connection over the cap kept open"
+                );
+                for stream in &mut open {
+                    assert!(!closed(stream, Duration::from_millis(10)).await);
+                }
+                server.abort();
+            })
+            .await;
+    }
+
+    /// B3: failing accepts (e.g. EMFILE) are retried with a backoff, not in
+    /// a busy loop
+    #[tokio::test]
+    async fn accept_errors_back_off() {
+        let attempts = Cell::new(0);
+        let failing = async || {
+            attempts.set(attempts.get() + 1);
+            tokio::task::yield_now().await;
+            Err::<((), SocketAddr), _>(io::Error::other("too many open files"))
+        };
+        let run = accept_loop(failing, |_, _| {});
+        let _ = timeout(Duration::from_millis(200), run).await;
+        // 10, 20, 40, 80 ms: at most 5 attempts in 200 ms
+        assert!(attempts.get() <= 5, "{} attempts", attempts.get());
+    }
 }

@@ -146,7 +146,7 @@ impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(WATCHDOG_TICK);
         let mut last_response = HashMap::new();
-        let mut rejected_connections = HashMap::new();
+        let mut rejections = RecentRejections::default();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -181,10 +181,9 @@ impl ListenTask {
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
-                        if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
-                            }
+                        if rejections.report(&fingerprint, Instant::now()) {
+                            self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                        }
                     }
                     None => break
                 }}
@@ -242,6 +241,34 @@ fn take_expired(
         last_response.remove(addr);
     }
     expired
+}
+
+/// Fingerprints refused recently: a peer dialing several addresses at once
+/// is reported once.
+#[derive(Default)]
+struct RecentRejections {
+    at: HashMap<String, Instant>,
+}
+
+/// refusals of one fingerprint closer than this are reported once
+const REJECTION_REPEAT_WINDOW: Duration = Duration::from_secs(2);
+/// remembered fingerprints (fresh certificates are free to make); refusals
+/// beyond are reported without dedup
+const MAX_RECENT_REJECTIONS: usize = 64;
+
+impl RecentRejections {
+    /// records a refusal of `fingerprint`; true if it is to be reported
+    fn report(&mut self, fingerprint: &str, now: Instant) -> bool {
+        self.at
+            .retain(|_, at| now.saturating_duration_since(*at) < REJECTION_REPEAT_WINDOW);
+        if self.at.contains_key(fingerprint) {
+            return false;
+        }
+        if self.at.len() < MAX_RECENT_REJECTIONS {
+            self.at.insert(fingerprint.to_owned(), now);
+        }
+        true
+    }
 }
 
 /// proxy handling the actual input emulation,
@@ -662,6 +689,25 @@ mod tests {
         assert!(take_expired(&mut seen, at(4000), WATCHDOG_TIMEOUT).is_empty());
         assert_eq!(take_expired(&mut seen, at(6400), WATCHDOG_TIMEOUT), [lossy]);
         assert!(seen.is_empty());
+    }
+
+    /// B5: refusals of fresh certificates do not grow the map without bound
+    #[test]
+    fn recent_rejections_stay_bounded() {
+        let mut r = RecentRejections::default();
+        let t0 = Instant::now();
+        assert!(r.report("a", t0));
+        assert!(!r.report("a", t0 + Duration::from_millis(1999)));
+        assert!(r.report("a", t0 + REJECTION_REPEAT_WINDOW));
+        // a flood within the window: every fresh fingerprint is reported,
+        // but only a bounded number is remembered
+        for i in 0..10_000 {
+            assert!(r.report(&format!("fp{i}"), t0 + Duration::from_millis(i)));
+            assert!(r.at.len() <= MAX_RECENT_REJECTIONS);
+        }
+        // expired entries are dropped
+        assert!(r.report("b", t0 + Duration::from_secs(100)));
+        assert_eq!(r.at.len(), 1);
     }
 }
 

@@ -10,7 +10,8 @@ use std::{
 };
 
 const APP_NAME: &str = "MiMouse";
-/// an unauthorized fingerprint is announced at most once per interval
+/// unauthorized attempts, from any fingerprint, are announced at most once
+/// per interval; the next notice counts the ones in between
 const UNAUTHORIZED_INTERVAL: Duration = Duration::from_secs(60);
 /// the same approval wait is announced at most once per interval
 const APPROVAL_INTERVAL: Duration = Duration::from_secs(300);
@@ -25,7 +26,7 @@ pub(crate) struct Notifier {
     switch_enabled: bool,
     control: ControlTracker,
     local_host: Option<String>,
-    unauthorized: RateLimit,
+    unauthorized: Summarized,
     approval: RateLimit,
     backend: backend::Backend,
 }
@@ -36,7 +37,7 @@ impl Notifier {
             switch_enabled,
             control: Default::default(),
             local_host: None,
-            unauthorized: RateLimit::new(UNAUTHORIZED_INTERVAL),
+            unauthorized: Summarized::new(UNAUTHORIZED_INTERVAL),
             approval: RateLimit::new(APPROVAL_INTERVAL),
             backend: backend::Backend::new(),
         }
@@ -69,9 +70,15 @@ impl Notifier {
 
     /// a peer with an unknown certificate tried to connect
     pub(crate) fn unauthorized(&mut self, fingerprint: &str) {
-        if self.unauthorized.allow(fingerprint, Instant::now()) {
-            self.backend.show(unauthorized_notice(fingerprint));
+        if let Some(notice) = self.unauthorized_notice(fingerprint, Instant::now()) {
+            self.backend.show(notice);
         }
+    }
+
+    /// the notice for an unauthorized attempt at `now`, if one is due
+    fn unauthorized_notice(&mut self, fingerprint: &str, now: Instant) -> Option<Notice> {
+        let held_back = self.unauthorized.allow(now)?;
+        Some(unauthorized_notice(fingerprint, held_back))
     }
 }
 
@@ -121,6 +128,36 @@ impl RateLimit {
     }
 }
 
+/// allows once per interval, counting what it holds back
+struct Summarized {
+    interval: Duration,
+    last: Option<Instant>,
+    held_back: u32,
+}
+
+impl Summarized {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+            held_back: 0,
+        }
+    }
+
+    /// the number held back since the last allowed one, if this one is allowed
+    fn allow(&mut self, now: Instant) -> Option<u32> {
+        if self
+            .last
+            .is_some_and(|at| now.saturating_duration_since(at) < self.interval)
+        {
+            self.held_back = self.held_back.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.held_back))
+    }
+}
+
 fn switch_text(to: Option<&str>, local: &str) -> String {
     match to {
         Some(host) => format!("Controlling {host}"),
@@ -135,12 +172,20 @@ fn approval_notice(what: &str) -> Notice {
     }
 }
 
-fn unauthorized_notice(fingerprint: &str) -> Notice {
+/// the notice for an attempt by `fingerprint`, after `held_back` attempts
+/// that got none
+fn unauthorized_notice(fingerprint: &str, held_back: u32) -> Notice {
+    let mut body = format!(
+        "Fingerprint {fingerprint}\nTrust it with: mimouse cli authorize-key <name> {fingerprint}"
+    );
+    match held_back {
+        0 => {}
+        1 => body.push_str("\n1 more unauthorized attempt"),
+        n => body.push_str(&format!("\n{n} more unauthorized attempts")),
+    }
     Notice {
         summary: "Unknown device tried to connect".into(),
-        body: format!(
-            "Fingerprint {fingerprint}\nTrust it with: mimouse cli authorize-key <name> {fingerprint}"
-        ),
+        body,
     }
 }
 
@@ -391,10 +436,13 @@ mod backend {
 #[cfg(target_os = "macos")]
 mod backend {
     use super::Notice;
-    use std::sync::mpsc::{Sender, channel};
+    use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+
+    /// notices waiting for `osascript`; more are dropped
+    const MAX_QUEUED: usize = 4;
 
     pub(super) struct Backend {
-        tx: Option<Sender<Notice>>,
+        tx: Option<SyncSender<Notice>>,
     }
 
     impl Backend {
@@ -404,7 +452,7 @@ mod backend {
 
         pub(super) fn show(&mut self, notice: Notice) {
             if self.tx.is_none() {
-                let (tx, rx) = channel::<Notice>();
+                let (tx, rx) = sync_channel::<Notice>(MAX_QUEUED);
                 let spawned = std::thread::Builder::new()
                     .name("notify".into())
                     .spawn(move || {
@@ -432,7 +480,12 @@ mod backend {
                 }
             }
             if let Some(tx) = &self.tx {
-                let _ = tx.send(notice);
+                if let Err(TrySendError::Full(notice)) = tx.try_send(notice) {
+                    log::debug!(
+                        "notification dropped, {MAX_QUEUED} queued: {}",
+                        notice.summary
+                    );
+                }
             }
         }
     }
@@ -549,8 +602,33 @@ mod tests {
 
     #[test]
     fn unauthorized_notice_names_fingerprint_and_fix() {
-        let n = unauthorized_notice("ab:cd");
+        let n = unauthorized_notice("ab:cd", 0);
         assert!(n.body.contains("mimouse cli authorize-key <name> ab:cd"));
+    }
+
+    /// B5: a fresh certificate per handshake does not yield a notice each;
+    /// the next notice counts the attempts in between
+    #[test]
+    fn unauthorized_notices_are_rate_limited_globally() {
+        let mut n = Notifier::new(false);
+        let t0 = Instant::now();
+        assert!(n.unauthorized_notice("fp0", t0).is_some());
+        for i in 1..=100 {
+            let at = t0 + Duration::from_millis(i * 100);
+            assert_eq!(n.unauthorized_notice(&format!("fp{i}"), at), None);
+        }
+        let notice = n
+            .unauthorized_notice("fp101", t0 + UNAUTHORIZED_INTERVAL)
+            .expect("notice after the interval");
+        assert!(notice.body.contains("fp101"), "{}", notice.body);
+        assert!(
+            notice.body.contains("100 more unauthorized attempts"),
+            "{}",
+            notice.body
+        );
+        let quiet = t0 + 3 * UNAUTHORIZED_INTERVAL;
+        let notice = n.unauthorized_notice("fp0", quiet).expect("notice");
+        assert!(!notice.body.contains("more"), "{}", notice.body);
     }
 
     #[test]
