@@ -117,6 +117,7 @@ Emulation:
 Clipboard:
 - **B21 An older transfer overwrites a newer copy.** reported (`src/clipboard/mod.rs:402-410`, 466-472). No ordering between directions: a slow file transfer finishing after the user's fresh copy on the receiver replaces it. Fix: generation/timestamp per update; receiver drops updates older than its last local change.
   [REVISED: frames carry no timestamp (old MiMouse peers); compare the inbound accept `Instant` with the last local change.]
+  [SMOKE 2026-10-14 17:08-17:10, L3 build 54a8d55a on megapc: GNOME restart with a non-empty clipboard sent nothing after `access granted`; a new copy was sent and received; a 62914560-byte file went gpumaster -> megapc on `cli focus 0`, stored with matching SHA-256 (38e29c8c...), megapc peak working set 16 MiB (14 before).]
 - **B22 Portal clipboard leaks RemoteDesktop sessions.** reported (`src/clipboard/portal.rs:131-214`, 107). Errors after session creation retry after 10 s without `session.close()` (one failed paste is enough); GNOME accumulates sessions. Fix: close on every exit path (guard).
   [REVISED: one failed paste only logs (`portal.rs:196-199`); the leak needs a D-Bus error after `create_session`. Fix unchanged.]
 - **B23 Windows broadcasts a stale clipboard at startup.** reported (`src/clipboard/windows.rs:86-90`). The initial `report()` pushes whatever is on the clipboard to all clients on every service restart. Fix: seed `current` without sending.
