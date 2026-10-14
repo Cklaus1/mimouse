@@ -35,7 +35,7 @@ Wave 3
 Wave 4
 - [x] T5 T5
 - [x] T3 T3
-- [ ] X1 T-1, T-2, T-3, T-4
+- [x] X1 T-1, T-2, T-3, T-4
 - [ ] T2 T2
 
 Wave 5
