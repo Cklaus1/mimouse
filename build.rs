@@ -6,6 +6,17 @@ fn main() {
         .build()
         .expect("shadow build");
 
+    // VERSIONINFO (name, version, description from Cargo.toml). Without any
+    // resource, Defender's ML heuristic quarantined the unsigned exe as
+    // Trojan:Win32/Bearfoos.B!ml (2026-10-14).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set("FileDescription", env!("CARGO_PKG_DESCRIPTION"))
+            .set("LegalCopyright", "GPL-3.0-or-later")
+            .compile()
+            .expect("windows resource");
+    }
+
     let unix = cfg!(unix);
     let macos = cfg!(target_os = "macos");
 
