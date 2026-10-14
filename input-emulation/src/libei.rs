@@ -1,5 +1,6 @@
 use futures::{StreamExt, future};
 use std::{
+    collections::HashSet,
     env, fs, io,
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
@@ -33,16 +34,44 @@ use crate::{PermissionPending, error::EmulationError};
 use super::geometry::{Rect, entry_point};
 use super::{Edge, Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 
-/// absolute pointer with its regions (one per monitor on mutter)
-type AbsolutePointer = (ei::Device, ei::PointerAbsolute, Vec<Rect>);
+/// a device interface, with the device it belongs to
+type Slot<T> = Arc<RwLock<Option<(ei::Device, T)>>>;
 
 #[derive(Clone, Default)]
 struct Devices {
-    pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
-    absolute: Arc<RwLock<Option<AbsolutePointer>>>,
-    scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
-    button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
-    keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
+    pointer: Slot<ei::Pointer>,
+    /// absolute pointer with its regions (one per monitor on mutter)
+    absolute: Slot<(ei::PointerAbsolute, Vec<Rect>)>,
+    scroll: Slot<ei::Scroll>,
+    button: Slot<ei::Button>,
+    keyboard: Slot<ei::Keyboard>,
+    /// devices the EIS resumed: events to a paused device are a protocol
+    /// error
+    resumed: Arc<RwLock<HashSet<ei::Device>>>,
+}
+
+impl Devices {
+    /// the device and interface in `slot` if the device may emulate
+    fn usable<'a, T>(&self, slot: &'a Option<(ei::Device, T)>) -> Option<&'a (ei::Device, T)> {
+        let resumed = self.resumed.read().unwrap();
+        slot.as_ref().filter(|(device, _)| resumed.contains(device))
+    }
+
+    /// forgets every interface of `device`
+    fn remove(&self, device: &ei::Device) {
+        fn clear<T>(slot: &Slot<T>, device: &ei::Device) {
+            let mut slot = slot.write().unwrap();
+            if slot.as_ref().is_some_and(|(d, _)| d == device) {
+                slot.take();
+            }
+        }
+        clear(&self.pointer, device);
+        clear(&self.absolute, device);
+        clear(&self.scroll, device);
+        clear(&self.button, device);
+        clear(&self.keyboard, device);
+        self.resumed.write().unwrap().remove(device);
+    }
 }
 
 pub(crate) struct LibeiEmulation {
@@ -192,7 +221,7 @@ impl Emulation for LibeiEmulation {
             Event::Pointer(p) => match p {
                 PointerEvent::Motion { time: _, dx, dy } => {
                     let pointer_device = self.devices.pointer.read().unwrap();
-                    if let Some((d, p)) = pointer_device.as_ref() {
+                    if let Some((d, p)) = self.devices.usable(&pointer_device) {
                         p.motion_relative(dx as f32, dy as f32);
                         d.frame(self.conn.serial(), now);
                     }
@@ -203,7 +232,7 @@ impl Emulation for LibeiEmulation {
                     state,
                 } => {
                     let button_device = self.devices.button.read().unwrap();
-                    if let Some((d, b)) = button_device.as_ref() {
+                    if let Some((d, b)) = self.devices.usable(&button_device) {
                         b.button(
                             button,
                             match state {
@@ -220,7 +249,7 @@ impl Emulation for LibeiEmulation {
                     value,
                 } => {
                     let scroll_device = self.devices.scroll.read().unwrap();
-                    if let Some((d, s)) = scroll_device.as_ref() {
+                    if let Some((d, s)) = self.devices.usable(&scroll_device) {
                         match axis {
                             0 => s.scroll(0., value as f32),
                             _ => s.scroll(value as f32, 0.),
@@ -230,7 +259,7 @@ impl Emulation for LibeiEmulation {
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
                     let scroll_device = self.devices.scroll.read().unwrap();
-                    if let Some((d, s)) = scroll_device.as_ref() {
+                    if let Some((d, s)) = self.devices.usable(&scroll_device) {
                         match axis {
                             0 => s.scroll_discrete(0, value),
                             _ => s.scroll_discrete(value, 0),
@@ -246,7 +275,7 @@ impl Emulation for LibeiEmulation {
                     state,
                 } => {
                     let keyboard_device = self.devices.keyboard.read().unwrap();
-                    if let Some((d, k)) = keyboard_device.as_ref() {
+                    if let Some((d, k)) = self.devices.usable(&keyboard_device) {
                         k.key(
                             key,
                             match state {
@@ -274,8 +303,8 @@ impl Emulation for LibeiEmulation {
     ) -> Result<Option<(i32, i32)>, EmulationError> {
         let point = {
             let absolute = self.devices.absolute.read().unwrap();
-            let Some((d, p, regions)) = absolute.as_ref() else {
-                log::warn!("no absolute pointer device: pointer not placed");
+            let Some((d, (p, regions))) = self.devices.usable(&absolute) else {
+                log::warn!("no usable absolute pointer device: pointer not placed");
                 return Ok(None);
             };
             let Some((x, y)) = entry_point(regions, edge, fraction) else {
@@ -333,116 +362,264 @@ async fn ei_event_handler(
 ) -> Result<(), EmulationError> {
     loop {
         let event = events.next().await.ok_or(EmulationError::EndOfStream)??;
-        const CAPABILITIES: &[DeviceCapability] = &[
-            DeviceCapability::Pointer,
-            DeviceCapability::PointerAbsolute,
-            DeviceCapability::Keyboard,
-            DeviceCapability::Touch,
-            DeviceCapability::Scroll,
-            DeviceCapability::Button,
-        ];
-        log::debug!("{event:?}");
-        match event {
-            EiEvent::Disconnected(e) => {
-                log::debug!("ei disconnected: {e:?}");
-                return Err(EmulationError::EndOfStream);
-            }
-            EiEvent::SeatAdded(e) => {
-                e.seat().bind_capabilities(CAPABILITIES);
-            }
-            EiEvent::SeatRemoved(e) => {
-                log::debug!("seat removed: {:?}", e.seat());
-            }
-            EiEvent::DeviceAdded(e) => {
-                let device_type = e.device().device_type();
-                log::debug!("device added: {device_type:?}");
-                e.device().device();
-                let device = e.device();
-                if let Some(pointer) = e.device().interface::<Pointer>() {
-                    devices
-                        .pointer
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), pointer));
-                }
-                if let Some(absolute) = e.device().interface::<PointerAbsolute>() {
-                    let regions = e
-                        .device()
-                        .regions()
-                        .iter()
-                        .map(|r| Rect {
-                            x: r.x as i32,
-                            y: r.y as i32,
-                            width: r.width as i32,
-                            height: r.height as i32,
-                        })
-                        .collect::<Vec<_>>();
-                    log::debug!("absolute pointer regions: {regions:?}");
-                    devices.absolute.write().unwrap().replace((
-                        device.device().clone(),
-                        absolute,
-                        regions,
-                    ));
-                }
-                if let Some(keyboard) = e.device().interface::<Keyboard>() {
-                    devices
-                        .keyboard
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), keyboard));
-                }
-                if let Some(scroll) = e.device().interface::<Scroll>() {
-                    devices
-                        .scroll
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), scroll));
-                }
-                if let Some(button) = e.device().interface::<Button>() {
-                    devices
-                        .button
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), button));
-                }
-            }
-            EiEvent::DeviceRemoved(e) => {
-                log::debug!("device removed: {:?}", e.device().device_type());
-                let mut absolute = devices.absolute.write().unwrap();
-                if absolute
-                    .as_ref()
-                    .is_some_and(|(d, ..)| d == e.device().device())
-                {
-                    absolute.take();
-                }
-            }
-            EiEvent::DevicePaused(e) => {
-                log::debug!("device paused: {:?}", e.device().device_type());
-            }
-            EiEvent::DeviceResumed(e) => {
-                log::debug!("device resumed: {:?}", e.device().device_type());
-                e.device().device().start_emulating(0, 0);
-            }
-            EiEvent::KeyboardModifiers(e) => {
-                log::debug!("modifiers: {e:?}");
-            }
-            // only for receiver context
-            // EiEvent::Frame(_) => { },
-            // EiEvent::DeviceStartEmulating(_) => { },
-            // EiEvent::DeviceStopEmulating(_) => { },
-            // EiEvent::PointerMotion(_) => { },
-            // EiEvent::PointerMotionAbsolute(_) => { },
-            // EiEvent::Button(_) => { },
-            // EiEvent::ScrollDelta(_) => { },
-            // EiEvent::ScrollStop(_) => { },
-            // EiEvent::ScrollCancel(_) => { },
-            // EiEvent::ScrollDiscrete(_) => { },
-            // EiEvent::KeyboardKey(_) => { },
-            // EiEvent::TouchDown(_) => { },
-            // EiEvent::TouchUp(_) => { },
-            // EiEvent::TouchMotion(_) => { },
-            _ => unreachable!("unexpected ei event"),
-        }
+        handle_ei_event(event, devices)?;
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
+    }
+}
+
+/// tracks the devices the EIS offers and whether they may emulate
+fn handle_ei_event(event: EiEvent, devices: &Devices) -> Result<(), EmulationError> {
+    const CAPABILITIES: &[DeviceCapability] = &[
+        DeviceCapability::Pointer,
+        DeviceCapability::PointerAbsolute,
+        DeviceCapability::Keyboard,
+        DeviceCapability::Touch,
+        DeviceCapability::Scroll,
+        DeviceCapability::Button,
+    ];
+    log::debug!("{event:?}");
+    match event {
+        EiEvent::Disconnected(e) => {
+            log::debug!("ei disconnected: {e:?}");
+            return Err(EmulationError::EndOfStream);
+        }
+        EiEvent::SeatAdded(e) => {
+            e.seat().bind_capabilities(CAPABILITIES);
+        }
+        EiEvent::SeatRemoved(e) => {
+            log::debug!("seat removed: {:?}", e.seat());
+        }
+        EiEvent::DeviceAdded(e) => {
+            let device_type = e.device().device_type();
+            log::debug!("device added: {device_type:?}");
+            let device = e.device();
+            if let Some(pointer) = device.interface::<Pointer>() {
+                devices
+                    .pointer
+                    .write()
+                    .unwrap()
+                    .replace((device.device().clone(), pointer));
+            }
+            if let Some(absolute) = device.interface::<PointerAbsolute>() {
+                let regions = device
+                    .regions()
+                    .iter()
+                    .map(|r| Rect {
+                        x: r.x as i32,
+                        y: r.y as i32,
+                        width: r.width as i32,
+                        height: r.height as i32,
+                    })
+                    .collect::<Vec<_>>();
+                log::debug!("absolute pointer regions: {regions:?}");
+                devices
+                    .absolute
+                    .write()
+                    .unwrap()
+                    .replace((device.device().clone(), (absolute, regions)));
+            }
+            if let Some(keyboard) = device.interface::<Keyboard>() {
+                devices
+                    .keyboard
+                    .write()
+                    .unwrap()
+                    .replace((device.device().clone(), keyboard));
+            }
+            if let Some(scroll) = device.interface::<Scroll>() {
+                devices
+                    .scroll
+                    .write()
+                    .unwrap()
+                    .replace((device.device().clone(), scroll));
+            }
+            if let Some(button) = device.interface::<Button>() {
+                devices
+                    .button
+                    .write()
+                    .unwrap()
+                    .replace((device.device().clone(), button));
+            }
+        }
+        EiEvent::DeviceRemoved(e) => {
+            log::debug!("device removed: {:?}", e.device().device_type());
+            devices.remove(e.device().device());
+        }
+        EiEvent::DevicePaused(e) => {
+            log::debug!("device paused: {:?}", e.device().device_type());
+            devices.resumed.write().unwrap().remove(e.device().device());
+        }
+        EiEvent::DeviceResumed(e) => {
+            log::debug!("device resumed: {:?}", e.device().device_type());
+            let device = e.device().device();
+            device.start_emulating(0, 0);
+            devices.resumed.write().unwrap().insert(device.clone());
+        }
+        EiEvent::KeyboardModifiers(e) => {
+            log::debug!("modifiers: {e:?}");
+        }
+        // only for receiver context
+        // EiEvent::Frame(_) => { },
+        // EiEvent::DeviceStartEmulating(_) => { },
+        // EiEvent::DeviceStopEmulating(_) => { },
+        // EiEvent::PointerMotion(_) => { },
+        // EiEvent::PointerMotionAbsolute(_) => { },
+        // EiEvent::Button(_) => { },
+        // EiEvent::ScrollDelta(_) => { },
+        // EiEvent::ScrollStop(_) => { },
+        // EiEvent::ScrollCancel(_) => { },
+        // EiEvent::ScrollDiscrete(_) => { },
+        // EiEvent::KeyboardKey(_) => { },
+        // EiEvent::TouchDown(_) => { },
+        // EiEvent::TouchUp(_) => { },
+        // EiEvent::TouchMotion(_) => { },
+        _ => unreachable!("unexpected ei event"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reis::{
+        PendingRequestResult, eis,
+        handshake::EisHandshaker,
+        request::{EisRequest, EisRequestConverter},
+    };
+    use tokio::io::unix::AsyncFd;
+
+    /// requests the client sent, waiting for at least one
+    async fn requests(eis: &AsyncFd<eis::Context>) -> Vec<eis::Request> {
+        loop {
+            let mut ready = eis.readable().await.unwrap();
+            match eis.get_ref().read() {
+                Ok(0) => panic!("the client hung up"),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready.clear_ready();
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            }
+            let mut requests = Vec::new();
+            while let Some(request) = eis.get_ref().pending_request() {
+                let PendingRequestResult::Request(request) = request else {
+                    panic!("malformed request");
+                };
+                requests.push(request);
+            }
+            if !requests.is_empty() {
+                return requests;
+            }
+        }
+    }
+
+    async fn eis_handshake(eis: &AsyncFd<eis::Context>) -> EisRequestConverter {
+        let mut handshaker = EisHandshaker::new(eis.get_ref(), 1);
+        loop {
+            for request in requests(eis).await {
+                if let Some(done) = handshaker.handle_request(request).unwrap() {
+                    let converter = EisRequestConverter::new(eis.get_ref(), done, 1);
+                    // the client waits for the connection object
+                    eis.get_ref().flush().unwrap();
+                    return converter;
+                }
+            }
+        }
+    }
+
+    /// handles events until one `stop` holds
+    async fn handle_until(
+        events: &mut EiConvertEventStream,
+        context: &ei::Context,
+        devices: &Devices,
+        stop: fn(&EiEvent) -> bool,
+    ) {
+        loop {
+            let event = events.next().await.unwrap().unwrap();
+            let last = stop(&event);
+            handle_ei_event(event, devices).unwrap();
+            context.flush().unwrap();
+            if last {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_resumed_devices_emulate() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let eis = AsyncFd::new(eis::Context::new(server).unwrap()).unwrap();
+        let context = ei::Context::new(client).unwrap();
+        let ((_conn, mut events), mut eis_conn) = tokio::join!(
+            async {
+                context
+                    .handshake_tokio("test", ContextType::Sender)
+                    .await
+                    .unwrap()
+            },
+            eis_handshake(&eis),
+        );
+        let devices = Devices::default();
+        let keyboard_usable = || devices.usable(&devices.keyboard.read().unwrap()).is_some();
+
+        let seat = eis_conn
+            .handle()
+            .add_seat(Some("seat"), &[DeviceCapability::Keyboard]);
+        eis.get_ref().flush().unwrap();
+        handle_until(&mut events, &context, &devices, |e| {
+            matches!(e, EiEvent::SeatAdded(_))
+        })
+        .await;
+        'bind: loop {
+            for request in requests(&eis).await {
+                eis_conn.handle_request(request).unwrap();
+            }
+            while let Some(request) = eis_conn.next_request() {
+                if matches!(request, EisRequest::Bind(_)) {
+                    break 'bind;
+                }
+            }
+        }
+
+        let device = seat.add_device(
+            Some("keyboard"),
+            eis::device::DeviceType::Virtual,
+            &[DeviceCapability::Keyboard],
+            |_| {},
+        );
+        eis.get_ref().flush().unwrap();
+        handle_until(&mut events, &context, &devices, |e| {
+            matches!(e, EiEvent::DeviceAdded(_))
+        })
+        .await;
+        // devices start paused
+        assert!(devices.keyboard.read().unwrap().is_some());
+        assert!(!keyboard_usable());
+
+        device.resumed();
+        eis.get_ref().flush().unwrap();
+        handle_until(&mut events, &context, &devices, |e| {
+            matches!(e, EiEvent::DeviceResumed(_))
+        })
+        .await;
+        assert!(keyboard_usable());
+
+        device.paused();
+        eis.get_ref().flush().unwrap();
+        handle_until(&mut events, &context, &devices, |e| {
+            matches!(e, EiEvent::DevicePaused(_))
+        })
+        .await;
+        assert!(!keyboard_usable());
+
+        device.resumed();
+        device.remove();
+        eis.get_ref().flush().unwrap();
+        handle_until(&mut events, &context, &devices, |e| {
+            matches!(e, EiEvent::DeviceRemoved(_))
+        })
+        .await;
+        assert!(devices.keyboard.read().unwrap().is_none());
+        assert!(devices.resumed.read().unwrap().is_empty());
     }
 }

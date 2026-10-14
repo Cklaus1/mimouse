@@ -1,18 +1,21 @@
 use async_trait::async_trait;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, hash_map::Entry},
     fmt::Display,
     future::Future,
 };
 use tokio::sync::watch;
 
-use input_event::{Event, KeyboardEvent, PointerEvent};
+use input_event::{Event, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 pub use self::geometry::Edge;
+use self::normalize::{Peer, Steps};
 
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_logic;
 
 #[cfg(x11)]
 mod x11;
@@ -31,10 +34,18 @@ mod macos;
 #[cfg(any(target_os = "macos", test))]
 mod macos_logic;
 
+#[cfg(test)]
+mod contract;
+#[cfg(test)]
+mod testing;
+
 /// configured-only emulation that discards events
 mod dummy;
 mod error;
 mod geometry;
+#[cfg(any(windows, target_os = "macos", test))]
+mod keys;
+mod normalize;
 
 pub type EmulationHandle = u64;
 
@@ -75,10 +86,14 @@ impl Display for Backend {
     }
 }
 
+/// Emulates peers' input on a backend. Every event passes [`Peer::plan`]
+/// first, so backends only see protocol values, real key and button
+/// changes, and motion and scroll in steps they can emulate.
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
-    handles: HashSet<EmulationHandle>,
-    pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    steps: Steps,
+    peers: HashMap<EmulationHandle, Peer>,
+    terminated: bool,
 }
 
 impl InputEmulation {
@@ -91,7 +106,7 @@ impl InputEmulation {
         let _ = permission_pending;
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
-            Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new()?),
+            Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new().await?),
             #[cfg(libei)]
             Backend::Libei => Box::new(libei::LibeiEmulation::new(permission_pending).await?),
             #[cfg(x11)]
@@ -106,11 +121,16 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
-        Ok(Self {
+        Ok(Self::with_emulation(emulation))
+    }
+
+    fn with_emulation(emulation: Box<dyn Emulation>) -> Self {
+        Self {
+            steps: emulation.steps(),
             emulation,
-            handles: HashSet::new(),
-            pressed_keys: HashMap::new(),
-        })
+            peers: HashMap::new(),
+            terminated: false,
+        }
     }
 
     /// `permission_pending` is `true` while the backend waits for a
@@ -133,21 +153,35 @@ impl InputEmulation {
         .await
     }
 
+    /// Emulates `event` for `handle` (see [`Peer::plan`]); events for a
+    /// handle that was not created, or after `terminate`, are dropped.
     pub async fn consume(
         &mut self,
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
-        match event {
-            Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
-                // prevent double pressed / released keys
-                if self.update_pressed_keys(handle, key, state) {
-                    self.emulation.consume(event, handle).await?;
-                }
-                Ok(())
-            }
-            _ => self.emulation.consume(event, handle).await,
+        let steps = self.steps;
+        let Some(event) = self
+            .peers
+            .get_mut(&handle)
+            .and_then(|peer| peer.plan(event, steps))
+        else {
+            return Ok(());
+        };
+        self.emulate(event, handle).await
+    }
+
+    /// hands a planned event to the backend
+    async fn emulate(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        self.emulation.consume(event, handle).await?;
+        if let Some(peer) = self.peers.get_mut(&handle) {
+            peer.emulated(event);
         }
+        Ok(())
     }
 
     /// Places the pointer at `fraction` along `edge` of this desktop, where
@@ -159,6 +193,9 @@ impl InputEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<(), EmulationError> {
+        if self.terminated {
+            return Ok(());
+        }
         if let Some((x, y)) = self.emulation.enter_at(handle, edge, fraction)? {
             log::info!("entered at {x},{y} ({edge} edge, fraction {fraction})");
         }
@@ -180,6 +217,9 @@ impl InputEmulation {
         const STEPS: usize = 3;
         /// logical pixels per event: far more than the edge inset
         const STEP: f64 = 16.;
+        if self.terminated {
+            return Ok(false);
+        }
         let Some((x, y)) = self.emulation.enter_at(handle, edge, fraction)? else {
             return Ok(false);
         };
@@ -199,77 +239,56 @@ impl InputEmulation {
         Ok(true)
     }
 
+    /// Starts emulating for `handle`; `false` if it exists or emulation was
+    /// terminated.
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
-        if self.handles.insert(handle) {
-            self.pressed_keys.insert(handle, HashSet::new());
-            self.emulation.create(handle).await;
-            true
-        } else {
-            false
+        if self.terminated {
+            return false;
         }
+        let Entry::Vacant(entry) = self.peers.entry(handle) else {
+            return false;
+        };
+        entry.insert(Peer::default());
+        self.emulation.create(handle).await;
+        true
     }
 
+    /// Releases every key and button `handle` holds, then stops emulating
+    /// for it.
     pub async fn destroy(&mut self, handle: EmulationHandle) {
-        let _ = self.release_keys(handle).await;
-        if self.handles.remove(&handle) {
-            self.pressed_keys.remove(&handle);
+        if let Err(e) = self.release(handle).await {
+            log::warn!("could not release the input of {handle}: {e}");
+        }
+        if self.peers.remove(&handle).is_some() {
             self.emulation.destroy(handle).await
         }
     }
 
+    /// Destroys every handle and ends the backend; later calls do nothing.
     pub async fn terminate(&mut self) {
-        for handle in self.handles.iter().cloned().collect::<Vec<_>>() {
+        if std::mem::replace(&mut self.terminated, true) {
+            return;
+        }
+        for handle in self.peers.keys().copied().collect::<Vec<_>>() {
             self.destroy(handle).await
         }
         self.emulation.terminate().await
     }
 
-    pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
-        if let Some(keys) = self.pressed_keys.get_mut(&handle) {
-            let keys = keys.drain().collect::<Vec<_>>();
-            for key in keys {
-                let event = Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key,
-                    state: 0,
-                });
-                self.emulation.consume(event, handle).await?;
-                if let Ok(key) = input_event::scancode::Linux::try_from(key) {
-                    log::warn!("releasing stuck key: {key:?}");
-                }
-            }
-        }
-
-        let event = Event::Keyboard(KeyboardEvent::Modifiers {
-            depressed: 0,
-            latched: 0,
-            locked: 0,
-            group: 0,
-        });
-        self.emulation.consume(event, handle).await?;
-        Ok(())
-    }
-
-    pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
-        self.pressed_keys
-            .get(&handle)
-            .is_some_and(|p| !p.is_empty())
-    }
-
-    /// update the pressed_keys for the given handle
-    /// returns whether the event should be processed
-    fn update_pressed_keys(&mut self, handle: EmulationHandle, key: u32, state: u8) -> bool {
-        let Some(pressed_keys) = self.pressed_keys.get_mut(&handle) else {
-            return false;
+    /// key-ups and button-ups for everything `handle` holds, then a
+    /// modifier reset
+    async fn release(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        let Some(peer) = self.peers.get(&handle) else {
+            return Ok(());
         };
-
-        if state == 0 {
-            // currently pressed => can release
-            pressed_keys.remove(&key)
-        } else {
-            // currently not pressed => can press
-            pressed_keys.insert(key)
+        let (keys, buttons) = peer.held();
+        if keys + buttons > 0 {
+            log::warn!("releasing {keys} key(s) and {buttons} button(s) held by {handle}");
         }
+        for event in peer.release() {
+            self.emulate(event, handle).await?;
+        }
+        Ok(())
     }
 }
 
@@ -340,6 +359,11 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
+    /// Smallest motion and scroll steps the backend emulates; the layer
+    /// above keeps anything finer per peer until it adds up.
+    fn steps(&self) -> Steps {
+        Steps::EXACT
+    }
     /// Moves the pointer to [`geometry::entry_point`] of this desktop and
     /// returns the point, `None` if the pointer was not placed.
     fn enter_at(
@@ -356,6 +380,97 @@ trait Emulation: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Call, Recorder};
+    use futures::executor::block_on;
+    use input_event::{BTN_LEFT, KeyboardEvent};
+
+    const KEY_A: u32 = 30;
+
+    fn key(key: u32, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state,
+        })
+    }
+
+    fn button(button: u32, state: u32) -> Event {
+        Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button,
+            state,
+        })
+    }
+
+    fn motion(dx: f64, dy: f64) -> Event {
+        Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })
+    }
+
+    const RESET: Event = Event::Keyboard(KeyboardEvent::Modifiers {
+        depressed: 0,
+        latched: 0,
+        locked: 0,
+        group: 0,
+    });
+
+    #[test]
+    fn destroy_releases_held_keys_and_buttons() {
+        let (mut emulation, mut calls) = Recorder::emulation(Steps::EXACT, true);
+        block_on(async {
+            emulation.create(1).await;
+            emulation.consume(button(BTN_LEFT, 1), 1).await.unwrap();
+            emulation.consume(key(KEY_A, 1), 1).await.unwrap();
+            calls.take();
+            emulation.destroy(1).await;
+        });
+        assert_eq!(
+            calls.take(),
+            [
+                Call::Consume(1, key(KEY_A, 0)),
+                Call::Consume(1, button(BTN_LEFT, 0)),
+                Call::Consume(1, RESET),
+                Call::Destroy(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn values_outside_the_protocol_never_reach_the_backend() {
+        let (mut emulation, mut calls) = Recorder::emulation(Steps::EXACT, true);
+        block_on(async {
+            emulation.create(1).await;
+            emulation.consume(key(KEY_A, 2), 1).await.unwrap();
+            emulation.consume(button(BTN_LEFT, 7), 1).await.unwrap();
+            let axis = PointerEvent::AxisDiscrete120 {
+                axis: 2,
+                value: 120,
+            };
+            emulation.consume(Event::Pointer(axis), 1).await.unwrap();
+            // a handle that was never created
+            emulation.consume(key(KEY_A, 1), 2).await.unwrap();
+        });
+        assert_eq!(calls.take(), [Call::Create(1)]);
+    }
+
+    #[test]
+    fn remainders_are_kept_per_handle() {
+        let whole = Steps {
+            whole_pixels: true,
+            v120: 1,
+        };
+        let (mut emulation, mut calls) = Recorder::emulation(whole, true);
+        block_on(async {
+            emulation.create(1).await;
+            emulation.create(2).await;
+            calls.take();
+            emulation.consume(motion(0.6, 0.), 1).await.unwrap();
+            // another peer's motion does not complete the first one's pixel
+            emulation.consume(motion(0.6, 0.), 2).await.unwrap();
+            assert_eq!(calls.take(), []);
+            emulation.consume(motion(0.6, 0.), 1).await.unwrap();
+        });
+        assert_eq!(calls.take(), [Call::Consume(1, motion(1., 0.))]);
+    }
 
     #[test]
     fn auto_selection_without_a_working_backend_fails() {

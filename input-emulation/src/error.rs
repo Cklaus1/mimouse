@@ -12,8 +12,8 @@ impl InputEmulationError {
         matches!(self, Self::Create(e) if e.cancelled_by_user())
     }
 
-    /// the backend may come up by itself: the EIS / portal connection ended,
-    /// the portal is not on the bus yet (login) or no backend works yet
+    /// the backend may come up by itself: the EIS / portal / compositor
+    /// connection ended or is not there yet (login), or no backend works yet
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Create(EmulationCreationError::NoAvailableBackend) => true,
@@ -25,12 +25,29 @@ impl InputEmulationError {
             Self::Create(EmulationCreationError::Xdp(XdpEmulationCreationError::Ashpd(e))) => {
                 portal_not_on_bus(e)
             }
+            #[cfg(wlroots)]
+            Self::Create(EmulationCreationError::Wlroots(e)) => e.is_transient(),
+            #[cfg(x11)]
+            Self::Create(EmulationCreationError::X11(X11EmulationCreationError::OpenDisplay)) => {
+                true
+            }
             Self::Emulate(EmulationError::EndOfStream) => true,
             #[cfg(any(rdp, libei))]
             Self::Emulate(EmulationError::Ashpd(e)) => portal_not_on_bus(e),
+            #[cfg(wlroots)]
+            Self::Emulate(EmulationError::Wayland(e)) => compositor_gone(e),
             _ => false,
         }
     }
+}
+
+/// the compositor closed the connection (it exited or restarted)
+#[cfg(wlroots)]
+fn compositor_gone(e: &WaylandError) -> bool {
+    matches!(e, WaylandError::Io(e) if matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+    ))
 }
 
 #[cfg(any(libei, rdp))]
@@ -149,6 +166,27 @@ pub enum WlrootsEmulationCreationError {
     Dispatch(#[from] DispatchError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// e.g. no keymap because the seat has no keyboard (yet)
+    #[error("the compositor sent no {awaited} within {after:?}")]
+    Timeout {
+        awaited: &'static str,
+        after: std::time::Duration,
+    },
+}
+
+#[cfg(wlroots)]
+impl WlrootsEmulationCreationError {
+    /// no compositor yet (login), it went away while starting, or it did
+    /// not answer in time
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Connect(ConnectError::NoCompositor) | Self::Timeout { .. } => true,
+            Self::Wayland(e)
+            | Self::Global(GlobalError::Backend(e))
+            | Self::Dispatch(DispatchError::Backend(e)) => compositor_gone(e),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(wlroots)]
@@ -235,5 +273,53 @@ mod tests {
         let io = InputEmulationError::from(EmulationError::Io(io::ErrorKind::Other.into()));
         assert!(!io.is_transient());
         assert!(!io.cancelled_by_user());
+    }
+}
+
+#[cfg(all(test, wlroots, x11))]
+mod compositor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wlroots(e: WlrootsEmulationCreationError) -> InputEmulationError {
+        EmulationCreationError::Wlroots(e).into()
+    }
+
+    #[test]
+    fn compositor_loss_is_transient() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let lost = WaylandError::Io(kind.into());
+            assert!(
+                InputEmulationError::from(EmulationError::Wayland(lost.clone())).is_transient()
+            );
+            assert!(wlroots(lost.clone().into()).is_transient());
+            assert!(wlroots(DispatchError::Backend(lost).into()).is_transient());
+        }
+        // no compositor yet, e.g. right after login
+        assert!(wlroots(ConnectError::NoCompositor.into()).is_transient());
+        assert!(
+            wlroots(WlrootsEmulationCreationError::Timeout {
+                awaited: "keymap",
+                after: Duration::from_secs(5),
+            })
+            .is_transient()
+        );
+        assert!(
+            InputEmulationError::from(EmulationCreationError::X11(
+                X11EmulationCreationError::OpenDisplay
+            ))
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn unsupported_compositor_is_final() {
+        assert!(!wlroots(ConnectError::NoWaylandLib.into()).is_transient());
+        let other = WaylandError::Io(io::ErrorKind::PermissionDenied.into());
+        assert!(!InputEmulationError::from(EmulationError::Wayland(other)).is_transient());
     }
 }

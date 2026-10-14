@@ -1,0 +1,11 @@
+# Wire events a peer sends (format: input-emulation/src/contract.rs).
+# A window dragged with the left button; the peer is lost mid-drag, so the
+# trace ends with the button held. Fractional motion as a libei (GNOME)
+# capture sends it.
+motion 0.75 0.25
+motion 1.5 -0.5
+button 272 1
+motion 3.25 0.125
+motion 4.0 0.875
+motion 2.5 1.5
+motion 0.375 0.0

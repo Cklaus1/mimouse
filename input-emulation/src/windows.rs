@@ -26,18 +26,25 @@ use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
 use windows::core::BOOL;
 
 use super::geometry::{Rect, entry_point};
+use super::keys::{Repeat, RepeatPlanner};
+use super::normalize::Steps;
+use super::windows_logic::{Wheel, wheel};
 use super::{Edge, Emulation, EmulationHandle};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
+    repeat: RepeatPlanner,
     repeat_task: Option<AbortHandle>,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+        Ok(Self {
+            repeat: RepeatPlanner::default(),
+            repeat_task: None,
+        })
     }
 }
 
@@ -67,11 +74,10 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
-                    match state {
-                        // pressed
-                        0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
-                        _ => {}
+                    match self.repeat.key(key, state == 1) {
+                        Repeat::Start(key) => self.spawn_repeat_task(key),
+                        Repeat::Stop => self.kill_repeat_task(),
+                        Repeat::Keep => {}
                     }
                     key_event(key, state)
                 }
@@ -79,6 +85,14 @@ impl Emulation for WindowsEmulation {
             },
         }
         Ok(())
+    }
+
+    /// `SendInput` moves in whole pixels; its wheels take any 120th
+    fn steps(&self) -> Steps {
+        Steps {
+            whole_pixels: true,
+            v120: 1,
+        }
     }
 
     fn enter_at(
@@ -103,7 +117,9 @@ impl Emulation for WindowsEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.kill_repeat_task();
+    }
 }
 
 /// Monitor rectangles on the virtual desktop.
@@ -143,9 +159,7 @@ fn monitors() -> Vec<Rect> {
 }
 
 impl WindowsEmulation {
-    async fn spawn_repeat_task(&mut self, key: u32) {
-        // there can only be one repeating key and it's
-        // always the last to be pressed
+    fn spawn_repeat_task(&mut self, key: u32) {
         self.kill_repeat_task();
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
@@ -253,16 +267,17 @@ fn mouse_button(button: u32, state: u32) {
 }
 
 fn scroll(axis: u8, value: i32) {
-    let event_type = match axis {
-        0 => MOUSEEVENTF_WHEEL,
-        1 => MOUSEEVENTF_HWHEEL,
-        _ => return,
+    let Some((wheel, data)) = wheel(axis, value) else {
+        return;
     };
     let mi = MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: -value as u32,
-        dwFlags: event_type,
+        mouseData: data as u32,
+        dwFlags: match wheel {
+            Wheel::Vertical => MOUSEEVENTF_WHEEL,
+            Wheel::Horizontal => MOUSEEVENTF_HWHEEL,
+        },
         time: 0,
         dwExtraInfo: 0,
     };

@@ -691,16 +691,34 @@ fn enter_event(pos: crate::proto::Position, at: Option<u16>) -> ProtoEvent {
     }
 }
 
+/// Buttons released on leave: capture tracks keys but not buttons, and a
+/// peer drops a release for a button it does not hold.
+const LEAVE_BUTTONS: [u32; 5] = [
+    input_event::BTN_LEFT,
+    input_event::BTN_RIGHT,
+    input_event::BTN_MIDDLE,
+    input_event::BTN_BACK,
+    input_event::BTN_FORWARD,
+];
+
 /// What a peer needs to stop being controlled: key-ups for every key that
 /// was forwarded as pressed (the release-bind chord, or keys held when the
 /// compositor ended capture, would otherwise stay held there until its
-/// watchdog fires), then a modifier reset (its XKB state is separate from
-/// pressed keys, e.g. a locked CapsLock), then `Leave`, which may be lost.
+/// watchdog fires), button-ups (a drag in progress), then a modifier reset
+/// (its XKB state is separate from pressed keys, e.g. a locked CapsLock),
+/// then `Leave`, which may be lost.
 fn leave_events(pressed: impl IntoIterator<Item = Linux>) -> Vec<ProtoEvent> {
     let key_ups = pressed.into_iter().map(|key| {
         ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
             time: 0,
             key: key as u32,
+            state: 0,
+        }))
+    });
+    let button_ups = LEAVE_BUTTONS.map(|button| {
+        ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button,
             state: 0,
         }))
     });
@@ -710,7 +728,10 @@ fn leave_events(pressed: impl IntoIterator<Item = Linux>) -> Vec<ProtoEvent> {
         locked: 0,
         group: 0,
     }));
-    key_ups.chain([mods_zero, ProtoEvent::Leave(0)]).collect()
+    key_ups
+        .chain(button_ups)
+        .chain([mods_zero, ProtoEvent::Leave(0)])
+        .collect()
 }
 
 /// how long a focus waits for capture to start
@@ -1033,7 +1054,8 @@ mod tests {
     fn leaving_releases_every_held_key_before_leave() {
         let held = [KeyLeftCtrl, Linux::KeyLeftShift, Linux::KeyA];
         let events = leave_events(held);
-        assert_eq!(events.len(), held.len() + 2);
+        let buttons = LEAVE_BUTTONS.len();
+        assert_eq!(events.len(), held.len() + buttons + 2);
         let mut released: Vec<u32> = events[..held.len()]
             .iter()
             .map(|e| match e {
@@ -1047,8 +1069,21 @@ mod tests {
         let mut expected: Vec<u32> = held.iter().map(|&k| k as u32).collect();
         expected.sort();
         assert_eq!(released, expected);
+        // a drag in progress ends too
+        let button_ups: Vec<u32> = events[held.len()..held.len() + buttons]
+            .iter()
+            .map(|e| match e {
+                ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+                    button,
+                    state: 0,
+                    ..
+                })) => *button,
+                e => panic!("expected a button-up, got {e}"),
+            })
+            .collect();
+        assert!(button_ups.contains(&input_event::BTN_LEFT));
         assert!(matches!(
-            events[held.len()],
+            events[held.len() + buttons],
             ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
                 depressed: 0,
                 latched: 0,
@@ -1056,9 +1091,12 @@ mod tests {
                 group: 0
             }))
         ));
-        assert!(matches!(events[held.len() + 1], ProtoEvent::Leave(_)));
-        // nothing held: still reset modifiers and leave
-        assert_eq!(leave_events([]).len(), 2);
+        assert!(matches!(
+            events[held.len() + buttons + 1],
+            ProtoEvent::Leave(_)
+        ));
+        // nothing held: still release buttons, reset modifiers and leave
+        assert_eq!(leave_events([]).len(), buttons + 2);
     }
 
     /// release bind Ctrl+Shift+Alt+Meta, local hotkey Ctrl+Alt+0, client 1

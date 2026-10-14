@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{Interest, unix::AsyncFd};
 use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
@@ -30,7 +32,7 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 };
 
 use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry, wl_seat},
 };
@@ -40,6 +42,11 @@ use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use super::error::WaylandBindError;
 use super::geometry::{Rect, entry_point};
 use super::{Edge, EmulationHandle};
+
+/// How long the compositor may take to send the keymap, and then the output
+/// layout. A seat without a keyboard never sends a keymap; creation fails
+/// then and is retried later.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
@@ -52,6 +59,8 @@ struct State {
     xdg_output_manager: Option<XdgOutputManager>,
     /// outputs by global name
     outputs: HashMap<u32, Output>,
+    /// the compositor answered the last `wl_display.sync`
+    synced: bool,
 }
 
 /// an output and its logical geometry in the layout
@@ -70,9 +79,31 @@ pub(crate) struct WlrootsEmulation {
 }
 
 impl WlrootsEmulation {
-    pub(crate) fn new() -> Result<Self, WlrootsEmulationCreationError> {
-        let conn = Connection::connect_to_env()?;
-        let (globals, queue) = registry_queue_init::<State>(&conn)?;
+    pub(crate) async fn new() -> Result<Self, WlrootsEmulationCreationError> {
+        Self::start(Connection::connect_to_env()?, STARTUP_TIMEOUT).await
+    }
+
+    /// Binds the globals, then waits up to `timeout` each for the keymap
+    /// and the output layout.
+    async fn start(
+        conn: Connection,
+        timeout: Duration,
+    ) -> Result<Self, WlrootsEmulationCreationError> {
+        let mut emulate = Self::bind(&conn)?;
+        emulate
+            .dispatch_until(timeout, "keymap", |s| s.keymap.is_some())
+            .await?;
+        // output geometry: requested before this sync, so it has arrived
+        // once the sync is answered
+        conn.display().sync(&emulate.state.qh, ());
+        emulate
+            .dispatch_until(timeout, "output layout", |s| s.synced)
+            .await?;
+        Ok(emulate)
+    }
+
+    fn bind(conn: &Connection) -> Result<Self, WlrootsEmulationCreationError> {
+        let (globals, queue) = registry_queue_init::<State>(conn)?;
         let qh = queue.handle();
 
         let seat: wl_seat::WlSeat = globals
@@ -91,19 +122,18 @@ impl WlrootsEmulation {
             log::warn!("no xdg-output-manager: the pointer is not placed where it enters");
         }
 
-        let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
-
         let mut emulate = WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
-                input_for_client,
+                input_for_client: HashMap::new(),
                 seat,
                 vpm,
                 vkm,
                 qh,
                 xdg_output_manager,
                 outputs: HashMap::new(),
+                synced: false,
             },
             queue,
         };
@@ -114,15 +144,68 @@ impl WlrootsEmulation {
                     .add_output(globals.registry(), global.name, global.version);
             }
         }
-        while emulate.state.keymap.is_none() {
-            emulate.queue.blocking_dispatch(&mut emulate.state)?;
-        }
-        // output geometry
-        emulate.queue.roundtrip(&mut emulate.state)?;
-        // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
-        // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
-        // log::debug!("{:?}", &mmap[..100]);
         Ok(emulate)
+    }
+
+    /// Dispatches events until `done` holds; a creation error when the
+    /// compositor sends nothing that makes it hold within `timeout`.
+    async fn dispatch_until(
+        &mut self,
+        timeout: Duration,
+        awaited: &'static str,
+        done: impl Fn(&State) -> bool,
+    ) -> Result<(), WlrootsEmulationCreationError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.queue.dispatch_pending(&mut self.state)?;
+            if done(&self.state) {
+                return Ok(());
+            }
+            self.queue.flush()?;
+            // `None`: events are queued already
+            let Some(guard) = self.queue.prepare_read() else {
+                continue;
+            };
+            let readable = async {
+                let fd = AsyncFd::with_interest(guard.connection_fd(), Interest::READABLE)?;
+                fd.readable().await.map(drop)
+            };
+            match tokio::time::timeout_at(deadline, readable).await {
+                Ok(readable) => readable?,
+                Err(_) => {
+                    return Err(WlrootsEmulationCreationError::Timeout {
+                        awaited,
+                        after: timeout,
+                    });
+                }
+            }
+            match guard.read() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => {
+                    r?;
+                }
+            }
+        }
+    }
+
+    /// Handles what the compositor sent since the last call (keymap and
+    /// output changes) without blocking.
+    fn read_events(&mut self) -> Result<(), EmulationError> {
+        if let Some(guard) = self.queue.prepare_read() {
+            match guard.read() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                r => {
+                    r?;
+                }
+            }
+        }
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|e| match e {
+                DispatchError::Backend(e) => EmulationError::Wayland(e),
+                e => io::Error::other(e.to_string()).into(),
+            })?;
+        Ok(())
     }
 }
 
@@ -198,6 +281,7 @@ impl Emulation for WlrootsEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        self.read_events()?;
         if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
             if self.last_flush_failed {
                 match self.queue.flush() {
@@ -232,18 +316,7 @@ impl Emulation for WlrootsEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        // pick up output changes without blocking
-        if let Some(guard) = self.queue.prepare_read() {
-            match guard.read() {
-                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
-                r => {
-                    r?;
-                }
-            }
-        }
-        self.queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.read_events()?;
 
         let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
             return Ok(None);
@@ -299,6 +372,9 @@ impl Emulation for WlrootsEmulation {
     }
 
     async fn create(&mut self, handle: EmulationHandle) {
+        if let Err(e) = self.read_events() {
+            log::warn!("{e}");
+        }
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {
             log::error!("{e}");
@@ -402,6 +478,21 @@ delegate_noop!(State: VkManager);
 delegate_noop!(State: XdgOutputManager);
 delegate_noop!(State: ignore WlOutput);
 
+impl Dispatch<WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.synced = true;
+        }
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
         state: &mut State,
@@ -455,7 +546,12 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event {
-            state.keymap = Some((u32::from(format), fd, size));
+            let format = u32::from(format);
+            // keyboards made before the change would type the old layout
+            for input in state.input_for_client.values() {
+                input.keyboard.keymap(format, fd.as_fd(), size);
+            }
+            state.keymap = Some((format, fd, size));
         }
     }
 }
@@ -548,5 +644,146 @@ impl XMods {
 
     fn mask_pressed(&self) -> XMods {
         *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// the globals the backend binds; the seat has no keyboard
+    const GLOBALS: &[(&str, u32)] = &[
+        ("wl_seat", 7),
+        ("zwlr_virtual_pointer_manager_v1", 1),
+        ("zwp_virtual_keyboard_manager_v1", 1),
+        ("zxdg_output_manager_v1", 3),
+    ];
+
+    /// a Wayland message: object, opcode and the encoded arguments
+    fn message(object: u32, opcode: u16, args: &[u8]) -> Vec<u8> {
+        let size = (8 + args.len()) as u32;
+        let mut msg = object.to_ne_bytes().to_vec();
+        msg.extend((size << 16 | u32::from(opcode)).to_ne_bytes());
+        msg.extend(args);
+        msg
+    }
+
+    /// a `wl_registry.global` event
+    fn global(registry: u32, name: u32, interface: &str, version: u32) -> Vec<u8> {
+        let mut args = name.to_ne_bytes().to_vec();
+        // a string: length with the NUL, padded to 4 bytes
+        args.extend((interface.len() as u32 + 1).to_ne_bytes());
+        args.extend(interface.as_bytes());
+        args.resize(args.len() + 4 - interface.len() % 4, 0);
+        args.extend(version.to_ne_bytes());
+        message(registry, 0, &args)
+    }
+
+    /// The compositor end of a fake connection: it announces `GLOBALS` and
+    /// answers `wl_display.sync`, anything else the test sends.
+    struct Compositor {
+        stream: Arc<Mutex<UnixStream>>,
+        /// the client's `wl_registry`
+        registry: Arc<AtomicU32>,
+    }
+
+    impl Compositor {
+        fn start() -> (Connection, Self) {
+            let (client, server) = UnixStream::pair().unwrap();
+            let mut reader = server.try_clone().unwrap();
+            let compositor = Self {
+                stream: Arc::new(Mutex::new(server)),
+                registry: Arc::default(),
+            };
+            let (stream, registry) = (compositor.stream.clone(), compositor.registry.clone());
+            std::thread::spawn(move || {
+                let mut header = [0; 8];
+                // ends when the client hangs up
+                while reader.read_exact(&mut header).is_ok() {
+                    let word = |b: &[u8]| u32::from_ne_bytes(b[..4].try_into().unwrap());
+                    let (object, size_opcode) = (word(&header), word(&header[4..]));
+                    let mut args = vec![0; (size_opcode >> 16) as usize - 8];
+                    if reader.read_exact(&mut args).is_err() {
+                        return;
+                    }
+                    // both requests carry the new object's id first
+                    let id = || word(&args);
+                    let reply = match (object, size_opcode & 0xffff) {
+                        // wl_display.sync: wl_callback.done
+                        (1, 0) => message(id(), 0, &0u32.to_ne_bytes()),
+                        // wl_display.get_registry
+                        (1, 1) => {
+                            registry.store(id(), Ordering::SeqCst);
+                            (1..)
+                                .zip(GLOBALS)
+                                .flat_map(|(name, &(interface, version))| {
+                                    global(id(), name, interface, version)
+                                })
+                                .collect()
+                        }
+                        _ => continue,
+                    };
+                    if stream.lock().unwrap().write_all(&reply).is_err() {
+                        return;
+                    }
+                }
+            });
+            (Connection::from_socket(client).unwrap(), compositor)
+        }
+
+        /// announces a new global
+        fn announce(&self, name: u32, interface: &str, version: u32) {
+            let registry = self.registry.load(Ordering::SeqCst);
+            let event = global(registry, name, interface, version);
+            self.stream.lock().unwrap().write_all(&event).unwrap();
+        }
+    }
+
+    /// a backend bound on `conn`, with a keymap: the fake cannot send one,
+    /// that needs fd passing
+    fn bound(conn: &Connection) -> WlrootsEmulation {
+        let mut emulation = WlrootsEmulation::bind(conn).unwrap();
+        let keymap = std::fs::File::open("/dev/null").unwrap();
+        emulation.state.keymap = Some((1, keymap.into(), 0));
+        emulation
+    }
+
+    /// a backend on a fake compositor without outputs
+    pub(crate) fn on_fake_compositor() -> WlrootsEmulation {
+        bound(&Compositor::start().0)
+    }
+
+    #[tokio::test]
+    async fn a_seat_without_keyboard_fails_in_time() {
+        let (conn, _compositor) = Compositor::start();
+        let result = WlrootsEmulation::start(conn, Duration::from_millis(200)).await;
+        assert!(matches!(
+            result,
+            Err(WlrootsEmulationCreationError::Timeout {
+                awaited: "keymap",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compositor_changes_arrive_with_input() {
+        let (conn, compositor) = Compositor::start();
+        let mut emulation = bound(&conn);
+        emulation.create(1).await;
+        assert!(emulation.state.outputs.is_empty());
+
+        // a monitor plugged in while a peer only sends input, no `enter_at`
+        compositor.announce(GLOBALS.len() as u32 + 1, "wl_output", 4);
+        let motion = PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 0.,
+        };
+        emulation.consume(Event::Pointer(motion), 1).await.unwrap();
+        assert_eq!(emulation.state.outputs.len(), 1);
     }
 }
