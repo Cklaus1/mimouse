@@ -17,9 +17,10 @@ use std::{
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{net::TcpStream, process::Command, time::timeout};
+use tokio::{net::TcpStream, time::timeout};
 
 use crate::config::Config;
+use crate::doctor::{COMMAND_TIMEOUT, CommandError, run_command};
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -32,8 +33,8 @@ pub enum DiscoverError {
     NotInstalled,
     #[error("`tailscale status --json` failed: {0}")]
     Failed(String),
-    #[error("could not run tailscale: {0}")]
-    Io(#[from] io::Error),
+    #[error(transparent)]
+    Command(#[from] CommandError),
     #[error("unexpected `tailscale status --json` output: {0}")]
     Parse(#[from] serde_json::Error),
 }
@@ -206,9 +207,11 @@ async fn tailscale_status() -> Result<String, DiscoverError> {
     const BINARIES: &[&str] = &["tailscale"];
 
     for bin in BINARIES {
-        let output = match Command::new(bin).args(["status", "--json"]).output().await {
+        let output = match run_command(bin, &["status", "--json"], COMMAND_TIMEOUT).await {
             Ok(output) => output,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(CommandError::Spawn { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         if !output.status.success() {

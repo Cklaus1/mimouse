@@ -581,15 +581,14 @@ fn peer_fingerprint(certs: Option<&[CertificateDer<'static>]>) -> Result<String,
 }
 
 /// this machine's name as the peer should know it
-fn local_name() -> String {
+async fn local_name() -> String {
     #[cfg(windows)]
     let name = std::env::var("COMPUTERNAME").ok();
     #[cfg(target_os = "linux")]
     let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
     #[cfg(not(any(windows, target_os = "linux")))]
-    let name = std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
+    let name = crate::doctor::run_command("hostname", &["-s"], crate::doctor::COMMAND_TIMEOUT)
+        .await
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
     name.map(|n| n.trim().to_owned())
@@ -629,7 +628,7 @@ async fn initiate(
 
     let nonce = random_nonce()?;
     let hello = Frame::Hello {
-        name: local_name(),
+        name: local_name().await,
         port,
         position: target.position,
         commitment: commitment(&nonce),
@@ -726,7 +725,7 @@ async fn respond(
     };
     let nonce = random_nonce()?;
     let welcome = Frame::Welcome {
-        name: local_name(),
+        name: local_name().await,
         nonce,
     };
     write_frame(&mut w, &welcome).await?;
@@ -823,7 +822,7 @@ where
                     confirmed = true;
                 }
                 _ => {
-                    let reason = format!("the code was rejected on {}", local_name());
+                    let reason = format!("the code was rejected on {}", local_name().await);
                     let _ = write_frame(w, &Frame::Cancel { reason }).await;
                     return Err(PairError::Cancelled);
                 }
