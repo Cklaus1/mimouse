@@ -1,7 +1,7 @@
 class Mimouse < Formula
   desc "Software KVM switch: share one mouse and keyboard between computers on a LAN"
   homepage "https://github.com/Cklaus1/mimouse"
-  url "https://github.com/Cklaus1/mimouse/archive/refs/tags/v0.11.0.tar.gz"
+  url "https://github.com/Cklaus1/mimouse/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "@SHA256_SOURCE_TARBALL@"
   license "GPL-3.0-or-later"
   head "https://github.com/Cklaus1/mimouse.git", branch: "main"
