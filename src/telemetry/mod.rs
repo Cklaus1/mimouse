@@ -395,15 +395,17 @@ impl Task {
     /// turns telemetry on (install id, persisted state, crash records of
     /// earlier runs) or off (all of it deleted, the collector asked to
     /// delete the install's rows). At the start, `off` also purges what a
-    /// stopped service left behind
+    /// stopped service left behind, and so does turning off a setting that
+    /// was on but never active (no endpoint)
     async fn configure(&mut self, settings: Settings, start: bool) {
-        let active = {
+        let (active, was_enabled) = {
             let mut shared = self.shared.borrow_mut();
+            let was_enabled = shared.settings.enabled;
             shared.settings = settings.clone();
             if !settings.enabled {
                 shared.error = None;
             }
-            shared.active
+            (shared.active, was_enabled)
         };
         match (settings.enabled, active) {
             (true, false) => match &settings.endpoint {
@@ -414,7 +416,7 @@ impl Task {
                 }
             },
             (false, true) => self.turn_off(&settings).await,
-            (false, false) if start => self.turn_off(&settings).await,
+            (false, false) if start || was_enabled => self.turn_off(&settings).await,
             _ => {}
         }
     }

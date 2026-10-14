@@ -465,6 +465,40 @@ async fn turning_off_deletes_everything_and_asks_the_collector_to_forget() {
         .await;
 }
 
+/// a run that had telemetry on but no endpoint (e.g. a source build after a
+/// release build) still forgets the earlier install when turned off
+#[tokio::test(start_paused = true)]
+async fn turning_off_while_waiting_for_an_endpoint_deletes_the_earlier_install() {
+    let fx = fixture!("off-inactive");
+    fx.recorder.answer(204);
+    LocalSet::new()
+        .run_until(async {
+            let telemetry = fx.start(on());
+            settle().await;
+            let id = telemetry.status().install_id.unwrap();
+            telemetry.shutdown().await;
+
+            let no_endpoint = Settings {
+                enabled: true,
+                endpoint: endpoint_from(None, Some("")),
+            };
+            let telemetry = fx.start(no_endpoint);
+            settle().await;
+            assert_eq!(telemetry.status().install_id, None);
+            telemetry.apply(off()).await.unwrap();
+            settle().await;
+            assert!(!fx.id_file().exists());
+            assert!(!fx.state_file().exists());
+            let last = fx.recorder.sent.borrow().last().cloned().unwrap();
+            assert_eq!(last.1.method, "DELETE");
+            assert_eq!(last.1.route, format!("/v1/installs/{id}"));
+
+            telemetry.apply(on()).await.unwrap();
+            assert_ne!(telemetry.status().install_id.unwrap(), id);
+        })
+        .await;
+}
+
 const CRASH_DIR: &str = "MIMOUSE_TEST_CRASH_DIR";
 const CRASH_ON: &str = "MIMOUSE_TEST_CRASH_ON";
 const SECRET_HOST: &str = "secret-host.example";
