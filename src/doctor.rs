@@ -220,6 +220,25 @@ fn key_check(path: &Path) -> Check {
     }
 }
 
+/// the config file, and while it is invalid, the last good copy the service
+/// runs on instead
+fn config_check(path: &Path) -> Check {
+    const NAME: &str = "config";
+    let Err(e) = config::check_file(path) else {
+        return Check::pass(NAME, format!("{} parses", path.display()));
+    };
+    let last_good = config::last_good_path(path);
+    let fix = match config::check_file(&last_good) {
+        Ok(()) => format!(
+            "fix the file or restore the last good copy {}: `{}`; until then the service runs on that copy and refuses to save changes",
+            last_good.display(),
+            config::restore_command(path)
+        ),
+        Err(_) => "fix the file; until then the service runs on defaults and refuses to save changes (no last good copy)".into(),
+    };
+    Check::fail(NAME, format!("{}: {e}", path.display()), fix)
+}
+
 /// firewall state for the MiMouse port: UDP (input) and TCP (clipboard, pairing)
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Firewall {
@@ -1024,15 +1043,7 @@ pub async fn checks(config: &Config) -> Vec<Check> {
     }
     let state = state.ok();
 
-    let path = config.config_path();
-    match config::check_file(path) {
-        Ok(()) => checks.push(Check::pass("config", format!("{} parses", path.display()))),
-        Err(e) => checks.push(Check::fail(
-            "config",
-            format!("{}: {e}", path.display()),
-            "fix the file; the service ignores it while it does not parse",
-        )),
-    }
+    checks.push(config_check(config.config_path()));
 
     checks.push(key_check(config.cert_path()));
 
@@ -1334,5 +1345,28 @@ Ok.
             status_check("capture", "disabled", "enable-capture").status,
             Outcome::Fail
         );
+    }
+
+    #[test]
+    fn invalid_config_names_the_last_good_copy() {
+        let dir = std::env::temp_dir().join(format!("mimouse-doctor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let last_good = config::last_good_path(&path);
+
+        std::fs::write(&path, "port = 4242\n").unwrap();
+        assert_eq!(config_check(&path).status, Outcome::Pass);
+
+        std::fs::write(&path, "[[clients]]\nrange = [80, 20]\n").unwrap();
+        let check = config_check(&path);
+        assert_eq!(check.status, Outcome::Fail);
+        assert!(check.detail.contains("invalid range"), "{}", check.detail);
+        assert!(check.fix.unwrap().contains("no last good copy"));
+
+        std::fs::write(&last_good, "port = 4242\n").unwrap();
+        let fix = config_check(&path).fix.unwrap();
+        assert!(fix.contains(&config::restore_command(&path)), "{fix}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

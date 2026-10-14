@@ -99,6 +99,8 @@ pub struct Service {
     inhibit: IdleInhibit,
     /// pairing with other machines (`mimouse cli pair`)
     pairing: Pairing,
+    /// a save merged changes from the file that the runtime has yet to apply
+    config_reload: bool,
 }
 
 #[derive(Debug)]
@@ -186,6 +188,7 @@ impl Service {
             notifier,
             inhibit,
             pairing,
+            config_reload: false,
         };
         Ok(service)
     }
@@ -206,13 +209,13 @@ impl Service {
 
         loop {
             tokio::select! {
-                event = self.frontend_listener.next() => self.handle_ipc_event(event),
+                event = self.frontend_listener.next() => self.handle_ipc_event(event).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.clipboard.event() => self.handle_clipboard_event(event),
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
-                event = self.pairing.event() => self.handle_pair_event(event),
+                event = self.pairing.event() => self.handle_pair_event(event).await,
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -231,7 +234,7 @@ impl Service {
         Ok(())
     }
 
-    fn handle_ipc_event(&mut self, event: IpcEvent) {
+    async fn handle_ipc_event(&mut self, event: IpcEvent) {
         match event {
             IpcEvent::Connected(conn) => {
                 for event in self.sync_events() {
@@ -267,18 +270,21 @@ impl Service {
                     }
                     return;
                 }
-                let result = self.handle_request(&request);
+                let result = self.handle_request(&request).await;
                 if !request.is_read_only() {
                     let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
                     self.audit.record(&peer, &request, &outcome);
                 }
                 self.reply(conn, seq, result);
+                self.reload_if_merged();
             }
         }
     }
 
-    /// apply a request; events it causes are queued before its reply
-    fn handle_request(&mut self, request: &FrontendRequest) -> Result<Reply, String> {
+    /// apply a request; events it causes are queued before its reply.
+    /// Requests that change the config apply to the runtime only once it is
+    /// saved, so a failed save changes nothing
+    async fn handle_request(&mut self, request: &FrontendRequest) -> Result<Reply, String> {
         if let Some(handle) = request.client() {
             if self.client_manager.get_state(handle).is_none() {
                 return Err(format!("no such client: {handle}"));
@@ -291,53 +297,72 @@ impl Service {
                 ips,
                 enter_hook,
             } => {
+                // the handle (and the client's place in the saved list) is
+                // known only once added: rolled back if the save fails
                 let handle = self.add_client();
                 self.update_hostname(handle, hostname);
                 self.update_port(handle, port);
                 self.update_fix_ips(handle, ips);
                 self.update_enter_hook(handle, enter_hook);
-                self.save_config()?;
+                if let Err(e) = self.save_config().await {
+                    self.remove_client(handle);
+                    return Err(e);
+                }
                 self.client_reply(handle)
             }
             FrontendRequest::RemoveClient { id } => {
+                self.save_clients(|c| c.retain(|(h, _)| *h != id)).await?;
                 self.remove_client(id);
-                self.save_config()?;
                 Reply::Done
             }
             FrontendRequest::Activate { id } => {
+                self.save_clients(|c| plan_activate(c, id)).await?;
                 self.activate_client(id);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::Deactivate { id } => {
+                self.save_clients(|c| plan(c, id, |c| c.active = false))
+                    .await?;
                 self.deactivate_client(id);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::List => Reply::Clients(self.client_infos()),
             FrontendRequest::SetHost { id, hostname } => {
+                let name = hostname.clone();
+                self.save_clients(|c| plan(c, id, |c| c.hostname = name))
+                    .await?;
                 self.update_hostname(id, hostname);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::SetPort { id, port } => {
+                self.save_clients(|c| plan(c, id, |c| c.port = port))
+                    .await?;
                 self.update_port(id, port);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::SetPosition { id, position } => {
+                self.save_clients(|c| {
+                    plan(c, id, |c| c.pos = position);
+                    // `update_pos` re-activates an active client at its new place
+                    if c.iter().any(|(h, c)| *h == id && c.active) {
+                        plan_activate(c, id);
+                    }
+                })
+                .await?;
                 self.update_pos(id, position);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::SetIps { id, ips } => {
+                let set = ips.iter().copied().collect();
+                self.save_clients(|c| plan(c, id, |c| c.ips = set)).await?;
                 self.update_fix_ips(id, ips);
-                self.save_config()?;
                 self.client_reply(id)
             }
             FrontendRequest::SetEnterHook { id, enter_hook } => {
+                let hook = enter_hook.clone();
+                self.save_clients(|c| plan(c, id, |c| c.enter_hook = hook))
+                    .await?;
                 self.update_enter_hook(id, enter_hook);
-                self.save_config()?;
                 self.client_reply(id)
             }
             // a different port and focus are handled in `handle_ipc_event`
@@ -354,19 +379,30 @@ impl Service {
                 description,
                 fingerprint,
             } => {
-                self.add_authorized_key(description, fingerprint);
-                self.save_config()?;
+                let clients = self.config_clients();
+                self.config_reload |=
+                    change_keys(&mut self.config, &self.authorized_keys, clients, |keys| {
+                        keys.insert(fingerprint, description);
+                        Ok(())
+                    })
+                    .await?;
+                self.notify_keys();
                 Reply::Done
             }
             FrontendRequest::RemoveAuthorizedKey { fingerprint } => {
-                if !self.remove_authorized_key(&fingerprint) {
-                    return Err(format!("no such authorized key: {fingerprint}"));
-                }
-                self.save_config()?;
+                let clients = self.config_clients();
+                self.config_reload |=
+                    change_keys(&mut self.config, &self.authorized_keys, clients, |keys| {
+                        keys.remove(&fingerprint)
+                            .map(|_| ())
+                            .ok_or_else(|| format!("no such authorized key: {fingerprint}"))
+                    })
+                    .await?;
+                self.notify_keys();
                 Reply::Done
             }
             FrontendRequest::SaveConfig => {
-                self.save_config()?;
+                self.save_config().await?;
                 Reply::Done
             }
             FrontendRequest::Pair {
@@ -429,28 +465,50 @@ impl Service {
             .unwrap_or(Reply::Done)
     }
 
-    fn save_config(&mut self) -> Result<(), String> {
-        let clients = self.client_manager.clients();
-        let clients = clients
+    /// the clients as the config stores them, with their handles
+    fn config_clients(&self) -> Vec<(ClientHandle, ConfigClient)> {
+        self.client_manager
+            .get_client_states()
             .into_iter()
-            .map(|(c, s)| ConfigClient {
-                ips: HashSet::from_iter(c.fix_ips),
-                hostname: c.hostname,
-                port: c.port,
-                pos: c.pos,
-                active: s.active,
-                enter_hook: c.cmd,
-                range: c.range,
-                hotkey: c.hotkey,
+            .map(|(h, c, s)| {
+                let client = ConfigClient {
+                    ips: HashSet::from_iter(c.fix_ips),
+                    hostname: c.hostname,
+                    port: c.port,
+                    pos: c.pos,
+                    active: s.active,
+                    enter_hook: c.cmd,
+                    range: c.range,
+                    hotkey: c.hotkey,
+                };
+                (h, client)
             })
-            .collect();
-        self.config.set_clients(clients);
-        let authorized_keys = self.authorized_keys.read().expect("lock").clone();
-        self.config.set_authorized_keys(authorized_keys);
-        self.config.write_back().map_err(|e| {
-            log::warn!("failed to write config: {e}");
-            format!("failed to write config: {e}")
-        })
+            .collect()
+    }
+
+    /// saves the runtime state as it is
+    async fn save_config(&mut self) -> Result<(), String> {
+        self.save_clients(|_| {}).await
+    }
+
+    /// saves the config with `change` applied to the client list; the
+    /// caller applies the same change to the runtime once this succeeded
+    async fn save_clients(
+        &mut self,
+        change: impl FnOnce(&mut Vec<(ClientHandle, ConfigClient)>),
+    ) -> Result<(), String> {
+        let mut clients = self.config_clients();
+        change(&mut clients);
+        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.config_reload |= save(&mut self.config, clients, keys).await?;
+        Ok(())
+    }
+
+    /// a save merged changes from the file the runtime lacks: apply them
+    fn reload_if_merged(&mut self) {
+        if std::mem::take(&mut self.config_reload) {
+            self.handle_config_change();
+        }
     }
 
     fn handle_config_change(&mut self) {
@@ -565,7 +623,7 @@ impl Service {
         });
     }
 
-    fn handle_pair_event(&mut self, event: PairEvent) {
+    async fn handle_pair_event(&mut self, event: PairEvent) {
         let event = match event {
             PairEvent::Code {
                 code,
@@ -581,21 +639,20 @@ impl Service {
                     position,
                 }
             }
-            PairEvent::Trusted(trusted) => match self.paired(trusted) {
-                Ok(event) => event,
-                Err(reason) => FrontendEvent::PairFailed { reason },
-            },
+            PairEvent::Trusted(trusted) => self.paired(trusted).await,
             PairEvent::Failed(reason) => {
                 log::warn!("pairing failed: {reason}");
                 FrontendEvent::PairFailed { reason }
             }
         };
         self.notify_frontend(event);
+        self.reload_if_merged();
     }
 
     /// trust a paired machine and configure it as a client, reusing a client
-    /// with the same host name or address
-    fn paired(&mut self, peer: pair::Trusted) -> Result<FrontendEvent, String> {
+    /// with the same host name or address. The peer already trusts this
+    /// machine, so a failed save keeps the pairing live and reports it unsaved
+    async fn paired(&mut self, peer: pair::Trusted) -> FrontendEvent {
         log::info!(
             "paired with {} ({}), fingerprint {}",
             peer.name,
@@ -632,12 +689,19 @@ impl Service {
         self.update_fix_ips(handle, ips);
         self.update_pos(handle, peer.position);
         self.activate_client(handle);
-        self.save_config()?;
-        Ok(FrontendEvent::Paired {
+        let not_saved = self.save_config().await.err();
+        if let Some(e) = &not_saved {
+            log::warn!(
+                "paired with {}, but the config was not saved ({e}); fix it, then run `mimouse cli save-config`",
+                peer.name
+            );
+        }
+        FrontendEvent::Paired {
             id: handle,
             peer: peer.name,
             fingerprint: peer.fingerprint,
-        })
+            not_saved,
+        }
     }
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
@@ -898,24 +962,12 @@ impl Service {
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
         self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedKeys { keys });
+        self.notify_keys();
     }
 
-    /// false if `fp` was not authorized
-    fn remove_authorized_key(&mut self, fp: &str) -> bool {
-        if self
-            .authorized_keys
-            .write()
-            .expect("lock")
-            .remove(fp)
-            .is_none()
-        {
-            return false;
-        }
+    fn notify_keys(&mut self) {
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedKeys { keys });
-        true
     }
 
     fn add_client(&mut self) -> ClientHandle {
@@ -1109,6 +1161,60 @@ impl Service {
     }
 }
 
+/// `Config::save` with the error logged and worded for the CLI
+async fn save(
+    config: &mut Config,
+    clients: Vec<(ClientHandle, ConfigClient)>,
+    keys: HashMap<String, String>,
+) -> Result<bool, String> {
+    let clients = clients.into_iter().map(|(_, c)| c).collect();
+    config.save(clients, keys).await.map_err(|e| {
+        log::warn!("failed to write config: {e}");
+        format!("failed to write config: {e}")
+    })
+}
+
+/// saves the authorized keys as `change` leaves them, then puts them in
+/// effect: a failed save leaves `authorized` untouched
+async fn change_keys(
+    config: &mut Config,
+    authorized: &RwLock<HashMap<String, String>>,
+    clients: Vec<(ClientHandle, ConfigClient)>,
+    change: impl FnOnce(&mut HashMap<String, String>) -> Result<(), String>,
+) -> Result<bool, String> {
+    let mut keys = authorized.read().expect("lock").clone();
+    change(&mut keys)?;
+    let reload = save(config, clients, keys.clone()).await?;
+    *authorized.write().expect("lock") = keys;
+    Ok(reload)
+}
+
+/// `change` applied to the planned config of client `id`
+fn plan(
+    clients: &mut [(ClientHandle, ConfigClient)],
+    id: ClientHandle,
+    change: impl FnOnce(&mut ConfigClient),
+) {
+    if let Some((_, c)) = clients.iter_mut().find(|(h, _)| *h == id) {
+        change(c);
+    }
+}
+
+/// `id` active, as `Service::activate_client` leaves it: another active
+/// client at its position is deactivated
+fn plan_activate(clients: &mut [(ClientHandle, ConfigClient)], id: ClientHandle) {
+    let Some(pos) = clients.iter().find(|(h, _)| *h == id).map(|(_, c)| c.pos) else {
+        return;
+    };
+    for (h, c) in clients {
+        if *h == id {
+            c.active = true;
+        } else if c.pos == pos {
+            c.active = false;
+        }
+    }
+}
+
 /// where to push the local pointer to cross the barrier at `pos`: that edge
 /// of this desktop, in the middle of `range` (`None`: the whole edge)
 fn push_target(pos: input_capture::Position, range: Option<EdgeRange>) -> (Edge, u16) {
@@ -1140,5 +1246,67 @@ mod tests {
             push_target(Position::Bottom, EdgeRange::new(100 - 1, 100)),
             (Edge::Bottom, 65207)
         );
+    }
+
+    fn client(pos: Position, active: bool) -> ConfigClient {
+        ConfigClient {
+            ips: HashSet::new(),
+            hostname: None,
+            port: crate::ipc::DEFAULT_PORT,
+            pos,
+            active,
+            enter_hook: None,
+            range: None,
+            hotkey: None,
+        }
+    }
+
+    #[test]
+    fn activating_deactivates_the_other_client_at_that_position() {
+        let mut clients = vec![
+            (0, client(Position::Left, true)),
+            (2, client(Position::Left, false)),
+            (3, client(Position::Right, true)),
+        ];
+        plan_activate(&mut clients, 2);
+        let active: Vec<_> = clients.iter().map(|(_, c)| c.active).collect();
+        assert_eq!(active, [false, true, true]);
+    }
+
+    /// B7: a failed save leaves the key untrusted; once the file is
+    /// writable again the same request succeeds
+    #[tokio::test]
+    async fn authorize_key_applies_only_after_the_save() {
+        let dir = std::env::temp_dir().join(format!("mimouse-authorize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "port = 4242\n").unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let authorized = RwLock::new(config.authorized_fingerprints());
+        let set_readonly = |readonly| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        let authorize = |keys: &mut HashMap<String, String>| {
+            keys.insert("aa:bb".into(), "laptop".into());
+            Ok(())
+        };
+
+        set_readonly(true);
+        let failed = change_keys(&mut config, &authorized, vec![], authorize).await;
+        assert!(failed.unwrap_err().contains("read-only"));
+        assert!(authorized.read().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port = 4242\n");
+
+        set_readonly(false);
+        change_keys(&mut config, &authorized, vec![], authorize)
+            .await
+            .unwrap();
+        assert_eq!(authorized.read().unwrap()["aa:bb"], "laptop");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"aa:bb\" = \"laptop\""), "{saved}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -325,11 +325,14 @@ async fn pair(
                         }
                         asking = Some(code.clone());
                     }
-                    FrontendEvent::Paired { id, peer, .. } => {
+                    FrontendEvent::Paired { id, peer, not_saved, .. } => {
                         if json {
                             println!("{}", to_json(&event));
                         } else {
                             println!("paired with {peer}; it is client {id} (`mimouse cli list`)");
+                        }
+                        if let Some(e) = not_saved {
+                            eprintln!("paired, not saved: {e}; fix the config, then run `mimouse cli save-config`");
                         }
                         return Ok(());
                     }
@@ -481,7 +484,14 @@ fn print_event(event: &FrontendEvent) {
             id,
             peer,
             fingerprint,
+            not_saved: None,
         } => println!("paired with {peer} ({fingerprint}): client {id}"),
+        FrontendEvent::Paired {
+            id,
+            peer,
+            fingerprint,
+            not_saved: Some(e),
+        } => println!("paired with {peer} ({fingerprint}): client {id}; not saved: {e}"),
         FrontendEvent::PairFailed { reason } => println!("pairing failed: {reason}"),
     }
 }
