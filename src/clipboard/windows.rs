@@ -2,8 +2,9 @@
 //!
 //! A monitor thread receives `WM_CLIPBOARDUPDATE` and reads text
 //! (`CF_UNICODETEXT`), HTML (`HTML Format`), images (`PNG`, falling back to
-//! `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`). A writer
-//! thread sets remote contents.
+//! `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`), skipping
+//! copies marked secret and reporting an empty clipboard as a clear. A
+//! writer thread sets remote contents.
 //! Our own writes are recognized by their clipboard sequence number.
 
 use std::{
@@ -23,8 +24,8 @@ use image::ImageFormat;
 use tokio::sync::mpsc;
 
 use super::{
-    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT,
-    files::local_files,
+    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT, Offer,
+    WIN_MARKERS, files::local_files,
 };
 
 const OPEN_ATTEMPTS: usize = 20;
@@ -67,8 +68,9 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         Ok(m) => m,
         Err(e) => return log::warn!("clipboard: failed to monitor clipboard: {e}"),
     };
-    // returns false once the receiving end is gone
-    let report = || {
+    // returns false once the receiving end is gone; a clipboard that is
+    // empty at startup was not cleared by anyone
+    let report = |startup: bool| {
         let own = own_seq.lock().expect("lock");
         if *own == seq_num() {
             return true;
@@ -76,15 +78,15 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         let data = read_settled();
         drop(own);
         match data {
-            Ok(data) if data.is_empty() => true,
-            Ok(data) => changes.send(Arc::new(data)).is_ok(),
+            Ok(Some(data)) if !(startup && data.is_empty()) => changes.send(Arc::new(data)).is_ok(),
+            Ok(_) => true,
             Err(e) => {
                 log::warn!("clipboard: failed to read clipboard: {e}");
                 true
             }
         }
     };
-    if !report() {
+    if !report(true) {
         return;
     }
     loop {
@@ -96,7 +98,7 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         if let Err(e) = settle(&mut monitor) {
             return log::warn!("clipboard: monitor failed: {e}");
         }
-        if !report() {
+        if !report(false) {
             return;
         }
     }
@@ -118,7 +120,7 @@ fn settle(monitor: &mut Monitor) -> SysResult<()> {
     Ok(())
 }
 
-fn read_settled() -> SysResult<ClipboardData> {
+fn read_settled() -> SysResult<Option<ClipboardData>> {
     let mut attempts = READ_ATTEMPTS;
     loop {
         match read() {
@@ -132,12 +134,24 @@ fn read_settled() -> SysResult<ClipboardData> {
     }
 }
 
-fn read() -> SysResult<ClipboardData> {
+/// the update to report: empty if the clipboard was cleared, `None` for
+/// secret copies and copies without a supported format
+fn read() -> SysResult<Option<ClipboardData>> {
     let mut data = ClipboardData::default();
     let mut bitmap = None;
     let mut paths: Vec<String> = Vec::new();
     {
         let _clipboard = open()?;
+        // `None` (the count failed) is not taken for a clear
+        let count = raw::count_formats().unwrap_or(usize::MAX);
+        match Offer::from_windows_formats(count, &markers()) {
+            Offer::Nothing => return Ok(Some(data)),
+            Offer::Secret => {
+                log::debug!("clipboard: not sending a copy marked secret");
+                return Ok(None);
+            }
+            Offer::Formats => {}
+        }
         if raw::is_format_avail(CF_UNICODETEXT) {
             let mut text = String::new();
             Unicode.read_clipboard(&mut text)?;
@@ -173,11 +187,32 @@ fn read() -> SysResult<ClipboardData> {
     }
     if data.size() > MAX_CLIPBOARD_SIZE {
         log::warn!("clipboard: contents too large ({} bytes)", data.size());
-        return Ok(ClipboardData::default());
+        return Ok(None);
     }
     // stat outside the clipboard lock: paths may be on slow network shares
     data.set_files(local_files(paths.into_iter().map(Into::into).collect()));
-    Ok(data)
+    // no supported format: nothing to send, and not a clear
+    Ok((!data.is_empty()).then_some(data))
+}
+
+/// the password manager marker formats on the (open) clipboard with their
+/// contents; a marker that cannot be read counts with empty contents
+fn markers() -> Vec<(&'static str, Vec<u8>)> {
+    WIN_MARKERS
+        .into_iter()
+        .filter_map(|name| {
+            let format = raw::register_format(name)?.get();
+            if !raw::is_format_avail(format) {
+                return None;
+            }
+            let mut value = Vec::new();
+            if let Err(e) = RawData(format).read_clipboard(&mut value) {
+                log::debug!("clipboard: cannot read {name}: {e}");
+                value.clear();
+            }
+            Some((name, value))
+        })
+        .collect()
 }
 
 fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mutex<u32>>) {

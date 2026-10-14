@@ -7,6 +7,9 @@
 //!
 //! Copied files are read from and offered as `text/uri-list` and
 //! `x-special/gnome-copied-files` (Nautilus).
+//!
+//! Copies offering `x-kde-passwordManagerHint` are secret and never read; an
+//! owner change without mime types is a clear.
 
 use std::{
     borrow::Cow,
@@ -41,6 +44,7 @@ use tokio::{
 
 use super::{
     BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML, MIME_PNG, MIME_TEXT,
+    Offer,
     files::{FileRef, cache_dir, local_files},
 };
 
@@ -178,14 +182,29 @@ async fn session(
                     continue;
                 }
                 *owned = None;
-                match read_selection(&clipboard, &session, event.mime_types()).await {
-                    Ok(data) if !data.is_empty() => {
+                let mime_types = event.mime_types();
+                let update = match Offer::from_mime_types(mime_types) {
+                    Offer::Nothing => Ok(Some(ClipboardData::default())),
+                    Offer::Secret => {
+                        log::debug!("clipboard portal: not sending a copy marked secret");
+                        Ok(None)
+                    }
+                    Offer::Formats => read_selection(&clipboard, &session, mime_types)
+                        .await
+                        .map(|data| {
+                            if data.is_empty() {
+                                log::debug!(
+                                    "clipboard portal: no supported format in {mime_types:?}"
+                                );
+                            }
+                            (!data.is_empty()).then_some(data)
+                        }),
+                };
+                match update {
+                    Ok(Some(data)) => {
                         let _ = changes.send(Arc::new(data));
                     }
-                    Ok(_) => log::debug!(
-                        "clipboard portal: no supported format in {:?}",
-                        event.mime_types()
-                    ),
+                    Ok(None) => {}
                     Err(e) => log::warn!("clipboard portal: failed to read clipboard: {e}"),
                 }
             }
@@ -220,6 +239,9 @@ async fn session(
 
 /// the data to serve for a requested mime type
 fn lookup<'a>(data: &'a ClipboardData, mime: &str) -> Option<Cow<'a, [u8]>> {
+    if data.is_empty() {
+        return TEXT_MIMES.contains(&mime).then_some(Cow::Borrowed(&[]));
+    }
     if !data.files().is_empty() {
         match mime {
             MIME_FILES => return Some(Cow::Owned(uri_list(data.files()))),
@@ -239,11 +261,17 @@ async fn set_selection(
     session: &Session<RemoteDesktop>,
     data: &ClipboardData,
 ) -> Result<(), PortalError> {
-    let mut mimes: Vec<&str> = FORMATS
-        .iter()
-        .filter(|(canonical, _)| data.get(canonical).is_some())
-        .flat_map(|(_, mimes)| mimes.iter().copied())
-        .collect();
+    // a clear is set as empty text: when the selection is unset instead,
+    // mutter's clipboard manager restores the previous contents
+    let mut mimes: Vec<&str> = if data.is_empty() {
+        TEXT_MIMES.to_vec()
+    } else {
+        FORMATS
+            .iter()
+            .filter(|(canonical, _)| data.get(canonical).is_some())
+            .flat_map(|(_, mimes)| mimes.iter().copied())
+            .collect()
+    };
     if !data.files().is_empty() {
         mimes.extend([MIME_FILES, GNOME_FILES]);
     }

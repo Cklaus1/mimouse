@@ -7,7 +7,8 @@
 //! Names are UTF-8 base names (see [`valid_name`]).
 //!
 //! Updates without files are sent as v1, so older MiMouse peers keep
-//! receiving text and images.
+//! receiving text and images. A clear is a v1 update without items, which
+//! older MiMouse peers also decode as an empty clipboard.
 
 use std::{fs::File, io::Read};
 
@@ -180,6 +181,13 @@ mod tests {
         // no files: readable by MiMouse peers that only know v1
         assert_eq!(encoded[4], V1);
         assert_eq!(decoded(&encoded), Some((data, vec![])));
+    }
+
+    #[test]
+    fn clear_is_an_empty_v1_update() {
+        let encoded = encode(&ClipboardData::default(), MAX).unwrap();
+        assert_eq!(encoded, b"LMCB\x01\x00");
+        assert_eq!(decoded(&encoded), Some((ClipboardData::default(), vec![])));
     }
 
     #[test]
