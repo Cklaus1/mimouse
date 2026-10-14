@@ -51,4 +51,6 @@ Stop condition
 - [x] Implementation review + fixes
 
 Review (2026-10-14): 7 reviewers, 17 findings, fixed as 14 nodes R-1..R-14 (R-1 docs, R-2 telemetry off purge, R-3/R-4/R-5 clipboard portal + B21, R-6..R-9 config/IPC, R-10 Windows end session, R-11/R-12 wlroots, R-13 the four doc findings, R-14 clipboard TOFU after ACK). Gates green at 02c8043 (220 + 43 + 23 + 3 tests, clippy -D warnings on 3 targets, deny). Smoke at 4eb23c1: crossing megapc -> gpumaster and back, B21 6/6, R-10 three messages.
-- [ ] Final smoke, end-of-run report
+- [x] Final smoke, end-of-run report
+
+Final (2026-10-14 20:47-20:49): the merged tree gated at 02c8043 is the deployed 1.0.0 (linux da53b227, win 75eff093). Only tasks/AGENTS/CHANGELOG changed after it. The crossing smoke and R-10 smoke passed, and `git status --ignored` lists only known build dirs. All v1/* branches are merged, and the 15 track worktrees are removed. Open items: needs-human N1-N5 (tasks/public-release.md).
