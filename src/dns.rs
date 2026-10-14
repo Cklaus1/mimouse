@@ -36,6 +36,14 @@ impl DnsRequester {
     }
 }
 
+#[cfg(test)]
+impl DnsRequester {
+    /// a requester whose requests go nowhere
+    pub(crate) fn detached() -> Self {
+        Self(channel().0)
+    }
+}
+
 struct DnsTask {
     resolver: TokioResolver,
     request_rx: Receiver<DnsRequest>,
@@ -64,11 +72,6 @@ impl DnsResolver {
             event_rx,
             request_tx,
         })
-    }
-
-    pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
-        let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
     }
 
     pub(crate) fn requester(&self) -> DnsRequester {

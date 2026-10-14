@@ -271,6 +271,7 @@ struct Delivered {
 
 enum Request {
     ClientEntered(ClientHandle),
+    ClientRemoved(ClientHandle),
     PortChanged(u16),
 }
 
@@ -375,6 +376,13 @@ impl Clipboard {
     pub(crate) fn client_entered(&self, handle: ClientHandle) {
         if let Some(tx) = &self.request_tx {
             let _ = tx.send(Request::ClientEntered(handle));
+        }
+    }
+
+    /// the given client was removed: its delivery state is forgotten
+    pub(crate) fn client_removed(&self, handle: ClientHandle) {
+        if let Some(tx) = &self.request_tx {
+            let _ = tx.send(Request::ClientRemoved(handle));
         }
     }
 
@@ -521,7 +529,7 @@ async fn listen_only(
                 listener.abort();
                 listener = listen(port);
             }
-            Request::PortChanged(_) | Request::ClientEntered(_) => {}
+            Request::PortChanged(_) | Request::ClientEntered(_) | Request::ClientRemoved(_) => {}
         }
     }
     listener.abort();
@@ -564,6 +572,7 @@ impl ClipboardTask {
                 request = requests.recv() => match request {
                     None => break,
                     Some(Request::ClientEntered(handle)) => self.update_if_stale(handle),
+                    Some(Request::ClientRemoved(handle)) => self.forget(handle),
                     Some(Request::PortChanged(p)) if p != port => {
                         port = p;
                         listener.abort();
@@ -691,6 +700,12 @@ impl ClipboardTask {
         if !self.seeded && self.delivered.get(&handle) != Some(digest) {
             self.update(handle);
         }
+    }
+
+    /// drops what is known about a removed client; its sender ends
+    fn forget(&mut self, handle: ClientHandle) {
+        self.delivered.remove(&handle);
+        self.senders.remove(&handle);
     }
 
     fn update(&mut self, handle: ClientHandle) {
@@ -976,6 +991,31 @@ mod tests {
                 let again = LocalChange::read(Some(Instant::now()), Some((*text("old")).clone()));
                 task.local_changed(again.expect("change"));
                 assert!(task.senders.contains_key(&handle), "copy not sent");
+            })
+            .await;
+    }
+
+    /// B8: once a client is removed, what it was known to have is forgotten,
+    /// so a client given its handle does not inherit it
+    #[tokio::test]
+    async fn removed_client_is_forgotten() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut task = task();
+                let (backend, _set) = mpsc::unbounded_channel();
+                let handle = task.client_manager.add_client();
+                task.client_manager
+                    .set_fix_ips(handle, vec![IpAddr::from([10, 0, 0, 2])]);
+                // the client sent this clipboard, so it has it
+                task.received(from_peer(text("theirs"), Instant::now()), &backend);
+                task.update_if_stale(handle);
+                assert!(task.senders.is_empty(), "sent back to its sender");
+
+                task.forget(handle);
+                task.update_if_stale(handle);
+                assert!(task.senders.contains_key(&handle), "delivery inherited");
+                task.forget(handle);
+                assert!(task.senders.is_empty(), "sender kept");
             })
             .await;
     }

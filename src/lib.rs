@@ -4,6 +4,7 @@ mod capture;
 pub mod capture_test;
 pub mod cli;
 pub mod client;
+mod clients;
 mod clipboard;
 pub mod config;
 mod connect;
