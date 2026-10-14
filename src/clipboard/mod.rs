@@ -137,7 +137,7 @@ const WIN_MARKERS: [&str; 2] = [WIN_EXCLUDE_FORMAT, WIN_HISTORY_FORMAT];
 
 /// what the owner of the local clipboard offers; platform-independent so
 /// the backends' decisions are tested on every host
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 enum Offer {
     /// no format at all: the clipboard was cleared, sent as an empty update
@@ -314,8 +314,12 @@ impl Clipboard {
 /// a local clipboard backend: receives clipboard contents to set locally,
 /// reports local clipboard changes through the sender passed to `spawn`
 type BackendTx = mpsc::UnboundedSender<Arc<ClipboardData>>;
+/// local clipboard changes: the contents to send (empty for a clear), or
+/// `None` when the clipboard holds contents that are not shared (marked
+/// secret, no supported format)
+type ChangesTx = mpsc::UnboundedSender<Option<Arc<ClipboardData>>>;
 
-fn spawn_backend(changes: BackendTx) -> Option<BackendTx> {
+fn spawn_backend(changes: ChangesTx) -> Option<BackendTx> {
     #[cfg(all(unix, not(target_os = "macos")))]
     return Some(portal::spawn(changes));
     #[cfg(windows)]
@@ -422,7 +426,12 @@ impl ClipboardTask {
         listener.abort();
     }
 
-    fn local_changed(&mut self, data: Arc<ClipboardData>) {
+    fn local_changed(&mut self, change: Option<Arc<ClipboardData>>) {
+        let Some(data) = change else {
+            // entering a client must not push the previous contents
+            self.current = None;
+            return;
+        };
         let digest = data.digest();
         if self.current.as_ref().is_some_and(|(d, _)| *d == digest) {
             return;

@@ -24,7 +24,7 @@ use image::ImageFormat;
 use tokio::sync::mpsc;
 
 use super::{
-    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT, Offer,
+    BackendTx, ChangesTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT, Offer,
     WIN_MARKERS, files::local_files,
 };
 
@@ -41,7 +41,7 @@ const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SETTLE_ROUNDS: usize = 10;
 
-pub(super) fn spawn(changes: BackendTx) -> BackendTx {
+pub(super) fn spawn(changes: ChangesTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
     // sequence number of the clipboard after our latest write; the lock
     // serializes clipboard access between the two threads, so the monitor
@@ -63,7 +63,7 @@ fn seq_num() -> u32 {
     raw::seq_num().map_or(0, |n| n.get())
 }
 
-fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
+fn monitor(changes: ChangesTx, own_seq: Arc<Mutex<u32>>) {
     let mut monitor = match Monitor::new() {
         Ok(m) => m,
         Err(e) => return log::warn!("clipboard: failed to monitor clipboard: {e}"),
@@ -78,8 +78,8 @@ fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
         let data = read_settled();
         drop(own);
         match data {
-            Ok(Some(data)) if !(startup && data.is_empty()) => changes.send(Arc::new(data)).is_ok(),
-            Ok(_) => true,
+            Ok(Some(data)) if startup && data.is_empty() => true,
+            Ok(update) => changes.send(update.map(Arc::new)).is_ok(),
             Err(e) => {
                 log::warn!("clipboard: failed to read clipboard: {e}");
                 true
