@@ -806,38 +806,62 @@ where
         },
     ));
     let deadline = Instant::now() + CONFIRM_TIMEOUT;
-    let peer_frame = read_frame(r);
-    tokio::pin!(peer_frame);
-    let (mut confirmed, mut peer_confirmed) = (false, false);
-    while !(confirmed && peer_confirmed) {
-        tokio::select! {
-            frame = &mut peer_frame, if !peer_confirmed => match frame? {
-                Frame::Confirm => peer_confirmed = true,
-                Frame::Cancel { reason } => return Err(PairError::Refused(reason)),
-                _ => return Err(PairError::Invalid("expected confirm")),
-            },
-            // read even after confirming: a later cancel wins until the end
-            decision = ctx.decisions.recv() => match decision {
-                Some(true) if confirmed => {}
-                Some(true) => {
-                    write_frame(w, &Frame::Confirm).await?;
-                    confirmed = true;
+    let refusal = {
+        let peer_frame = read_frame(&mut *r);
+        tokio::pin!(peer_frame);
+        let (mut confirmed, mut peer_confirmed) = (false, false);
+        loop {
+            if confirmed && peer_confirmed {
+                break None;
+            }
+            tokio::select! {
+                frame = &mut peer_frame, if !peer_confirmed => match frame? {
+                    Frame::Confirm => peer_confirmed = true,
+                    Frame::Cancel { reason } => return Err(PairError::Refused(reason)),
+                    _ => return Err(PairError::Invalid("expected confirm")),
+                },
+                // read even after confirming: a later cancel wins until the end
+                decision = ctx.decisions.recv() => match decision {
+                    Some(true) if confirmed => {}
+                    Some(true) => {
+                        write_frame(w, &Frame::Confirm).await?;
+                        confirmed = true;
+                    }
+                    _ => {
+                        let reason = format!("the code was rejected on {}", local_name().await);
+                        break Some((reason, PairError::Cancelled));
+                    }
+                },
+                _ = sleep_until(deadline) => {
+                    let reason = format!("the code was not confirmed on both machines within {} s", CONFIRM_TIMEOUT.as_secs());
+                    break Some((reason.clone(), PairError::Refused(reason)));
                 }
-                _ => {
-                    let reason = format!("the code was rejected on {}", local_name().await);
-                    let _ = write_frame(w, &Frame::Cancel { reason }).await;
-                    return Err(PairError::Cancelled);
-                }
-            },
-            _ = sleep_until(deadline) => {
-                let reason = format!("the code was not confirmed on both machines within {} s", CONFIRM_TIMEOUT.as_secs());
-                let _ = write_frame(w, &Frame::Cancel { reason: reason.clone() }).await;
-                return Err(PairError::Refused(reason));
             }
         }
+    };
+    if let Some((reason, error)) = refusal {
+        let _ = write_frame(w, &Frame::Cancel { reason }).await;
+        close(r, w).await;
+        return Err(error);
     }
     let _ = w.shutdown().await;
     Ok(())
+}
+
+/// ends a session after sending `Cancel`. Closing a socket with unread input
+/// (e.g. the peer's `Confirm`) sends a reset, and Windows then discards the
+/// `Cancel` the peer has not read yet: so read until the peer closes
+async fn close<R, W>(r: &mut R, w: &mut W)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let _ = w.shutdown().await;
+    let mut buf = [0; 256];
+    let _ = timeout(FRAME_TIMEOUT, async {
+        while !matches!(r.read(&mut buf).await, Ok(0) | Err(_)) {}
+    })
+    .await;
 }
 
 #[cfg(test)]

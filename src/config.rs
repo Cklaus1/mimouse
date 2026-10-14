@@ -581,9 +581,17 @@ impl Config {
         };
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        let watched = config_path.clone();
         let watcher = RecommendedWatcher::new(
-            move |res| {
-                let _ = tx.blocking_send(res);
+            move |res: Result<notify::Event, notify::Error>| {
+                if res.as_ref().is_ok_and(|e| !is_edit_of(e, &watched)) {
+                    return;
+                }
+                // never block the watcher thread: on macOS dropping the
+                // watcher joins it, so a full queue nobody reads would hang
+                // the drop. A dropped edit is covered by the queued ones,
+                // whose loads read the file after it was written
+                let _ = tx.try_send(res);
             },
             notify::Config::default(),
         )?;
@@ -638,27 +646,18 @@ impl Config {
                 }
                 continue;
             }
-            let event = match self.watch_rx.recv().await.expect("channel closed") {
-                Ok(event) => event,
-                // says nothing about the file: keep the running config
-                Err(e) => {
-                    log::warn!("config watcher: {e}");
-                    continue;
+            match self.watch_rx.recv().await.expect("channel closed") {
+                Ok(_) => {
+                    log::info!("reading config from {:?}", self.config_path);
+                    let path = self.config_path.clone();
+                    self.loading = Some(tokio::task::spawn_blocking(move || {
+                        let (config, text) = ConfigToml::load(&path)?;
+                        write_last_good(&path, &text);
+                        Ok(config)
+                    }));
                 }
-            };
-            if event.paths.contains(&self.config_path)
-                && matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                )
-            {
-                log::info!("reading config from {:?}", self.config_path);
-                let path = self.config_path.clone();
-                self.loading = Some(tokio::task::spawn_blocking(move || {
-                    let (config, text) = ConfigToml::load(&path)?;
-                    write_last_good(&path, &text);
-                    Ok(config)
-                }));
+                // says nothing about the file: keep the running config
+                Err(e) => log::warn!("config watcher: {e}"),
             }
         }
     }
@@ -989,6 +988,15 @@ impl Config {
         self.config_toml = merged;
         Ok(reload)
     }
+}
+
+/// whether the watcher `event` created, changed or removed the file at `path`
+fn is_edit_of(event: &notify::Event, path: &Path) -> bool {
+    event.paths.iter().any(|p| p == path)
+        && matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        )
 }
 
 fn json(value: impl Serialize) -> serde_json::Value {
@@ -2022,6 +2030,22 @@ future_client_key = "kept"
         assert!(reloaded.is_err(), "reloaded on a watcher error");
         assert_eq!(tx.capacity(), 1, "error not consumed");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// only edits of the config file reload: the audit log and the
+    /// replace-file temp file live in the same watched directory
+    #[test]
+    fn only_edits_of_the_config_file_reload() {
+        use notify::event::{AccessKind, ModifyKind};
+        let path = Path::new("/cfg/config.toml");
+        let event = |kind, p: &str| notify::Event::new(kind).add_path(p.into());
+        let modify = EventKind::Modify(ModifyKind::Any);
+        assert!(is_edit_of(&event(modify, "/cfg/config.toml"), path));
+        assert!(!is_edit_of(&event(modify, "/cfg/audit.jsonl"), path));
+        assert!(!is_edit_of(
+            &event(EventKind::Access(AccessKind::Any), "/cfg/config.toml"),
+            path
+        ));
     }
 
     /// reloads `config` from its file, as the watcher does after an edit

@@ -85,6 +85,9 @@ jobs:
     name: "Release"
     needs: [build]
     runs-on: "ubuntu-latest"
+    # the repository's default token is read-only; publishing a release needs write
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v6
       with:
