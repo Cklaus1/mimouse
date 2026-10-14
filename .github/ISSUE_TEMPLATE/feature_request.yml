@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest an improvement to MiMouse
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: MiMouse is CLI-only (`mimouse cli`); GUI or tray requests are out of scope.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should it work, e.g. which `mimouse cli` command or config option?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: platform
+    attributes:
+      label: Platforms affected
+      placeholder: e.g. GNOME, KDE, sway, Hyprland, X11, Windows, macOS

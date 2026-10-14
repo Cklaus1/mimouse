@@ -1,0 +1,79 @@
+name: Bug report
+description: Something in MiMouse does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        MiMouse is a CLI-only software KVM, originally forked from Lan Mouse. Please report MiMouse bugs here, not to Lan Mouse.
+
+        **Do not paste clipboard contents, private keys, certificates or other secrets.** Review the doctor output and logs before submitting and redact host names or addresses you do not want to share.
+        Security issues: use a private advisory instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: MiMouse version
+      description: Output of `mimouse --version` (on every machine involved, if they differ).
+    validations:
+      required: true
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: OS and desktop/session
+      description: Select every platform involved.
+      multiple: true
+      options:
+        - Linux GNOME (Wayland)
+        - Linux KDE Plasma (Wayland)
+        - Linux sway
+        - Linux Hyprland
+        - Linux other Wayland compositor
+        - Linux X11
+        - Windows 10
+        - Windows 11
+        - macOS (experimental)
+    validations:
+      required: true
+  - type: input
+    id: os-details
+    attributes:
+      label: OS details
+      description: Distribution and version, compositor/desktop version, Windows build or macOS version.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: Output of `mimouse cli doctor --json`.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant log
+      description: |
+        Linux: `journalctl --user -u mimouse` (around the time of the problem).
+        Windows: `%LOCALAPPDATA%\mimouse\mimouse.log`.
+        Setting `MIMOUSE_LOG_LEVEL=debug` gives more detail. Do not include clipboard contents or keys.
+      render: text
