@@ -2056,7 +2056,10 @@ future_client_key = "kept"
         assert!(config.changed().now_or_never().is_none());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let authorized = HashMap::from([("fp".to_owned(), "x".to_owned())]);
-        assert!(config.save(vec![], authorized).await.unwrap(), "edit merged");
+        assert!(
+            config.save(vec![], authorized).await.unwrap(),
+            "edit merged"
+        );
         let wait = std::time::Duration::from_secs(1);
         let reloaded = tokio::time::timeout(wait, config.changed()).await;
         assert!(reloaded.is_err(), "stale load applied");
