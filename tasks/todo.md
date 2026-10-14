@@ -12,9 +12,9 @@ Wave 1
 - [ ] I1 A5, B3b
 - [ ] I2 B9, C11
 - [ ] L1 A11
-- [ ] X0 T-1a
+- [x] X0 T-1a
 - [ ] X2 T-5
-- [ ] D2 P3
+- [x] D2 P3
 
 Wave 2
 - [ ] N3 A-arch-2, A2, B4
