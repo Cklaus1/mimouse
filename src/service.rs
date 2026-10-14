@@ -213,7 +213,7 @@ impl Service {
                 event = self.frontend_listener.next() => self.handle_ipc_event(event).await,
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.clipboard.event() => self.handle_clipboard_event(event),
-                event = self.emulation.event() => self.handle_emulation_event(event),
+                event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.pairing.event() => self.handle_pair_event(event).await,
@@ -720,7 +720,7 @@ impl Service {
         }
     }
 
-    fn handle_emulation_event(&mut self, event: EmulationEvent) {
+    async fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 log::warn!(
@@ -757,6 +757,12 @@ impl Service {
                         self.port = port;
                         self.clipboard.port_changed(port);
                         self.notify_frontend(FrontendEvent::Port { port, error: None });
+                        self.config.set_port(port);
+                        if let Err(e) = self.save_config().await {
+                            log::warn!(
+                                "listening on port {port}, but the config was not saved ({e}); fix it, then run `mimouse cli save-config`"
+                            );
+                        }
                         Ok(())
                     }
                     Err(e) => {
