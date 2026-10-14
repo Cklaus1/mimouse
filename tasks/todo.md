@@ -18,18 +18,18 @@ Wave 1
 
 Wave 2
 - [x] N3 A-arch-2, A2, B4
-- [ ] N5 C4, C10
+- [x] N5 C4, C10
 - [x] E3 A-arch-4, B15, B17, B18, B19, B20
 - [x] E4 C13, C14
 - [x] E5 T6
 - [x] K4 A-arch-3, B12, B13, B14
-- [ ] K5 C1, C2, C12
+- [x] K5 C1, C2, C12
 - [ ] L2 B21, B22, B23, B24
 - [ ] L3 C6, C7, C8
 - [ ] G2 C5, C9
 
 Wave 3
-- [ ] N4 B2, B3, B5
+- [x] N4 B2, B3, B5
 - [ ] S1 A-arch-1, B6, B8
 
 Wave 4
