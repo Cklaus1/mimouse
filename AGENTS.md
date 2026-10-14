@@ -42,5 +42,6 @@ Software KVM: one Rust binary (`mimouse`) runs the service; `mimouse cli` contro
 ```sh
 cargo fmt && cargo clippy --workspace --all-targets && cargo test --workspace
 cargo clippy --release --target x86_64-pc-windows-gnu --no-default-features
+cargo deny check licenses bans sources   # license allow-list in deny.toml; a new license needs a GPL-3.0 compatibility check
 MIMOUSE_LOG_LEVEL=debug cargo run
 ```

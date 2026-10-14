@@ -22,6 +22,15 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
+  deny:
+    name: Licenses and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
   ci:
     name: ${{ matrix.job }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
