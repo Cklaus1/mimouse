@@ -114,6 +114,7 @@ graph LR
 |---|---|
 | 1 | net: N1 -> N2; emu: E1 -> E2; cap: K1 -> K3, K2; cfg: G1; ipc: I1 -> I2; clip: L1; rel: X0, X2; docs: D2 |
 | 2 | net: N3 (after G1, N2 merged) -> N5; emu: E3 -> E4, E5; cap: K4 -> K5 (after E3 for K5); clip: L2 -> L3; cfg: G2 |
+| | [REVISED 2026-10-14, re-plan loop: N3 shares `doctor.rs`/`clipboard/transport.rs` with L2 and `config.rs`/`service.rs` with G2; N4 shares `transport.rs` with L2 and `service.rs` with G2; N5 shares `doctor.rs` with L2. Valid schedule: **2a** net N3, emu E3 -> E4, E5, cap K4; **2b** (N3 merged) net N4, net2 N5, cap K5 (after E3, K4); **2c** (N4, N5 merged) clip L2 -> L3, cfg G2; then S1 (L3 may follow S1).] |
 | 3 | net: N4; then svc: S1 |
 | 4 | svc: T5, T3; then rel: X1; then cfg: T2 |
 | 5 | P1 smoke matrix; docs D1, D4; then D3; then R1 |
