@@ -90,7 +90,7 @@ mod tests {
         seen.take()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn restored_grant_is_never_reported() {
         let seen = reports(|tx| async move {
             for _ in 0..3 {
@@ -103,7 +103,7 @@ mod tests {
         assert!(seen.is_empty(), "{seen:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dialog_is_reported_until_answered_then_again() {
         let seen = reports(|tx| async move {
             for _ in 0..2 {
@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(seen, [true, false, true, false]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn backend_gone_while_waiting_clears_the_status() {
         let seen = reports(|tx| async move {
             tx.send_replace(true);

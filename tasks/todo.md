@@ -26,7 +26,7 @@ Wave 2
 - [x] K5 C1, C2, C12
 - [x] L2 B21, B22, B23, B24
 - [ ] L3 C6, C7, C8
-- [ ] G2 C5, C9
+- [x] G2 C5, C9
 
 Wave 3
 - [x] N4 B2, B3, B5

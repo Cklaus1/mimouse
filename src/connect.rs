@@ -588,16 +588,10 @@ mod tests {
     /// a listener on a free localhost port trusting `client`, and a client
     /// manager with one client pointing at it
     async fn peer(client: &Certificate) -> (MiMouseListener, ClientManager, ClientHandle) {
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .expect("free port")
-            .port();
         let fingerprint = crypto::certificate_fingerprint(client);
         let authorized = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
         let server = Certificate::generate_self_signed(["ignored".to_owned()]).expect("cert");
-        let listener = MiMouseListener::new(port, server, authorized)
-            .await
-            .expect("listener");
+        let (listener, port) = MiMouseListener::on_free_port(server, authorized).await;
         let client_manager = ClientManager::default();
         let handle = client_manager.add_client();
         client_manager.set_fix_ips(handle, vec![Ipv4Addr::LOCALHOST.into()]);

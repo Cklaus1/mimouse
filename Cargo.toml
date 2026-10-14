@@ -94,6 +94,10 @@ image = { version = "0.25", default-features = false, features = [
     "png",
 ] }
 
+[dev-dependencies]
+# paused clock (`start_paused`) for timing tests (T3)
+tokio = { version = "1.32.0", features = ["test-util"] }
+
 [features]
 default = [
     "layer_shell_capture",

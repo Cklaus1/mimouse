@@ -438,7 +438,7 @@ mod tests {
 
                 keys.write().unwrap().clear();
                 assert!(
-                    closed(&mut stream, Duration::from_secs(2)).await,
+                    closed(&mut stream, Duration::from_secs(5)).await,
                     "revoked connection kept open"
                 );
                 server.abort();

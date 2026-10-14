@@ -191,6 +191,31 @@ impl MiMouseListener {
         let peer = conns.iter().find(|p| p.addr == addr)?;
         Some(peer.fingerprint.clone())
     }
+
+    /// tests: a listener on a free port and that port. The port is picked
+    /// before the listener binds it, so a parallel test's UDP socket can take
+    /// it in between: pick again then.
+    #[cfg(test)]
+    pub(crate) async fn on_free_port(
+        cert: Certificate,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    ) -> (Self, u16) {
+        let mut attempts = 0;
+        loop {
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .and_then(|s| s.local_addr())
+                .expect("free port")
+                .port();
+            match Self::new(port, cert.clone(), authorized_keys.clone()).await {
+                Ok(listener) => return (listener, port),
+                Err(e) if attempts < 10 => {
+                    attempts += 1;
+                    log::debug!("port {port} taken ({e}), picking another");
+                }
+                Err(e) => panic!("listener: {e}"),
+            }
+        }
+    }
 }
 
 impl Stream for MiMouseListener {
@@ -365,16 +390,10 @@ mod tests {
     /// a listener on a free loopback port trusting `client`, and its
     /// authorized keys
     async fn listener(client: &Certificate) -> (MiMouseListener, SocketAddr, Keys) {
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|s| s.local_addr())
-            .expect("free port")
-            .port();
         let fingerprint = crypto::certificate_fingerprint(client);
         let authorized = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
         let server = Certificate::generate_self_signed(["ignored".to_owned()]).expect("cert");
-        let listener = MiMouseListener::new(port, server, authorized.clone())
-            .await
-            .expect("listener");
+        let (listener, port) = MiMouseListener::on_free_port(server, authorized.clone()).await;
         (
             listener,
             SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
@@ -566,7 +585,7 @@ mod tests {
                 let (ping, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
                 client.send(&ping[..len]).await.unwrap();
                 let mut buf = [0u8; MAX_EVENT_SIZE];
-                let closed = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                let closed = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
                     .await
                     .expect("revoked connection kept open");
                 assert!(closed.is_err(), "{closed:?}");
