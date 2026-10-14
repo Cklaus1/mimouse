@@ -6,3 +6,6 @@
 - GNOME 50: removing the last client and adding one (e.g. re-pairing) recreates the capture session, so the approval dialog appears again. Keeping the session alive with no barriers would avoid it. (P3)
 - AGENTS.md `## Commands`: the Windows clippy line lacks `--all-targets` and the macOS cross-clippy line (`/tmp/fakecc` shims) is only in tasks/build-loop.md. (P3, from D2)
 - `AsyncFrontendListener::send` no longer awaits anything (I1); make it sync and drop `async` from `handle_frontend_pending` (`src/service.rs:555`). (P3, from I1)
+- layer-shell `update_windows` (`input-capture/src/layer_shell.rs:587`): `active_windows.clear()` on an output change leaves `focused` on a dropped window while the grab may be held; no End is emitted. `grab` (`:464`) still unwraps `focused`. (P3, from K2)
+- `cli watch` prints a clipboard clear as `clipboard sent to X: 0 bytes ()` (`src/cli.rs:465-470`); print `cleared`. (P3, from L1)
+- GNOME: mutter's clipboard manager restores the previous owner's content after any clear, so a local clear on GNOME rarely sticks; peers follow what the local clipboard really holds. Older MiMouse GNOME peers that receive a clear restore and resend their old content. (P3, from L1)
