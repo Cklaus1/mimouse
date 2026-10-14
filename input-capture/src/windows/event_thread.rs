@@ -6,8 +6,6 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
@@ -35,6 +33,7 @@ use input_event::{
 use super::{CaptureEvent, EdgeRange, Position, display_util};
 use crate::ChordMatcher;
 use crate::chord::Chord;
+use crate::event_queue::EventSender;
 use crate::geometry::{self, Rect};
 
 pub(crate) struct EventThread {
@@ -44,7 +43,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: EventSender) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -115,15 +114,10 @@ enum Request {
     SetHotkeys(Vec<(Chord, Position)>),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
-fn try_send_event(
-    pos: Position,
-    event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+/// Queues an event for the capture task without blocking the hook; false
+/// if it was dropped.
+fn send_event(pos: Position, event: CaptureEvent) -> bool {
+    EVENT_TX.with_borrow(|tx| tx.as_ref().is_some_and(|tx| tx.send(pos, event)))
 }
 
 thread_local! {
@@ -132,7 +126,7 @@ thread_local! {
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static EVENT_TX: RefCell<Option<EventSender>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
@@ -161,7 +155,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: EventSender,
     request_buffer: Arc<Mutex<Vec<Request>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
@@ -181,7 +175,7 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: EventSender,
     request_buffer: Arc<Mutex<Vec<Request>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
@@ -320,14 +314,15 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
+    /* notify main thread; a dropped `Begin` leaves the input local */
+    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
+    if !send_event(pos, CaptureEvent::Begin(fraction)) {
+        return ret;
+    }
+
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
-
-    /* notify main thread */
-    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin(fraction));
 
     ret
 }
@@ -356,10 +351,8 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
-    }
+    /* notify mainthread (motion and presses are dropped if sending too fast) */
+    send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -420,9 +413,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         }
     }
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
-    }
+    send_event(client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -473,6 +464,10 @@ fn activate(pos: Position, range: Option<EdgeRange>) -> bool {
         return false;
     };
     let point = (x as i32, y as i32);
+    /* a dropped `Begin` leaves the input local */
+    if !send_event(pos, CaptureEvent::Begin(fraction)) {
+        return false;
+    }
     if let Err(e) = unsafe { SetCursorPos(point.0, point.1) } {
         log::warn!("failed to move the cursor to {point:?}: {e}");
     }
@@ -481,7 +476,6 @@ fn activate(pos: Position, range: Option<EdgeRange>) -> bool {
     PREV_POS.replace(Some(point));
     ACTIVE_CLIENT.replace(Some(pos));
     log::debug!("capture for {pos} started at {point:?}");
-    blocking_send_event(pos, CaptureEvent::Begin(fraction));
     true
 }
 

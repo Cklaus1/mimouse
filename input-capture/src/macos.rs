@@ -2,6 +2,7 @@ use super::{
     Capture, CaptureError, CaptureEvent, Chord, ChordMatcher, EdgeRange, Position,
     error::MacosCaptureCreationError,
 };
+use crate::event_queue::{self, EventReceiver, EventSender};
 use crate::geometry::{self, Rect};
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -14,7 +15,7 @@ use core_foundation::{
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
-    display::{CGDisplay, CGPoint},
+    display::{CGDisplay, CGPoint, CGRect},
     event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
@@ -39,16 +40,36 @@ use std::{
 };
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, UnboundedSender},
     oneshot,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+impl Bounds {
+    /// the bounding box of `displays`; `None` without any
+    fn enclosing(displays: impl IntoIterator<Item = CGRect>) -> Option<Self> {
+        displays
+            .into_iter()
+            .map(|d| Self {
+                xmin: d.origin.x,
+                xmax: d.origin.x + d.size.width,
+                ymin: d.origin.y,
+                ymax: d.origin.y + d.size.height,
+            })
+            .reduce(|a, b| Self {
+                xmin: a.xmin.min(b.xmin),
+                xmax: a.xmax.max(b.xmax),
+                ymin: a.ymin.min(b.ymin),
+                ymax: a.ymax.max(b.ymax),
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -127,17 +148,15 @@ impl InputCaptureState {
         None
     }
 
-    // Get the max bounds of all displays
+    /// The bounding box of all displays, computed afresh: it also shrinks
+    /// when a display goes away.
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+        match Bounds::enclosing(active_ids.iter().map(|&d| CGDisplay::new(d).bounds())) {
+            Some(bounds) => self.bounds = bounds,
+            None => log::warn!("no active display, keeping the display bounds"),
+        }
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -229,10 +248,10 @@ impl InputCaptureState {
         CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
     }
 
-    async fn handle_producer_event(
+    fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
-        event_tx: &Sender<(Position, CaptureEvent)>,
+        event_tx: &EventSender,
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
@@ -255,9 +274,12 @@ impl InputCaptureState {
                     return Ok(());
                 }
                 let at = self.focus(pos, range)?;
+                // a dropped `Begin` leaves the input local
+                if !event_tx.send(pos, CaptureEvent::Begin(at)) {
+                    return Ok(());
+                }
                 self.hide_cursor()?;
                 self.current_pos = Some(pos);
-                let _ = event_tx.send((pos, CaptureEvent::Begin(at))).await;
             }
             ProducerEvent::SetHotkeys(hotkeys) => self.hotkeys.set_chords(hotkeys),
             ProducerEvent::Create(p, range) => {
@@ -483,8 +505,8 @@ fn get_events(
 
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
-    notify_tx: Sender<ProducerEvent>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    notify_tx: UnboundedSender<ProducerEvent>,
+    event_tx: EventSender,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
@@ -560,13 +582,11 @@ fn create_event_tap<'a>(
             log::error!("CGEventTap disabled by user input, releasing capture state");
             if let Some(pos) = state.current_pos.take() {
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                let _ = event_tx.blocking_send((pos, CaptureEvent::End));
+                event_tx.send(pos, CaptureEvent::End);
             }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
+            if let Err(e) = notify_tx.send(ProducerEvent::EventTapDisabled) {
+                log::error!("Failed to send notification: {e}");
+            }
             return CallbackResult::Keep;
         }
 
@@ -630,13 +650,15 @@ fn create_event_tap<'a>(
                         [] => Vec::new(),
                     };
                     match state.focus(pos, range) {
+                        // a dropped `Begin` leaves the input local
                         Ok(at) => {
-                            state.local_keys = local_keys;
-                            capture_position = Some(pos);
-                            res_events.push(CaptureEvent::Begin(at));
-                            notify_tx
-                                .blocking_send(ProducerEvent::Grab(pos))
-                                .expect("Failed to send notification");
+                            if event_tx.send(pos, CaptureEvent::Begin(at)) {
+                                state.local_keys = local_keys;
+                                capture_position = Some(pos);
+                                if let Err(e) = notify_tx.send(ProducerEvent::Grab(pos)) {
+                                    log::error!("Failed to send notification: {e}");
+                                }
+                            }
                         }
                         Err(e) => log::warn!("cannot start capture at {pos}: {e}"),
                     }
@@ -645,24 +667,26 @@ fn create_event_tap<'a>(
         } else if matches!(event_type, CGEventType::MouseMoved) {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
-                capture_position = Some(new_pos);
                 let at = state.edge_fraction(cg_ev.location(), new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin(at));
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                // a dropped `Begin` leaves the input local
+                if event_tx.send(new_pos, CaptureEvent::Begin(at)) {
+                    capture_position = Some(new_pos);
+                    state
+                        .start_capture(cg_ev, new_pos)
+                        .unwrap_or_else(|e| log::warn!("{e}"));
+                    if let Err(e) = notify_tx.send(ProducerEvent::Grab(new_pos)) {
+                        log::error!("Failed to send notification: {e}");
+                    }
+                }
             }
         }
 
         if let Some(pos) = capture_position {
-            res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
-            });
+            // never blocks while holding the state lock; motion and presses
+            // are dropped if the capture task is not keeping up
+            for &event in &res_events {
+                event_tx.send(pos, event);
+            }
         }
         if capture_position.is_some() && !pass_through {
             // Returning Drop should stop the event from being processed
@@ -704,8 +728,8 @@ fn create_event_tap<'a>(
 
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
-    event_tx: Sender<(Position, CaptureEvent)>,
-    notify_tx: Sender<ProducerEvent>,
+    event_tx: EventSender,
+    notify_tx: UnboundedSender<ProducerEvent>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
 ) {
@@ -747,7 +771,7 @@ fn event_tap_thread(
         // Reclaim the leaked sender Box so we don't leak a tokio
         // channel sender on every capture create/destroy cycle.
         drop(Box::from_raw(
-            display_user_info as *mut Sender<ProducerEvent>,
+            display_user_info as *mut UnboundedSender<ProducerEvent>,
         ));
     }
 
@@ -768,20 +792,22 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     if user_info.is_null() {
         return;
     }
-    // SAFETY: user_info is a Box::into_raw of Sender<ProducerEvent>
+    // SAFETY: user_info is a Box::into_raw of UnboundedSender<ProducerEvent>
     // owned by `event_tap_thread`. It's valid for the lifetime of
     // that thread; the registration is removed before the box is
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
-    let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+    let sender = unsafe { &*(user_info as *const UnboundedSender<ProducerEvent>) };
+    if let Err(e) = sender.send(ProducerEvent::DisplayReconfigured) {
         log::warn!("failed to notify display reconfiguration: {e}");
     }
 }
 
 pub struct MacOSInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
-    notify_tx: Sender<ProducerEvent>,
+    event_rx: EventReceiver,
+    /// unbounded: the event tap sends on it while holding the state lock,
+    /// which the receiving task takes
+    notify_tx: UnboundedSender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
 
@@ -790,9 +816,9 @@ impl MacOSInputCapture {
         request_macos_capture_permissions()?;
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
-        let (event_tx, event_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = event_queue::channel(32);
         let focus_tx = event_tx.clone();
-        let (notify_tx, mut notify_rx) = mpsc::channel(32);
+        let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
@@ -824,7 +850,7 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event, &focus_tx).await.unwrap_or_else(|e| {
+                        state.handle_producer_event(producer_event, &focus_tx).unwrap_or_else(|e| {
                             log::error!("Failed to handle producer event: {e}");
                         })
                     }
@@ -888,43 +914,30 @@ impl Capture for MacOSInputCapture {
         pos: Position,
         range: Option<EdgeRange>,
     ) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos, range)).await;
-            log::debug!("done !");
-        });
+        log::debug!("creating capture, {pos}");
+        let _ = self.notify_tx.send(ProducerEvent::Create(pos, range));
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        let _ = self.notify_tx.send(ProducerEvent::Destroy(pos));
         Ok(())
     }
 
-    // sent in order, unlike create / destroy: a focus right after a release
-    // must not overtake it
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("notifying Release");
-        let _ = self.notify_tx.send(ProducerEvent::Release).await;
+        let _ = self.notify_tx.send(ProducerEvent::Release);
         Ok(())
     }
 
     async fn focus(&mut self, pos: Position, range: Option<EdgeRange>) -> Result<(), CaptureError> {
-        let _ = self.notify_tx.send(ProducerEvent::Focus(pos, range)).await;
+        let _ = self.notify_tx.send(ProducerEvent::Focus(pos, range));
         Ok(())
     }
 
     async fn set_hotkeys(&mut self, hotkeys: Vec<(Chord, Position)>) -> Result<(), CaptureError> {
-        let _ = self
-            .notify_tx
-            .send(ProducerEvent::SetHotkeys(hotkeys))
-            .await;
+        let _ = self.notify_tx.send(ProducerEvent::SetHotkeys(hotkeys));
         Ok(())
     }
 
@@ -1031,5 +1044,37 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_graphics::geometry::{CGPoint, CGSize};
+
+    use super::*;
+
+    fn display(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect::new(&CGPoint::new(x, y), &CGSize::new(width, height))
+    }
+
+    #[test]
+    fn bounds_shrink_when_a_display_goes_away() {
+        let main = display(0., 0., 1920., 1080.);
+        let right = display(1920., -200., 2560., 1440.);
+        let both = Bounds::enclosing([main, right]).unwrap();
+        assert_eq!(
+            both,
+            Bounds {
+                xmin: 0.,
+                xmax: 4480.,
+                ymin: -200.,
+                ymax: 1240.,
+            }
+        );
+        // unplugging the right display moves the Right edge back
+        let main_only = Bounds::enclosing([main]).unwrap();
+        assert_eq!(main_only.xmax, 1920.);
+        assert_eq!(main_only.ymin, 0.);
+        assert_eq!(Bounds::enclosing([]), None);
     }
 }
