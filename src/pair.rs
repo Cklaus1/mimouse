@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::TcpStream,
-    sync::mpsc,
+    sync::{OwnedSemaphorePermit, mpsc},
     task::{JoinHandle, spawn_local},
     time::{Instant, sleep_until, timeout},
 };
@@ -53,9 +53,10 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// time each user has to compare the codes
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// a pairing connection whose TLS handshake has not completed yet, and the
-/// address it came from; sent by the TCP listener
-pub(crate) type Incoming = (StartHandshake<TcpStream>, SocketAddr);
+/// a pairing connection whose TLS handshake has not completed yet, the
+/// address it came from, and its slot among the TCP listener's connections;
+/// sent by the TCP listener
+pub(crate) type Incoming = (StartHandshake<TcpStream>, SocketAddr, OwnedSemaphorePermit);
 
 /// whether a TLS client asks for a pairing connection
 pub(crate) fn is_pairing(start: &StartHandshake<TcpStream>) -> bool {
@@ -497,11 +498,19 @@ impl Pairing {
         });
     }
 
-    fn incoming(&mut self, start: StartHandshake<TcpStream>, addr: SocketAddr) {
+    fn incoming(
+        &mut self,
+        start: StartHandshake<TcpStream>,
+        addr: SocketAddr,
+        permit: OwnedSemaphorePermit,
+    ) {
         let config = self.server_config.clone();
         if self.session.is_none() && self.window.take(Instant::now()) {
             log::info!("pairing: request from {addr}");
-            self.spawn(move |ctx| respond(ctx, config, start, addr));
+            self.spawn(move |ctx| async move {
+                let _permit = permit;
+                respond(ctx, config, start, addr).await
+            });
             return;
         }
         let reason = if self.session.is_some() {
@@ -511,6 +520,7 @@ impl Pairing {
         };
         log::info!("pairing: refused request from {addr}");
         spawn_local(async move {
+            let _permit = permit;
             if let Err(e) = refuse(config, start, reason).await {
                 log::debug!("pairing: {addr}: {e}");
             }
@@ -522,7 +532,7 @@ impl Pairing {
         loop {
             let deadline = self.window.deadline();
             tokio::select! {
-                Some((start, addr)) = self.incoming_rx.recv() => self.incoming(start, addr),
+                Some((start, addr, permit)) = self.incoming_rx.recv() => self.incoming(start, addr, permit),
                 Some((id, event)) = self.events_rx.recv() => {
                     if id.is_some() && id != self.session.as_ref().map(|s| s.id) {
                         continue; // a session that was cancelled
@@ -996,7 +1006,10 @@ mod tests {
                 );
                 let start = acceptor.await.unwrap();
                 assert!(is_pairing(&start));
-                incoming.send((start, addr)).unwrap();
+                let permit = Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap();
+                incoming.send((start, addr, permit)).unwrap();
             }
         });
         (pairing, crypto::certificate_fingerprint(&cert), port)

@@ -31,6 +31,17 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+/// a peer that completed the handshake
+#[derive(Clone)]
+struct Peer {
+    addr: SocketAddr,
+    /// of the certificate it authenticated with
+    fingerprint: String,
+    conn: ArcConn,
+}
+
+type Peers = Rc<AsyncMutex<Vec<Peer>>>;
+
 /// a handshake stalled this long is dropped (the client gives up after 5 s)
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// clients ping every 500 ms; a connection silent this long is closed
@@ -58,7 +69,7 @@ pub(crate) struct MiMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
     listen_task: JoinHandle<()>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Peers,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
 }
@@ -94,8 +105,7 @@ impl MiMouseListener {
 
         let mut listener = bind(port).await?;
 
-        let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
-            Rc::new(AsyncMutex::new(Vec::new()));
+        let conns: Peers = Rc::new(AsyncMutex::new(Vec::new()));
 
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
@@ -159,8 +169,8 @@ impl MiMouseListener {
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
         let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
-            let _ = conn.close().await;
+        for peer in conns.iter() {
+            let _ = peer.conn.close().await;
         }
         self.listen_tx.close();
     }
@@ -169,30 +179,17 @@ impl MiMouseListener {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+        for peer in conns.iter() {
+            if peer.addr == addr {
+                let _ = peer.conn.send(&buf[..len]).await;
             }
         }
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
-            .conns
-            .lock()
-            .await
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-            let certs = conn.connection_state().await.peer_certificates;
-            let cert = certs.first()?;
-            let fingerprint = crypto::generate_fingerprint(cert);
-            Some(fingerprint)
-        } else {
-            None
-        }
+        let conns = self.conns.lock().await;
+        let peer = conns.iter().find(|p| p.addr == addr)?;
+        Some(peer.fingerprint.clone())
     }
 }
 
@@ -207,17 +204,19 @@ impl Stream for MiMouseListener {
     }
 }
 
-/// handshakes over `conn`, then forwards the peer's events until it is gone;
-/// forgets the remote in the UDP listener on every exit
+/// handshakes over `conn`, then forwards the peer's events until it is gone
+/// or no longer authorized; forgets the remote in the UDP listener on every
+/// exit
 async fn serve(
     conn: ArcConn,
     addr: SocketAddr,
     cert: Certificate,
     authorized: Arc<RwLock<HashMap<String, String>>>,
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
+    conns: Peers,
     listen_tx: Sender<ListenEvent>,
 ) {
-    let (cfg, rejected) = peers::dtls_server_config(cert, peers::Policy::Authorized(authorized));
+    let policy = peers::Policy::Authorized(authorized);
+    let (cfg, rejected) = peers::dtls_server_config(cert, policy.clone());
     let handshake = DTLSConn::new(conn.clone(), cfg, false, None);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
         Ok(Ok(dtls)) => {
@@ -225,13 +224,18 @@ async fn serve(
             let dtls: ArcConn = Arc::new(dtls);
             if let Some(cert) = certs.first() {
                 log::info!("dtls client connected, ip: {addr}");
-                let fingerprint = crypto::generate_fingerprint(cert);
-                conns.lock().await.push((addr, dtls.clone()));
+                let peer = Peer {
+                    addr,
+                    fingerprint: crypto::generate_fingerprint(cert),
+                    conn: dtls.clone(),
+                };
+                conns.lock().await.push(peer.clone());
+                let fingerprint = peer.fingerprint.clone();
                 if listen_tx
                     .send(ListenEvent::Accept { addr, fingerprint })
                     .is_ok()
                 {
-                    read_loop(conns, addr, dtls.clone(), listen_tx, PEER_IDLE_TIMEOUT).await;
+                    read_loop(conns, peer, &policy, listen_tx, PEER_IDLE_TIMEOUT).await;
                 }
             } else {
                 log::warn!("{addr}: no client certificate");
@@ -251,14 +255,17 @@ async fn serve(
     let _ = conn.close().await;
 }
 
-/// forwards events from `conn` until it fails or stays silent for `idle_timeout`
+/// forwards events from `peer` until it fails, stays silent for
+/// `idle_timeout` or `policy` no longer trusts its fingerprint (a peer pings
+/// every 500 ms, so a revoked one is dropped within that)
 async fn read_loop(
-    conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
-    addr: SocketAddr,
-    conn: ArcConn,
+    conns: Peers,
+    peer: Peer,
+    policy: &peers::Policy,
     dtls_tx: Sender<ListenEvent>,
     idle_timeout: Duration,
 ) {
+    let Peer { addr, conn, .. } = &peer;
     let mut b = [0u8; MAX_EVENT_SIZE];
 
     loop {
@@ -270,10 +277,15 @@ async fn read_loop(
                 break;
             }
         };
+        if let Err(e) = policy.check(&peer.fingerprint) {
+            log::warn!("{addr}: closing, {e}");
+            break;
+        }
         // one corrupt datagram or an event id from a newer peer must not
         // drop the connection (upstream 82766cd, lan-mouse#307)
         match ProtoEvent::decode(&b[..n]) {
             Ok(event) => {
+                let addr = *addr;
                 if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
                     break;
                 }
@@ -282,7 +294,7 @@ async fn read_loop(
         }
     }
     log::info!("dtls client disconnected {addr:?}");
-    conns.lock().await.retain(|(_, c)| !Arc::ptr_eq(c, &conn));
+    conns.lock().await.retain(|p| !Arc::ptr_eq(&p.conn, conn));
 }
 
 #[cfg(test)]
@@ -292,12 +304,22 @@ mod tests {
     use tokio::{net::UdpSocket, task::LocalSet};
     use webrtc_util::conn::conn_pipe::pipe;
 
+    /// a peer on one end of a pipe, its list of peers, and the other end
+    fn piped_peer() -> (Peer, Peers, impl Conn) {
+        let (local, remote) = pipe();
+        let peer = Peer {
+            addr: "192.0.2.1:4242".parse().unwrap(),
+            fingerprint: "aa:bb".into(),
+            conn: Arc::new(local),
+        };
+        let conns = Rc::new(AsyncMutex::new(vec![peer.clone()]));
+        (peer, conns, remote)
+    }
+
     #[tokio::test]
     async fn read_loop_skips_undecodable_datagrams() {
-        let addr: SocketAddr = "192.0.2.1:4242".parse().unwrap();
-        let (local, remote) = pipe();
-        let local: ArcConn = Arc::new(local);
-        let conns = Rc::new(AsyncMutex::new(vec![(addr, local.clone())]));
+        let (peer, conns, remote) = piped_peer();
+        let addr = peer.addr;
         let (tx, mut rx) = channel();
 
         // unknown event id, `Enter` with an invalid position, then a Ping
@@ -307,7 +329,8 @@ mod tests {
         remote.send(&ping[..len]).await.unwrap();
         drop(remote);
 
-        read_loop(conns.clone(), addr, local, tx, PEER_IDLE_TIMEOUT).await;
+        let any = peers::Policy::Any;
+        read_loop(conns.clone(), peer, &any, tx, PEER_IDLE_TIMEOUT).await;
 
         let mut received = vec![];
         while let Some(event) = rx.recv().await {
@@ -326,21 +349,22 @@ mod tests {
 
     #[tokio::test]
     async fn read_loop_drops_silent_connections() {
-        let addr: SocketAddr = "192.0.2.1:4242".parse().unwrap();
-        let (local, _remote) = pipe();
-        let local: ArcConn = Arc::new(local);
-        let conns = Rc::new(AsyncMutex::new(vec![(addr, local.clone())]));
+        let (peer, conns, _remote) = piped_peer();
         let (tx, _rx) = channel();
 
-        let silent = read_loop(conns.clone(), addr, local, tx, Duration::from_millis(100));
+        let any = peers::Policy::Any;
+        let silent = read_loop(conns.clone(), peer, &any, tx, Duration::from_millis(100));
         tokio::time::timeout(Duration::from_secs(2), silent)
             .await
             .expect("silent connection kept");
         assert!(conns.lock().await.is_empty());
     }
 
-    /// a listener on a free loopback port trusting `client`
-    async fn listener(client: &Certificate) -> (MiMouseListener, SocketAddr) {
+    type Keys = Arc<RwLock<HashMap<String, String>>>;
+
+    /// a listener on a free loopback port trusting `client`, and its
+    /// authorized keys
+    async fn listener(client: &Certificate) -> (MiMouseListener, SocketAddr, Keys) {
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .and_then(|s| s.local_addr())
             .expect("free port")
@@ -348,10 +372,14 @@ mod tests {
         let fingerprint = crypto::certificate_fingerprint(client);
         let authorized = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
         let server = Certificate::generate_self_signed(["ignored".to_owned()]).expect("cert");
-        let listener = MiMouseListener::new(port, server, authorized)
+        let listener = MiMouseListener::new(port, server, authorized.clone())
             .await
             .expect("listener");
-        (listener, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        (
+            listener,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            authorized,
+        )
     }
 
     fn client_config(cert: Certificate) -> webrtc_dtls::config::Config {
@@ -441,7 +469,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
-                let (mut listener, addr) = listener(&cert).await;
+                let (mut listener, addr, _) = listener(&cert).await;
                 let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
                 silent.send_to(&client_hello().await, addr).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -470,7 +498,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
-                let (mut listener, addr) = listener(&cert).await;
+                let (mut listener, addr, _) = listener(&cert).await;
                 let (relay, relayed) = delaying_relay(addr, Duration::from_secs(3)).await;
 
                 let start = Instant::now();
@@ -493,7 +521,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
-                let (mut listener, addr) = listener(&cert).await;
+                let (mut listener, addr, _) = listener(&cert).await;
                 let strangers: Vec<_> = (0..2)
                     .map(|_| Certificate::generate_self_signed(["ignored".to_owned()]).unwrap())
                     .collect();
@@ -517,5 +545,54 @@ mod tests {
                 listener.terminate().await;
             })
             .await;
+    }
+
+    /// B2: removing a key closes the open connection authenticated with it
+    /// and refuses its next handshake
+    #[tokio::test]
+    async fn revoked_key_closes_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut listener, addr, keys) = listener(&cert).await;
+                let (client, event) =
+                    tokio::join!(dial(addr, cert.clone()), next_peer_event(&mut listener));
+                let client = client.expect("client handshake failed");
+                let ListenEvent::Accept { addr: peer, .. } = event else {
+                    panic!("not accepted");
+                };
+
+                keys.write().unwrap().clear();
+                let (ping, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+                client.send(&ping[..len]).await.unwrap();
+                let mut buf = [0u8; MAX_EVENT_SIZE];
+                let closed = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                    .await
+                    .expect("revoked connection kept open");
+                assert!(closed.is_err(), "{closed:?}");
+                assert_eq!(listener.get_certificate_fingerprint(peer).await, None);
+                assert!(
+                    !matches!(
+                        next_event(&mut listener).await,
+                        Some(ListenEvent::Msg { .. })
+                    ),
+                    "event forwarded after revocation"
+                );
+
+                let (client, event) =
+                    tokio::join!(dial(addr, cert), next_peer_event(&mut listener));
+                assert!(client.is_none(), "revoked client accepted again");
+                assert!(matches!(event, ListenEvent::Rejected { .. }));
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// the next listener event if one is queued
+    async fn next_event(listener: &mut MiMouseListener) -> Option<ListenEvent> {
+        tokio::time::timeout(Duration::from_millis(50), listener.next())
+            .await
+            .ok()
+            .flatten()
     }
 }

@@ -42,7 +42,7 @@ pub(crate) enum Policy {
 
 impl Policy {
     /// Err: why a peer presenting `fingerprint` is refused
-    fn check(&self, fingerprint: &str) -> Result<(), String> {
+    pub(crate) fn check(&self, fingerprint: &str) -> Result<(), String> {
         match self {
             Policy::Authorized(keys) => {
                 if keys.read().expect("lock").contains_key(fingerprint) {
