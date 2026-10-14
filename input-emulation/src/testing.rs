@@ -6,7 +6,7 @@ use input_event::Event;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::normalize::Steps;
-use crate::{Edge, Emulation, EmulationError, EmulationHandle, InputEmulation};
+use crate::{Backend, Edge, Emulation, EmulationError, EmulationHandle, InputEmulation, Selected};
 
 /// One call the layer made on the backend.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,8 +48,12 @@ impl Recorder {
     pub(crate) fn wrap(backend: Box<dyn Emulation>) -> (InputEmulation, Calls) {
         let (calls, rx) = unbounded_channel();
         let recorder = Recorder { calls, backend };
+        let configured = Selected {
+            backend: Backend::Dummy,
+            auto: false,
+        };
         (
-            InputEmulation::with_emulation(Box::new(recorder)),
+            InputEmulation::with_emulation(Box::new(recorder), configured),
             Calls(rx),
         )
     }

@@ -25,6 +25,7 @@ use crate::{
     approval,
     config::ReleaseBind,
     connect::{ConnEvent, MiMouseConnection},
+    ipc::BackendInUse,
 };
 
 pub(crate) struct Capture {
@@ -39,8 +40,8 @@ pub(crate) enum ICaptureEvent {
     CaptureBegin(CaptureHandle),
     /// capture disabled
     CaptureDisabled,
-    /// capture disabled
-    CaptureEnabled,
+    /// capture enabled, on this backend (`None`: an injected one)
+    CaptureEnabled(Option<BackendInUse>),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -316,9 +317,13 @@ impl CaptureTask {
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
+        let backend = capture.selected().map(|s| BackendInUse {
+            name: s.backend.to_string(),
+            auto: s.auto,
+        });
         let _capture_guard = DropGuard::new(
             self.event_tx.clone(),
-            ICaptureEvent::CaptureEnabled,
+            ICaptureEvent::CaptureEnabled(backend),
             ICaptureEvent::CaptureDisabled,
         );
 

@@ -1,6 +1,6 @@
 use crate::ipc::{
-    AsyncFrontendListener, ClientHandle, ConnId, FrontendEvent, FrontendRequest, IpcEvent,
-    IpcListenerCreationError, Peer, Position, Reply, Request, Status,
+    AsyncFrontendListener, BackendInUse, ClientHandle, ConnId, FrontendEvent, FrontendRequest,
+    IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
 };
 use crate::{
     approval::reported_status,
@@ -79,10 +79,14 @@ pub struct Service {
     capture_status: Status,
     /// the capture backend waits for the user to approve a permission request
     capture_awaiting: bool,
+    /// the capture backend in use while enabled
+    capture_backend: Option<BackendInUse>,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
     /// the emulation backend waits for the user to approve a permission request
     emulation_awaiting: bool,
+    /// the emulation backend in use while enabled
+    emulation_backend: Option<BackendInUse>,
     /// peers controlling this machine, each with the capture barrier that
     /// gives control back to it
     incoming: HashMap<SocketAddr, Incoming>,
@@ -226,8 +230,10 @@ impl Service {
             port,
             capture_status: Default::default(),
             capture_awaiting: false,
+            capture_backend: None,
             emulation_status: Default::default(),
             emulation_awaiting: false,
+            emulation_backend: None,
             incoming: Default::default(),
             next_trigger_handle: 0,
             notifier,
@@ -361,6 +367,7 @@ impl Service {
                 clients.reply(id)
             }
             FrontendRequest::List => Reply::Clients(clients.infos()),
+            FrontendRequest::Config => Reply::Config(clients.config().report()),
             FrontendRequest::SetHost { id, hostname } => {
                 clients.edit(&fx, id, |c| c.hostname = hostname).await?;
                 clients.reply(id)
@@ -464,6 +471,15 @@ impl Service {
         self.capture.set_release_bind(config.release_bind());
         self.notifier.set_switch_enabled(config.notify_switch());
         self.inhibit.set_enabled(config.idle_inhibit());
+        let pending = config.awaiting_restart();
+        if !pending.is_empty() {
+            let keys: Vec<_> = pending.iter().map(|p| p.key.as_str()).collect();
+            log::warn!(
+                "{:?}: changes to {} take effect after a restart of the service (`mimouse cli config` compares them)",
+                config.config_path(),
+                keys.join(", ")
+            );
+        }
         for event in self.sync_events() {
             self.notify_frontend(event);
         }
@@ -564,10 +580,12 @@ impl Service {
             }
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
+                self.emulation_backend = None;
                 self.notify_frontend(self.emulation_event());
             }
-            EmulationEvent::EmulationEnabled => {
+            EmulationEvent::EmulationEnabled(backend) => {
                 self.emulation_status = Status::Enabled;
+                self.emulation_backend = Some(backend);
                 self.notify_frontend(self.emulation_event());
             }
             EmulationEvent::AwaitingApproval(awaiting) => {
@@ -615,11 +633,13 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
+                self.capture_backend = None;
                 self.notify_frontend(self.capture_event());
                 self.control_switched(None);
             }
-            ICaptureEvent::CaptureEnabled => {
+            ICaptureEvent::CaptureEnabled(backend) => {
                 self.capture_status = Status::Enabled;
+                self.capture_backend = backend;
                 self.notify_frontend(self.capture_event());
             }
             ICaptureEvent::AwaitingApproval(awaiting) => {
@@ -666,6 +686,7 @@ impl Service {
         FrontendEvent::Capture {
             enabled: status.into(),
             status,
+            backend: self.capture_backend.clone(),
         }
     }
 
@@ -674,6 +695,7 @@ impl Service {
         FrontendEvent::Emulation {
             enabled: status.into(),
             status,
+            backend: self.emulation_backend.clone(),
         }
     }
 

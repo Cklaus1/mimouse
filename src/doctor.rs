@@ -28,7 +28,9 @@ use webrtc_dtls::{conn::DTLSConn, crypto::Certificate};
 use crate::{
     config::{self, Config},
     crypto::{self, peers::Policy},
-    ipc::{ClientInfo, ClipboardState, ClipboardStatus, FrontendEvent, connect_async},
+    ipc::{
+        BackendInUse, ClientInfo, ClipboardState, ClipboardStatus, FrontendEvent, connect_async,
+    },
 };
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -120,6 +122,10 @@ struct ServiceState {
     clients: Option<Vec<ClientInfo>>,
     capture: Option<String>,
     emulation: Option<String>,
+    /// the backends in use; `None` while disabled, or from services that do
+    /// not report them
+    capture_backend: Option<BackendInUse>,
+    emulation_backend: Option<BackendInUse>,
     /// `None` from services that do not report it
     clipboard: Option<ClipboardStatus>,
     port: Option<u16>,
@@ -159,12 +165,14 @@ async fn service_state() -> Result<ServiceState, String> {
             let event = event.map_err(|e| e.to_string())?;
             match &event {
                 FrontendEvent::Clients { clients } => state.clients = Some(clients.clone()),
-                FrontendEvent::Capture { .. } => {
+                FrontendEvent::Capture { backend, .. } => {
+                    state.capture_backend = backend.clone();
                     state.capture = serde_json::to_value(&event)
                         .ok()
                         .and_then(|v| status_of(&v))
                 }
-                FrontendEvent::Emulation { .. } => {
+                FrontendEvent::Emulation { backend, .. } => {
+                    state.emulation_backend = backend.clone();
                     state.emulation = serde_json::to_value(&event)
                         .ok()
                         .and_then(|v| status_of(&v))
@@ -198,9 +206,16 @@ fn start_service_fix() -> &'static str {
     return "start it: `systemctl --user start mimouse` or `mimouse daemon`";
 }
 
-fn status_check(name: &str, status: &str, enable: &str) -> Check {
+/// `backend`: the one in use, shown with `enabled`, e.g. `enabled (libei, auto)`
+fn status_check(name: &str, status: &str, backend: Option<&BackendInUse>, enable: &str) -> Check {
     match status {
-        "enabled" => Check::pass(name, "enabled"),
+        "enabled" => Check::pass(
+            name,
+            match backend {
+                Some(backend) => format!("enabled ({backend})"),
+                None => "enabled".to_owned(),
+            },
+        ),
         "awaiting_approval" => Check::warn(
             name,
             "waiting for approval of the desktop portal dialog",
@@ -1100,10 +1115,17 @@ pub async fn checks(config: &Config) -> Vec<Check> {
 
     if let Some(s) = &state {
         if let Some(capture) = &s.capture {
-            checks.push(status_check("capture", capture, "enable-capture"));
+            let backend = s.capture_backend.as_ref();
+            checks.push(status_check("capture", capture, backend, "enable-capture"));
         }
         if let Some(emulation) = &s.emulation {
-            checks.push(status_check("emulation", emulation, "enable-emulation"));
+            let backend = s.emulation_backend.as_ref();
+            checks.push(status_check(
+                "emulation",
+                emulation,
+                backend,
+                "enable-emulation",
+            ));
         }
         if let Some(clipboard) = &s.clipboard {
             checks.push(clipboard_check(clipboard));
@@ -1390,13 +1412,34 @@ Ok.
         let waiting = serde_json::json!({"event": "capture", "status": "awaiting_approval"});
         assert_eq!(status_of(&waiting).as_deref(), Some("awaiting_approval"));
         assert_eq!(
-            status_check("capture", "awaiting_approval", "enable-capture").status,
+            status_check("capture", "awaiting_approval", None, "enable-capture").status,
             Outcome::Warn
         );
         assert_eq!(
-            status_check("capture", "disabled", "enable-capture").status,
+            status_check("capture", "disabled", None, "enable-capture").status,
             Outcome::Fail
         );
+    }
+
+    /// T5: doctor names the backend in use and whether it was picked
+    /// automatically (the A8 fallback); older services report none
+    #[test]
+    fn enabled_check_names_the_backend() {
+        let libei = BackendInUse {
+            name: "libei".into(),
+            auto: true,
+        };
+        let check = status_check("capture", "enabled", Some(&libei), "enable-capture");
+        assert_eq!(check.status, Outcome::Pass);
+        assert_eq!(check.detail, "enabled (libei, auto)");
+        let x11 = BackendInUse {
+            name: "x11".into(),
+            auto: false,
+        };
+        let check = status_check("emulation", "enabled", Some(&x11), "enable-emulation");
+        assert_eq!(check.detail, "enabled (x11, configured)");
+        let old = status_check("emulation", "enabled", None, "enable-emulation");
+        assert_eq!(old.detail, "enabled");
     }
 
     #[test]

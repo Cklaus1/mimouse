@@ -1,5 +1,6 @@
 use crate::approval;
 use crate::connect::Backoff;
+use crate::ipc::BackendInUse;
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
@@ -51,8 +52,8 @@ pub(crate) enum EmulationEvent {
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
     EmulationDisabled,
-    /// emulation was enabled
-    EmulationEnabled,
+    /// emulation was enabled, on this backend
+    EmulationEnabled(BackendInUse),
     /// capture should be released
     ReleaseNotify,
     /// the backend waits for the user to approve emulating input (or no
@@ -335,7 +336,7 @@ impl EmulationProxy {
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
+        if let EmulationEvent::EmulationEnabled(_) = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
@@ -470,9 +471,14 @@ impl EmulationTask {
         self.backoff.reset();
 
         // used to send enabled and disabled events
+        let selected = emulation.selected();
+        let backend = BackendInUse {
+            name: selected.backend.to_string(),
+            auto: selected.auto,
+        };
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
+            EmulationEvent::EmulationEnabled(backend),
             EmulationEvent::EmulationDisabled,
         );
 

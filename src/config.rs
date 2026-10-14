@@ -3,7 +3,7 @@ use crate::emulation_test::TestEmulationArgs;
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env::{self, VarError};
 use std::fmt::Display;
 use std::fs::{self, File};
@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use crate::cli::CliArgs;
-use crate::ipc::{DEFAULT_PORT, Position};
+use crate::ipc::{ConfigReport, ConfigValue, DEFAULT_PORT, Position, RestartPending, Source};
 
 use input_event::scancode::{
     self,
@@ -119,6 +119,16 @@ impl ConfigToml {
             .filter(|c| !c.is_empty());
         self.authorized_fingerprints = self.authorized_fingerprints.filter(|k| !k.is_empty());
         self
+    }
+
+    /// whether clipboard sharing is enabled (default: disabled)
+    fn clipboard(&self) -> bool {
+        self.clipboard.unwrap_or(false)
+    }
+
+    /// largest total size of copied files sent to a client (default: 100 MiB)
+    fn max_file_size(&self) -> u64 {
+        self.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE)
     }
 }
 
@@ -317,6 +327,14 @@ pub struct Config {
     config_dir: PathBuf,
     /// the config in effect (normalized)
     config_toml: ConfigToml,
+    /// the config the service started with: restart-only keys keep its
+    /// values until the next start
+    started: ConfigToml,
+    /// the port the service listens on and where it comes from
+    port: u16,
+    port_source: Source,
+    /// `cert_path` when neither flag nor file sets it
+    default_cert_path: PathBuf,
     /// the snapshot `config_toml` was loaded from, the base of the
     /// three-way merge on save; the last good copy (or the defaults) while
     /// the file is invalid
@@ -481,11 +499,17 @@ impl Config {
         };
 
         // --cert-path <file> overrules default location
+        let default_cert_path = default_path()?.join(CERT_FILE_NAME);
         let cert_path = args
             .cert_path
             .clone()
             .or(config_toml.cert_path.clone())
-            .unwrap_or(default_path()?.join(CERT_FILE_NAME));
+            .unwrap_or_else(|| default_cert_path.clone());
+        let (port, port_source) = match (args.port, config_toml.port) {
+            (Some(port), _) => (port, Source::Flag),
+            (None, Some(port)) => (port, Source::File),
+            (None, None) => (DEFAULT_PORT, Source::Default),
+        };
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
         let watcher = RecommendedWatcher::new(
@@ -500,6 +524,10 @@ impl Config {
             config_path,
             config_dir,
             base: config_toml.clone(),
+            started: config_toml.clone(),
+            port,
+            port_source,
+            default_cert_path,
             config_toml,
             loading: None,
             watcher,
@@ -588,16 +616,16 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// whether clipboard sharing is enabled (default: disabled)
+    /// whether clipboard sharing is enabled (default: disabled); a change
+    /// takes effect at the next start
     pub fn clipboard(&self) -> bool {
-        self.config_toml.clipboard.unwrap_or(false)
+        self.started.clipboard()
     }
 
-    /// largest total size of copied files sent to a client (default: 100 MiB)
+    /// largest total size of copied files sent to a client (default:
+    /// 100 MiB); a change takes effect at the next start
     pub fn max_file_size(&self) -> u64 {
-        self.config_toml
-            .max_file_size
-            .unwrap_or(DEFAULT_MAX_FILE_SIZE)
+        self.started.max_file_size()
     }
 
     /// whether a notification announces each switch of control (default: enabled)
@@ -618,30 +646,169 @@ impl Config {
 
     /// optional input-capture backend override
     pub fn capture_backend(&self) -> Option<CaptureBackend> {
-        self.args
-            .capture_backend
-            .or(self.config_toml.capture_backend)
+        self.args.capture_backend.or(self.started.capture_backend)
     }
 
     /// optional input-emulation backend override
     pub fn emulation_backend(&self) -> Option<EmulationBackend> {
         self.args
             .emulation_backend
-            .or(self.config_toml.emulation_backend)
+            .or(self.started.emulation_backend)
     }
 
-    /// the port to use (initially)
+    /// the port the service listens on: flag, else file, else default at
+    /// the start, then the one `set_port` reported
     pub fn port(&self) -> u16 {
-        self.args
-            .port
-            .or(self.config_toml.port)
-            .unwrap_or(DEFAULT_PORT)
+        self.port
     }
 
     /// the port the service now listens on, written by the next `save`;
     /// a `--port` flag still takes precedence at the next start
     pub fn set_port(&mut self, port: u16) {
+        self.port = port;
+        self.port_source = Source::Cli;
         self.config_toml.port = Some(port);
+    }
+
+    /// each key's value in effect and where it comes from, and the
+    /// restart-only keys changed in the file
+    pub fn report(&self) -> ConfigReport {
+        let (args, file, started) = (&self.args, &self.config_toml, &self.started);
+        let release_bind = self.release_bind();
+        let fingerprints: BTreeMap<_, _> = self.authorized_fingerprints().into_iter().collect();
+        let keys = vec![
+            entry(
+                "capture_backend",
+                json(self.capture_backend()),
+                source(args.capture_backend, &started.capture_backend),
+                true,
+            ),
+            entry(
+                "emulation_backend",
+                json(self.emulation_backend()),
+                source(args.emulation_backend, &started.emulation_backend),
+                true,
+            ),
+            entry("port", json(self.port), self.port_source, true),
+            entry(
+                "release_bind",
+                json(release_bind.keys),
+                source(None::<()>, &file.release_bind),
+                false,
+            ),
+            entry(
+                "release_double_tap_ctrl",
+                json(release_bind.double_tap_ctrl),
+                source(None::<()>, &file.release_double_tap_ctrl),
+                false,
+            ),
+            entry(
+                "cert_path",
+                json(&self.cert_path),
+                source(args.cert_path.as_ref(), &started.cert_path),
+                true,
+            ),
+            entry(
+                "clients",
+                json(file.clients.as_deref().unwrap_or_default()),
+                source(None::<()>, &file.clients),
+                false,
+            ),
+            entry(
+                "authorized_fingerprints",
+                json(fingerprints),
+                source(None::<()>, &file.authorized_fingerprints),
+                false,
+            ),
+            entry(
+                "clipboard",
+                json(self.clipboard()),
+                source(None::<()>, &started.clipboard),
+                true,
+            ),
+            entry(
+                "max_file_size",
+                json(self.max_file_size()),
+                source(None::<()>, &started.max_file_size),
+                true,
+            ),
+            entry(
+                "notify_switch",
+                json(self.notify_switch()),
+                source(None::<()>, &file.notify_switch),
+                false,
+            ),
+            entry(
+                "idle_inhibit",
+                json(self.idle_inhibit()),
+                source(None::<()>, &file.idle_inhibit),
+                false,
+            ),
+            entry(
+                "local_hotkey",
+                json(self.local_hotkey()),
+                source(None::<()>, &file.local_hotkey),
+                false,
+            ),
+        ];
+        ConfigReport {
+            path: self.config_path.clone(),
+            keys,
+            awaiting_restart: self.awaiting_restart(),
+        }
+    }
+
+    /// restart-only keys whose value in the file (as last loaded) differs
+    /// from the one in effect; a key set by a flag ignores the file
+    pub fn awaiting_restart(&self) -> Vec<RestartPending> {
+        let (args, disk, started) = (&self.args, &self.base, &self.started);
+        let disk_cert = disk.cert_path.as_ref().unwrap_or(&self.default_cert_path);
+        let keys = [
+            (
+                "capture_backend",
+                args.capture_backend.is_some(),
+                json(started.capture_backend),
+                json(disk.capture_backend),
+            ),
+            (
+                "emulation_backend",
+                args.emulation_backend.is_some(),
+                json(started.emulation_backend),
+                json(disk.emulation_backend),
+            ),
+            (
+                "port",
+                args.port.is_some(),
+                json(self.port),
+                json(disk.port.unwrap_or(DEFAULT_PORT)),
+            ),
+            (
+                "cert_path",
+                args.cert_path.is_some(),
+                json(&self.cert_path),
+                json(disk_cert),
+            ),
+            (
+                "clipboard",
+                false,
+                json(started.clipboard()),
+                json(disk.clipboard()),
+            ),
+            (
+                "max_file_size",
+                false,
+                json(started.max_file_size()),
+                json(disk.max_file_size()),
+            ),
+        ];
+        keys.into_iter()
+            .filter(|(_, flagged, in_effect, on_disk)| !flagged && in_effect != on_disk)
+            .map(|(key, _, in_effect, on_disk)| RestartPending {
+                key: key.to_owned(),
+                in_effect,
+                on_disk,
+            })
+            .collect()
     }
 
     /// list of configured clients
@@ -696,6 +863,29 @@ impl Config {
         self.base = merged.clone();
         self.config_toml = merged;
         Ok(reload)
+    }
+}
+
+fn json(value: impl Serialize) -> serde_json::Value {
+    serde_json::to_value(value).expect("config serialization")
+}
+
+/// where a key's value comes from: the `flag`, else the `file`, else the
+/// default
+fn source<F, T>(flag: Option<F>, file: &Option<T>) -> Source {
+    match (flag, file) {
+        (Some(_), _) => Source::Flag,
+        (None, Some(_)) => Source::File,
+        (None, None) => Source::Default,
+    }
+}
+
+fn entry(key: &str, value: serde_json::Value, source: Source, restart: bool) -> ConfigValue {
+    ConfigValue {
+        key: key.to_owned(),
+        value,
+        source,
+        restart,
     }
 }
 
@@ -1539,6 +1729,139 @@ future_client_key = "kept"
         let reloaded = tokio::time::timeout(wait, config.changed()).await;
         assert!(reloaded.is_err(), "reloaded on a watcher error");
         assert_eq!(tx.capacity(), 1, "error not consumed");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// reloads `config` from its file, as the watcher does after an edit
+    async fn reload(config: &mut Config) {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        config.watch_rx = rx;
+        let modify = EventKind::Modify(notify::event::ModifyKind::Any);
+        let event = notify::Event::new(modify).add_path(config.config_path.clone());
+        tx.send(Ok(event)).await.unwrap();
+        let wait = std::time::Duration::from_secs(10);
+        tokio::time::timeout(wait, config.changed())
+            .await
+            .expect("reloaded");
+    }
+
+    /// T4: a reload applies hot keys; restart-only keys keep the value the
+    /// service started with and are listed as awaiting a restart, unless a
+    /// flag sets them
+    #[tokio::test]
+    async fn restart_only_change_awaits_restart() {
+        let dir = temp_dir("awaiting-restart");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, COMMENTED).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let mut flagged = Config::from_args(Args::parse_from([
+            "mimouse".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--port".as_ref(),
+            "4400".as_ref(),
+        ]))
+        .unwrap();
+        assert_eq!(config.awaiting_restart(), []);
+        edit(&path, |doc| {
+            doc["port"] = toml_edit::value(4300);
+            doc["clipboard"] = toml_edit::value(true);
+            doc["max_file_size"] = toml_edit::value(1024);
+            doc["idle_inhibit"] = toml_edit::value(false);
+        });
+        reload(&mut config).await;
+        assert!(!config.idle_inhibit(), "hot key applied on reload");
+        assert!(!config.clipboard(), "clipboard changed without a restart");
+        assert_eq!(config.max_file_size(), DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(config.port(), 4242);
+        let pending = |c: &Config| {
+            c.awaiting_restart()
+                .into_iter()
+                .map(|p| (p.key, p.in_effect, p.on_disk))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pending(&config),
+            [
+                ("port".into(), json(4242), json(4300)),
+                ("clipboard".into(), json(false), json(true)),
+                (
+                    "max_file_size".into(),
+                    json(DEFAULT_MAX_FILE_SIZE),
+                    json(1024)
+                ),
+            ]
+        );
+        let report = config.report();
+        assert_eq!(report.awaiting_restart.len(), 3);
+        let idle = report
+            .keys
+            .iter()
+            .find(|k| k.key == "idle_inhibit")
+            .unwrap();
+        assert_eq!((&idle.value, idle.source), (&json(false), Source::File));
+
+        // `--port` wins over the file at the next start too
+        reload(&mut flagged).await;
+        assert_eq!(flagged.port(), 4400);
+        let keys: Vec<_> = pending(&flagged).into_iter().map(|p| p.0).collect();
+        assert_eq!(keys, ["clipboard", "max_file_size"]);
+
+        // `change-port` to the file's port: the live port is what a restart uses
+        config.set_port(4300);
+        assert!(!pending(&config).iter().any(|p| p.0 == "port"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// T4: a flag beats the file, the file beats the default, per key
+    #[tokio::test]
+    async fn effective_config_sources() {
+        let dir = temp_dir("sources");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            "port = 4300\ncapture_backend = \"dummy\"\ncert_path = \"/file.pem\"\nclipboard = true\n",
+        )
+        .unwrap();
+        let config = Config::from_args(Args::parse_from([
+            "mimouse".as_ref(),
+            "--config".as_ref(),
+            path.as_os_str(),
+            "--port".as_ref(),
+            "4400".as_ref(),
+            "--emulation-backend".as_ref(),
+            "dummy".as_ref(),
+            "--cert-path".as_ref(),
+            "/flag.pem".as_ref(),
+        ]))
+        .unwrap();
+        let report = config.report();
+        let key = |name: &str| {
+            let k = report.keys.iter().find(|k| k.key == name).unwrap();
+            (k.value.clone(), k.source, k.restart)
+        };
+        assert_eq!(key("port"), (json(4400), Source::Flag, true));
+        assert_eq!(key("cert_path"), (json("/flag.pem"), Source::Flag, true));
+        assert_eq!(
+            key("emulation_backend"),
+            (json("dummy"), Source::Flag, true)
+        );
+        assert_eq!(key("capture_backend"), (json("dummy"), Source::File, true));
+        assert_eq!(key("clipboard"), (json(true), Source::File, true));
+        let max = json(DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(key("max_file_size"), (max, Source::Default, true));
+        assert_eq!(key("idle_inhibit"), (json(true), Source::Default, false));
+        assert_eq!(key("local_hotkey"), (json(()), Source::Default, false));
+        assert_eq!(report.keys.len(), 13, "every key of the file is reported");
+        assert_eq!(report.awaiting_restart, []);
+
+        // without flags: the file, where it sets the key
+        let config = Config::at(&path).unwrap();
+        let report = config.report();
+        let source = |name: &str| report.keys.iter().find(|k| k.key == name).unwrap().source;
+        assert_eq!(source("port"), Source::File);
+        assert_eq!(source("cert_path"), Source::File);
+        assert_eq!(source("emulation_backend"), Source::Default);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
