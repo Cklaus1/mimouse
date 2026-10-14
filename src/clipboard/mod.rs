@@ -1002,7 +1002,7 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let mut task = task();
-                let (backend, _set) = mpsc::unbounded_channel();
+                let (backend, _set) = set_channel();
                 let handle = task.client_manager.add_client();
                 task.client_manager
                     .set_fix_ips(handle, vec![IpAddr::from([10, 0, 0, 2])]);

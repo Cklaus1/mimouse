@@ -30,7 +30,7 @@ Wave 2
 
 Wave 3
 - [x] N4 B2, B3, B5
-- [ ] S1 A-arch-1, B6, B8
+- [x] S1 A-arch-1, B6, B8
 
 Wave 4
 - [ ] T5 T5

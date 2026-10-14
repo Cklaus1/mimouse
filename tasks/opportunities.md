@@ -31,3 +31,6 @@
 - `clipboard/transport.rs` `Admission::admit`: a cancelled waiter (revocation, connection error) drops its Arc clone without `Admitted::drop`'s cleanup, so a peer's map entry can outlive its last user until that fingerprint's next transfer (bounded by fingerprints ever seen); a waiter guard makes it exact. (P3, from L3)
 - `clipboard/transport.rs` `receive`: an update waiting for an admission slot has no receiver-side timeout; 16 idle authenticated connections can still starve pairing/probes, as before L3. (P3, from L3)
 - `clipboard/transport.rs` `send_to`: files are re-opened per address attempt after the TLS handshake, so an over-cap file costs one handshake per address. (P3, from L3)
+- `src/clients.rs` `Clients::paired`: pairing applies before the save (the peer already trusts us), so a failed save leaves an active trusted client that is gone after restart; only `not_saved` tells the user. (P3, from S1)
+- `src/service.rs` `Shutdown::recv`: `signal::ctrl_c()` is re-created every select iteration; a long-lived listener would be cleaner. (P3, from S1)
+- `src/config.rs:558,686`: the two baseline clippy `redundant reference in info!` warnings are trivial to fix. (P3, from S1)
