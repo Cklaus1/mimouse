@@ -18,3 +18,4 @@
 - `MiMouseListener::get_certificate_fingerprint` recomputes the fingerprint from DTLS state on every Ack; store it with each conn in `conns` (also serves B2, close conns on key revocation). (P3, from N2)
 - After `request_port_change`, conns on the old socket linger until PEER_IDLE_TIMEOUT (10 s); the service could close them right away. (P3, from N2)
 - Vendored webrtc-util tests are not in CI: add `exclude = ["vendor/webrtc-util"]` to the root workspace and run `cargo test --manifest-path vendor/webrtc-util/Cargo.toml --lib conn::` (pulls criterion/tokio-test dev-deps). (P3, from N2)
+- The release workflow publishes no checksums (`.github/workflows/release.yml`); unsigned binaries (D6) leave users nothing to verify a download against. Candidate for R1: a `SHA256SUMS` asset. (P2, from W1)
