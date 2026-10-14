@@ -63,6 +63,8 @@ struct ConfigToml {
     notify_switch: Option<bool>,
     idle_inhibit: Option<bool>,
     local_hotkey: Option<Vec<scancode::Linux>>,
+    telemetry: Option<bool>,
+    telemetry_endpoint: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -750,6 +752,22 @@ impl Config {
                 source(None::<()>, &file.local_hotkey),
                 false,
             ),
+            entry(
+                "telemetry",
+                json(self.telemetry()),
+                source(None::<()>, &file.telemetry),
+                false,
+            ),
+            entry(
+                "telemetry_endpoint",
+                json(
+                    crate::telemetry::endpoint(self.telemetry_endpoint())
+                        .ok()
+                        .map(|e| e.to_string()),
+                ),
+                source(None::<()>, &file.telemetry_endpoint),
+                false,
+            ),
         ];
         ConfigReport {
             path: self.config_path.clone(),
@@ -837,6 +855,33 @@ impl Config {
     /// chord that returns control to this machine from any client
     pub fn local_hotkey(&self) -> Option<Vec<scancode::Linux>> {
         self.config_toml.local_hotkey.clone()
+    }
+
+    /// whether usage statistics are sent (default: disabled); takes effect
+    /// on reload
+    pub fn telemetry(&self) -> bool {
+        self.config_toml.telemetry.unwrap_or(false)
+    }
+
+    /// base URL of the telemetry collector, overriding the built-in one
+    pub fn telemetry_endpoint(&self) -> Option<&str> {
+        self.config_toml.telemetry_endpoint.as_deref()
+    }
+
+    /// saves `telemetry = enabled` like `save` saves the clients; a failed
+    /// save leaves the config in effect unchanged
+    pub async fn save_telemetry(
+        &mut self,
+        enabled: bool,
+        clients: Vec<ConfigClient>,
+        authorized: HashMap<String, String>,
+    ) -> Result<bool, ConfigError> {
+        let previous = self.config_toml.telemetry.replace(enabled);
+        let result = self.save(clients, authorized).await;
+        if result.is_err() {
+            self.config_toml.telemetry = previous;
+        }
+        result
     }
 
     /// writes the config with the runtime's `clients` and `authorized` keys
@@ -1040,7 +1085,7 @@ fn resolve_symlinks(path: &Path) -> io::Result<PathBuf> {
 /// in its directory, renamed over it. Keeps the mode of an existing target;
 /// `private` makes the file owner-only instead. A read-only target is
 /// refused, like writing it in place would be
-fn replace_file(target: &Path, content: &[u8], private: bool) -> io::Result<()> {
+pub(crate) fn replace_file(target: &Path, content: &[u8], private: bool) -> io::Result<()> {
     let permissions = match fs::metadata(target) {
         Ok(m) => Some(m.permissions()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -1852,7 +1897,7 @@ future_client_key = "kept"
         assert_eq!(key("max_file_size"), (max, Source::Default, true));
         assert_eq!(key("idle_inhibit"), (json(true), Source::Default, false));
         assert_eq!(key("local_hotkey"), (json(()), Source::Default, false));
-        assert_eq!(report.keys.len(), 13, "every key of the file is reported");
+        assert_eq!(report.keys.len(), 15, "every key of the file is reported");
         assert_eq!(report.awaiting_restart, []);
 
         // without flags: the file, where it sets the key

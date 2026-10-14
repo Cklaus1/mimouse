@@ -275,6 +275,7 @@ impl Connector {
     async fn reconnect_loop(self, handle: ClientHandle, token: CancellationToken) {
         let mut backoff = Backoff::default();
         let mut first_attempt = true;
+        let mut was_connected = false;
         loop {
             // wait while connected or while an attempt is in flight
             loop {
@@ -283,6 +284,7 @@ impl Connector {
                 changed.as_mut().enable();
                 if self.is_connected(handle).await {
                     backoff.reset();
+                    was_connected = true;
                 } else if !self.connecting.lock().await.contains(&handle) {
                     break;
                 }
@@ -292,6 +294,9 @@ impl Connector {
                 }
             }
             if !first_attempt {
+                if std::mem::take(&mut was_connected) {
+                    crate::telemetry::COUNTERS.reconnects.bump();
+                }
                 // the name may resolve by now (e.g. the network came up
                 // after the service) or point somewhere else
                 self.resolve(handle);
@@ -513,6 +518,7 @@ async fn ping_pong(addr: SocketAddr, conn: &ArcConn, ping_response: &RefCell<Has
         tokio::time::sleep(PING_INTERVAL).await;
 
         if missed.record(ping_response.borrow_mut().remove(&addr)) {
+            crate::telemetry::COUNTERS.ping_timeouts.bump();
             log::warn!(
                 "{addr} did not respond for {:?}, closing connection",
                 PING_INTERVAL * MAX_MISSED_PINGS

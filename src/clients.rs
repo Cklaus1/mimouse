@@ -268,6 +268,21 @@ impl Clients {
         Ok(())
     }
 
+    /// saves `telemetry = enabled`; a failed save changes nothing
+    pub(crate) async fn set_telemetry(&mut self, enabled: bool) -> Result<(), String> {
+        let clients = self.running().into_iter().map(|(_, c)| c).collect();
+        let keys = self.authorized_keys();
+        self.reload |= self
+            .config
+            .save_telemetry(enabled, clients, keys)
+            .await
+            .map_err(|e| {
+                log::warn!("failed to write config: {e}");
+                format!("failed to write config: {e}")
+            })?;
+        Ok(())
+    }
+
     /// saves fingerprints pinned on first use
     pub(crate) async fn save_pins(&mut self) {
         if let Err(e) = self.save().await {

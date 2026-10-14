@@ -235,6 +235,7 @@ async fn run(changes: ChangesTx, status: StatusTx, mut set_rx: SetRx) {
             Err(e @ PortalError::NotGranted) => Some(e.to_string()),
             Err(e) => {
                 log::warn!("clipboard portal: {e}, retrying in {RETRY_DELAY:?}");
+                crate::telemetry::COUNTERS.clipboard_failures.bump();
                 status.send_replace(ClipboardStatus::disabled(format!(
                     "{e}, retrying in {RETRY_DELAY:?}"
                 )));
@@ -243,6 +244,7 @@ async fn run(changes: ChangesTx, status: StatusTx, mut set_rx: SetRx) {
         };
         if let Some(reason) = ended {
             log::warn!("clipboard portal: {reason}");
+            crate::telemetry::COUNTERS.clipboard_failures.bump();
             status.send_replace(ClipboardStatus::disabled(format!(
                 "{reason}; restart the service to ask again"
             )));

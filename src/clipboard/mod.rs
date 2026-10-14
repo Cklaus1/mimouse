@@ -18,7 +18,7 @@
 //! The receiving peer must have authorized the sender's certificate
 //! fingerprint; the sender accepts the receiver its client is pinned to.
 
-mod files;
+pub(crate) mod files;
 mod transport;
 mod wire;
 
@@ -662,6 +662,7 @@ impl ClipboardTask {
         (data, from, fingerprint, accepted): transport::Received,
         backend: &BackendTx,
     ) {
+        crate::telemetry::COUNTERS.transfer(&data);
         let _ = self
             .event_tx
             .send(Transfer::new(ClipboardDirection::Received, from, &data));
@@ -770,6 +771,7 @@ async fn client_sender(
                     match sent.await {
                         Ok(addr) => {
                             log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
+                            crate::telemetry::COUNTERS.transfer(data);
                             let _ = delivered_tx.send(Delivered {
                                 handle,
                                 digest: *digest,
