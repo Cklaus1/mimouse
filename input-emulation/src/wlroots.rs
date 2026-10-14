@@ -48,8 +48,35 @@ use super::{Edge, EmulationHandle};
 /// then and is retried later.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// the seat's keymap, uploaded to every virtual keyboard
+struct Keymap {
+    format: u32,
+    fd: OwnedFd,
+    size: u32,
+    /// the contents: the compositor re-sends an unchanged keymap
+    text: Vec<u8>,
+}
+
+impl Keymap {
+    fn read(format: u32, fd: OwnedFd, size: u32) -> io::Result<Self> {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::from(fd);
+        let mut text = vec![0; size as usize];
+        file.read_exact_at(&mut text, 0)?;
+        Ok(Self {
+            format,
+            fd: file.into(),
+            size,
+            text,
+        })
+    }
+}
+
 struct State {
-    keymap: Option<(u32, OwnedFd, u32)>,
+    keymap: Option<Keymap>,
+    /// the seat's keyboard, which receives the keymap; one at most, since
+    /// each gets every keymap event
+    keyboard: Option<WlKeyboard>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
@@ -126,6 +153,7 @@ impl WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
+                keyboard: None,
                 input_for_client: HashMap::new(),
                 seat,
                 vpm,
@@ -215,8 +243,8 @@ impl State {
         let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
 
         // TODO: use server side keymap
-        if let Some((format, fd, size)) = self.keymap.as_ref() {
-            keyboard.keymap(*format, fd.as_fd(), *size);
+        if let Some(keymap) = self.keymap.as_ref() {
+            keyboard.keymap(keymap.format, keymap.fd.as_fd(), keymap.size);
         } else {
             panic!("no keymap");
         }
@@ -546,19 +574,40 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Keymap { format, fd, size } = event {
-            let format = u32::from(format);
+            // wlroots sends NO_KEYMAP (/dev/null, size 0) while the active
+            // keyboard has none, e.g. a virtual keyboard before its `keymap`
+            // request; uploading that ends the connection (`no_memory`)
+            if format != WEnum::Value(wl_keyboard::KeymapFormat::XkbV1) || size == 0 {
+                log::debug!("ignoring a keymap event without a keymap");
+                return;
+            }
+            let keymap = match Keymap::read(u32::from(format), fd, size) {
+                Ok(keymap) => keymap,
+                Err(e) => {
+                    log::warn!("could not read the keymap: {e}");
+                    return;
+                }
+            };
+            // wlroots sends the keymap to every client whenever it is set,
+            // also when a virtual keyboard uploads it: uploading an
+            // unchanged keymap again would loop and flood the connection
+            if state.keymap.as_ref().is_some_and(|k| k.text == keymap.text) {
+                return;
+            }
             // keyboards made before the change would type the old layout
             for input in state.input_for_client.values() {
-                input.keyboard.keymap(format, fd.as_fd(), size);
+                input
+                    .keyboard
+                    .keymap(keymap.format, keymap.fd.as_fd(), keymap.size);
             }
-            state.keymap = Some((format, fd, size));
+            state.keymap = Some(keymap);
         }
     }
 }
 
 impl Dispatch<WlSeat, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         seat: &WlSeat,
         event: <WlSeat as wayland_client::Proxy>::Event,
         _: &(),
@@ -569,8 +618,12 @@ impl Dispatch<WlSeat, ()> for State {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                seat.get_keyboard(qhandle, ());
+            if !capabilities.contains(wl_seat::Capability::Keyboard) {
+                if let Some(keyboard) = state.keyboard.take() {
+                    keyboard.release();
+                }
+            } else if state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qhandle, ()));
             }
         }
     }
@@ -683,11 +736,13 @@ pub(crate) mod tests {
     }
 
     /// The compositor end of a fake connection: it announces `GLOBALS` and
-    /// answers `wl_display.sync`, anything else the test sends.
+    /// answers `wl_display.sync`, anything else the test sends. It records
+    /// every request as (object, opcode).
     struct Compositor {
         stream: Arc<Mutex<UnixStream>>,
         /// the client's `wl_registry`
         registry: Arc<AtomicU32>,
+        requests: Arc<Mutex<Vec<(u32, u32)>>>,
     }
 
     impl Compositor {
@@ -697,8 +752,13 @@ pub(crate) mod tests {
             let compositor = Self {
                 stream: Arc::new(Mutex::new(server)),
                 registry: Arc::default(),
+                requests: Arc::default(),
             };
-            let (stream, registry) = (compositor.stream.clone(), compositor.registry.clone());
+            let (stream, registry, requests) = (
+                compositor.stream.clone(),
+                compositor.registry.clone(),
+                compositor.requests.clone(),
+            );
             std::thread::spawn(move || {
                 let mut header = [0; 8];
                 // ends when the client hangs up
@@ -709,6 +769,10 @@ pub(crate) mod tests {
                     if reader.read_exact(&mut args).is_err() {
                         return;
                     }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((object, size_opcode & 0xffff));
                     // both requests carry the new object's id first
                     let id = || word(&args);
                     let reply = match (object, size_opcode & 0xffff) {
@@ -740,14 +804,52 @@ pub(crate) mod tests {
             let event = global(registry, name, interface, version);
             self.stream.lock().unwrap().write_all(&event).unwrap();
         }
+
+        /// how many `opcode` requests `object` received
+        fn received(&self, object: &impl Proxy, opcode: u32) -> usize {
+            let id = object.id().protocol_id();
+            let requests = self.requests.lock().unwrap();
+            requests.iter().filter(|&&r| r == (id, opcode)).count()
+        }
     }
 
-    /// a backend bound on `conn`, with a keymap: the fake cannot send one,
-    /// that needs fd passing
+    /// a keymap fd holding `text`, as the compositor sends it
+    fn keymap_fd(text: &str) -> OwnedFd {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("mimouse-keymap-{}-{n}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.into()
+    }
+
+    /// a `wl_keyboard.keymap` event carrying `text`
+    fn keymap_event(text: &str) -> wl_keyboard::Event {
+        wl_keyboard::Event::Keymap {
+            format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+            fd: keymap_fd(text),
+            size: text.len() as u32,
+        }
+    }
+
+    const KEYMAP: &str = "xkb_keymap { us };";
+
+    /// a backend bound on `conn`, with the keymap `KEYMAP`: the fake cannot
+    /// send one, that needs fd passing
     fn bound(conn: &Connection) -> WlrootsEmulation {
         let mut emulation = WlrootsEmulation::bind(conn).unwrap();
-        let keymap = std::fs::File::open("/dev/null").unwrap();
-        emulation.state.keymap = Some((1, keymap.into(), 0));
+        let qh = emulation.queue.handle();
+        let keyboard = WlKeyboard::inert(conn.backend().downgrade());
+        <State as Dispatch<WlKeyboard, ()>>::event(
+            &mut emulation.state,
+            &keyboard,
+            keymap_event(KEYMAP),
+            &(),
+            conn,
+            &qh,
+        );
+        assert!(emulation.state.keymap.is_some());
         emulation
     }
 
@@ -785,5 +887,93 @@ pub(crate) mod tests {
         };
         emulation.consume(Event::Pointer(motion), 1).await.unwrap();
         assert_eq!(emulation.state.outputs.len(), 1);
+    }
+
+    /// wlroots sends `NO_KEYMAP` (/dev/null, size 0) while the seat's active
+    /// keyboard has no keymap, e.g. between a virtual keyboard's creation and
+    /// its `keymap` request. Uploading that to a virtual keyboard makes the
+    /// compositor end the connection (`no_memory`), so it must not replace
+    /// the keymap later keyboards get.
+    #[test]
+    fn a_no_keymap_event_keeps_the_last_keymap() {
+        let (conn, _compositor) = Compositor::start();
+        let mut emulation = bound(&conn);
+        let keyboard = WlKeyboard::inert(conn.backend().downgrade());
+        let devnull = std::fs::File::open("/dev/null").unwrap();
+        let event = wl_keyboard::Event::Keymap {
+            format: WEnum::Value(wl_keyboard::KeymapFormat::NoKeymap),
+            fd: devnull.into(),
+            size: 0,
+        };
+        let qh = emulation.queue.handle();
+        <State as Dispatch<WlKeyboard, ()>>::event(
+            &mut emulation.state,
+            &keyboard,
+            event,
+            &(),
+            &conn,
+            &qh,
+        );
+        let keymap = emulation.state.keymap.as_ref().expect("keymap");
+        assert_eq!(keymap.text, KEYMAP.as_bytes());
+    }
+
+    /// wlroots sends the keymap to every client whenever the seat's keymap
+    /// is set, also when a virtual keyboard uploads one. Uploading an
+    /// unchanged keymap again then makes it send it again: a loop that
+    /// floods the connection until input events are discarded.
+    #[tokio::test]
+    async fn an_unchanged_keymap_is_not_uploaded_again() {
+        let (conn, compositor) = Compositor::start();
+        let mut emulation = bound(&conn);
+        emulation.create(1).await;
+        let qh = emulation.queue.handle();
+        let keyboard = WlKeyboard::inert(conn.backend().downgrade());
+        let mut keymap = |text| {
+            <State as Dispatch<WlKeyboard, ()>>::event(
+                &mut emulation.state,
+                &keyboard,
+                keymap_event(text),
+                &(),
+                &conn,
+                &qh,
+            );
+            emulation.queue.roundtrip(&mut emulation.state).unwrap();
+            let virtual_keyboard = &emulation.state.input_for_client[&1].keyboard;
+            compositor.received(virtual_keyboard, 0)
+        };
+        // the upload when the keyboard was made
+        assert_eq!(keymap(KEYMAP), 1, "unchanged keymap uploaded again");
+        assert_eq!(keymap("xkb_keymap { de };"), 2, "a new layout is uploaded");
+    }
+
+    /// The seat announces its capabilities again whenever a keyboard is
+    /// added or removed. Each keyboard gets every keymap event, so the
+    /// backend keeps exactly one while the seat has a keyboard.
+    #[test]
+    fn the_seat_keyboard_is_requested_once() {
+        let (conn, compositor) = Compositor::start();
+        let mut emulation = bound(&conn);
+        let qh = emulation.queue.handle();
+        let seat = emulation.state.seat.clone();
+        let mut announce = |capabilities| {
+            <State as Dispatch<WlSeat, ()>>::event(
+                &mut emulation.state,
+                &seat,
+                wl_seat::Event::Capabilities {
+                    capabilities: WEnum::Value(capabilities),
+                },
+                &(),
+                &conn,
+                &qh,
+            );
+            emulation.queue.roundtrip(&mut emulation.state).unwrap();
+            compositor.received(&seat, 1)
+        };
+        assert_eq!(announce(wl_seat::Capability::Keyboard), 1);
+        assert_eq!(announce(wl_seat::Capability::Keyboard), 1);
+        // removed and added again: a new keyboard
+        assert_eq!(announce(wl_seat::Capability::empty()), 1);
+        assert_eq!(announce(wl_seat::Capability::Keyboard), 2);
     }
 }

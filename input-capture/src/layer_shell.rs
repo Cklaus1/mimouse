@@ -795,7 +795,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 if let Some(k) = state.keyboard.take() {
                     k.release();
                 }
-                seat.get_keyboard(qh, ());
+                state.keyboard.replace(seat.get_keyboard(qh, ()));
             }
         }
     }
