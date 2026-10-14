@@ -21,6 +21,12 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// button state other than 0 (released) or 1 (pressed)
+    #[error("invalid button state: `{0}`")]
+    ButtonStateOutOfRange(u32),
+    /// scroll axis other than 0 (vertical) or 1 (horizontal)
+    #[error("invalid axis: `{0}`")]
+    AxisOutOfRange(u8),
 }
 
 /// Position of a client
@@ -160,17 +166,17 @@ impl ProtoEvent {
                 Ok(Self::Input(InputEvent::Pointer(PointerEvent::Button {
                     time: decode_u32(&mut buf)?,
                     button: decode_u32(&mut buf)?,
-                    state: decode_u32(&mut buf)?,
+                    state: decode_button_state(&mut buf)?,
                 })))
             }
             EventType::PointerAxis => Ok(Self::Input(InputEvent::Pointer(PointerEvent::Axis {
                 time: decode_u32(&mut buf)?,
-                axis: decode_u8(&mut buf)?,
+                axis: decode_axis(&mut buf)?,
                 value: decode_f64(&mut buf)?,
             }))),
             EventType::PointerAxisValue120 => Ok(Self::Input(InputEvent::Pointer(
                 PointerEvent::AxisDiscrete120 {
-                    axis: decode_u8(&mut buf)?,
+                    axis: decode_axis(&mut buf)?,
                     value: decode_i32(&mut buf)?,
                 },
             ))),
@@ -283,6 +289,21 @@ decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
 
+/// backends convert these to enums and must not see other values
+fn decode_button_state(data: &mut &[u8]) -> Result<u32, ProtocolError> {
+    match decode_u32(data)? {
+        state @ (0 | 1) => Ok(state),
+        state => Err(ProtocolError::ButtonStateOutOfRange(state)),
+    }
+}
+
+fn decode_axis(data: &mut &[u8]) -> Result<u8, ProtocolError> {
+    match decode_u8(data)? {
+        axis @ (0 | 1) => Ok(axis),
+        axis => Err(ProtocolError::AxisOutOfRange(axis)),
+    }
+}
+
 macro_rules! encode_impl {
     ($t:ty) => {
         paste! {
@@ -344,6 +365,50 @@ mod tests {
         assert!(matches!(
             ProtoEvent::decode_padded(buf),
             Ok(ProtoEvent::Enter(Position::Bottom))
+        ));
+    }
+
+    #[test]
+    fn button_state_outside_0_1_is_rejected() {
+        let mut wire = encode(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Button {
+                time: 0,
+                button: 0x110,
+                state: 1,
+            },
+        )));
+        assert!(ProtoEvent::decode(&wire).is_ok());
+        wire[12] = 2;
+        assert!(matches!(
+            ProtoEvent::decode(&wire),
+            Err(ProtocolError::ButtonStateOutOfRange(2))
+        ));
+    }
+
+    #[test]
+    fn axis_outside_0_1_is_rejected() {
+        let mut wire = encode(ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Axis {
+            time: 0,
+            axis: 1,
+            value: 1.0,
+        })));
+        assert!(ProtoEvent::decode(&wire).is_ok());
+        wire[5] = 2;
+        assert!(matches!(
+            ProtoEvent::decode(&wire),
+            Err(ProtocolError::AxisOutOfRange(2))
+        ));
+        let mut wire = encode(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: 120,
+            },
+        )));
+        assert!(ProtoEvent::decode(&wire).is_ok());
+        wire[1] = 2;
+        assert!(matches!(
+            ProtoEvent::decode(&wire),
+            Err(ProtocolError::AxisOutOfRange(2))
         ));
     }
 }

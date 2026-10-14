@@ -21,7 +21,11 @@ impl Emulation for DummyEmulation {
         event: Event,
         client_handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
-        log::info!("received event: ({client_handle}) {event}");
+        match event {
+            // never log what a peer types
+            Event::Keyboard(_) => log::debug!("received keyboard event: ({client_handle})"),
+            Event::Pointer(_) => log::debug!("received event: ({client_handle}) {event}"),
+        }
         Ok(())
     }
     fn enter_at(
@@ -31,7 +35,7 @@ impl Emulation for DummyEmulation {
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
         // there is no pointer to place
-        log::info!("received enter: ({client_handle}) {edge} edge at {fraction}");
+        log::debug!("received enter: ({client_handle}) {edge} edge at {fraction}");
         Ok(None)
     }
     async fn create(&mut self, _: EmulationHandle) {}
