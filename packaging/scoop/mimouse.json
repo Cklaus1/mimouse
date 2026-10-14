@@ -1,5 +1,5 @@
 {
-    "version": "0.11.0",
+    "version": "1.0.0",
     "description": "Software KVM switch: share one mouse and keyboard between computers on a LAN",
     "homepage": "https://github.com/Cklaus1/mimouse",
     "license": "GPL-3.0-or-later",
@@ -10,7 +10,7 @@
     ],
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Cklaus1/mimouse/releases/download/v0.11.0/mimouse-windows-x86_64.exe#/mimouse.exe",
+            "url": "https://github.com/Cklaus1/mimouse/releases/download/v1.0.0/mimouse-windows-x86_64.exe#/mimouse.exe",
             "hash": "@SHA256_WINDOWS_X86_64@"
         }
     },

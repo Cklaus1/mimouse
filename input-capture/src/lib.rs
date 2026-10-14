@@ -625,6 +625,8 @@ mod event_queue {
 
 /// An input capture backend: barriers at screen edges and the events
 /// captured through them.
+// async_trait returns a boxed future, itself `must_use`, from methods that return `Result`
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a barrier at `pos`, covering `range` of the edge (`None`: all);
@@ -643,13 +645,11 @@ pub trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>>
     /// grab input on their own return [`CaptureError::FocusByPointerPush`]:
     /// a pointer pushed through the barrier by the local input emulation
     /// starts it.
-    #[allow(clippy::double_must_use)] // async_trait's boxed future, as for the methods above
     async fn focus(&mut self, pos: Position, range: Option<EdgeRange>) -> Result<(), CaptureError>;
 
     /// Chords that start capture at a position while input is local. Only
     /// backends that see local keys watch them (Windows, macOS); elsewhere
     /// input is local exactly when these keys are invisible to mimouse.
-    #[allow(clippy::double_must_use)]
     async fn set_hotkeys(&mut self, hotkeys: Vec<(Chord, Position)>) -> Result<(), CaptureError>;
 
     /// destroy the input capture

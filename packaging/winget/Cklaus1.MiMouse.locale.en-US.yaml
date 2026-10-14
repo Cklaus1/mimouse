@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 
 PackageIdentifier: Cklaus1.MiMouse
-PackageVersion: 0.11.0
+PackageVersion: 1.0.0
 PackageLocale: en-US
 Publisher: Cklaus1
 PublisherUrl: https://github.com/Cklaus1
@@ -22,6 +22,6 @@ Tags:
 - mouse
 - input-sharing
 - clipboard
-ReleaseNotesUrl: https://github.com/Cklaus1/mimouse/releases/tag/v0.11.0
+ReleaseNotesUrl: https://github.com/Cklaus1/mimouse/releases/tag/v1.0.0
 ManifestType: defaultLocale
 ManifestVersion: 1.10.0

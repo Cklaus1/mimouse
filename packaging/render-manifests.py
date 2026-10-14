@@ -7,9 +7,9 @@ the release artifacts, writes the results to --out (same layout) and, with
 --validate, checks them against the official Scoop and winget JSON schemas
 (needs network, `jsonschema` and `pyyaml`).
 
-  packaging/render-manifests.py --version 0.11.0 \
+  packaging/render-manifests.py --version 1.0.0 \
       --windows-exe mimouse-windows-x86_64.exe \
-      --source-tarball mimouse-0.11.0.tar.gz \
+      --source-tarball mimouse-1.0.0.tar.gz \
       --out manifests --validate
 """
 

@@ -652,7 +652,7 @@ impl Config {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 )
             {
-                log::info!("reading config from {:?}", &self.config_path);
+                log::info!("reading config from {:?}", self.config_path);
                 let path = self.config_path.clone();
                 self.loading = Some(tokio::task::spawn_blocking(move || {
                     let (config, text) = ConfigToml::load(&path)?;
@@ -972,7 +972,7 @@ impl Config {
         clients: Vec<ConfigClient>,
         authorized: HashMap<String, String>,
     ) -> Result<bool, ConfigError> {
-        log::info!("writing config to {:?}", &self.config_path);
+        log::info!("writing config to {:?}", self.config_path);
         let mut memory = self.config_toml.clone();
         memory.clients = Some(clients.into_iter().map(TomlClient::from).collect());
         memory.authorized_fingerprints = Some(authorized);
