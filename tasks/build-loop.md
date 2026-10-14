@@ -49,7 +49,7 @@ Tracks group tasks by file scope; each track runs in its own worktree `/home/ckl
 | L1 | A11 | clip | src/clipboard/{windows,portal,mod}.rs | - |
 | L2 | B21, B22, B23, B24 | clip | src/clipboard/*, src/cli.rs, src/doctor.rs (status) | L1, I2 |
 | L3 | C6, C7, C8 | clip | src/clipboard/* | L2 |
-| S1 | A-arch-1, B6, B8 | svc | src/service.rs, src/client.rs, src/dns.rs, src/clipboard/mod.rs (`ClientRemoved`) | G2, N4, N5, K3, I2, L2 |
+| S1 | A-arch-1, B6, B8 | svc | src/service.rs, src/client.rs, src/dns.rs, src/clipboard/mod.rs (`ClientRemoved`) [REVISED 2026-10-14: + src/config.rs `changed()` (watcher Err was `expect`ed, aborting the service; now log + continue), approved by integrator; no concurrent owner] | G2, N4, N5, K3, I2, L2 |
 | T5 | T5 | svc | src/ipc/mod.rs, src/cli.rs, src/doctor.rs, input-capture/src/lib.rs, input-emulation/src/lib.rs | S1, E2, K4 |
 | T2 | T2 | cfg | src/config.rs, consts in src/{connect,emulation,pair}.rs | S1, X1 |
 | T3 | T3 | svc | Cargo.toml (dev tokio `test-util`), tests in src/{connect,capture,inhibit,approval}.rs | S1 |
