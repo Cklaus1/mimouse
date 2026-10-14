@@ -6,6 +6,11 @@
 //! receives the current clipboard as soon as the cursor enters it, similar to
 //! Deskflow's push-on-enter behaviour.
 //!
+//! Copies marked secret by a password manager are never sent. Clearing the
+//! clipboard (the owner offers no format at all) is sent as an empty update
+//! and clears the peers' clipboards; a copy without a supported format is
+//! not sent and does not clear them.
+//!
 //! Copied files (no directories) are sent only to the client the cursor
 //! enters, up to `max_file_size` bytes in total; the receiver stores them in
 //! its cache directory and puts them on its clipboard as files.
@@ -82,7 +87,6 @@ impl ClipboardData {
             .map(|(_, d)| d.as_slice())
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty() && self.files.is_empty()
     }
@@ -117,6 +121,67 @@ impl ClipboardData {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+/// mime type with which Linux password managers (KeePassXC) mark a copy as
+/// secret, value `secret`
+const SECRET_MIME: &str = "x-kde-passwordManagerHint";
+/// Windows format whose presence keeps a copy from clipboard monitors
+const WIN_EXCLUDE_FORMAT: &str = "ExcludeClipboardContentFromMonitorProcessing";
+/// Windows format holding a DWORD; zero keeps a copy out of the history
+const WIN_HISTORY_FORMAT: &str = "CanIncludeInClipboardHistory";
+/// Windows formats that may mark a copy as secret
+#[cfg_attr(not(windows), allow(dead_code))]
+const WIN_MARKERS: [&str; 2] = [WIN_EXCLUDE_FORMAT, WIN_HISTORY_FORMAT];
+
+/// what the owner of the local clipboard offers; platform-independent so
+/// the backends' decisions are tested on every host
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+enum Offer {
+    /// no format at all: the clipboard was cleared, sent as an empty update
+    Nothing,
+    /// marked secret by a password manager: neither read, sent nor stored
+    Secret,
+    /// formats to read; a copy without any supported format is not sent and
+    /// is not a clear either
+    Formats,
+}
+
+impl Offer {
+    /// classify by the mime types offered (xdg-desktop-portal); the secret
+    /// hint counts whatever its value, reading it would take a transfer
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+    fn from_mime_types(mime_types: &[String]) -> Self {
+        if mime_types.is_empty() {
+            Self::Nothing
+        } else if mime_types.iter().any(|m| m == SECRET_MIME) {
+            Self::Secret
+        } else {
+            Self::Formats
+        }
+    }
+
+    /// classify by the number of Windows clipboard formats and the marker
+    /// formats present (name, contents); a history marker that is not a
+    /// nonzero DWORD counts as secret
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn from_windows_formats(count: usize, markers: &[(&str, Vec<u8>)]) -> Self {
+        let secret = |(name, value): &(&str, Vec<u8>)| match *name {
+            WIN_EXCLUDE_FORMAT => true,
+            WIN_HISTORY_FORMAT => value
+                .first_chunk::<4>()
+                .is_none_or(|v| u32::from_le_bytes(*v) == 0),
+            _ => false,
+        };
+        if count == 0 {
+            Self::Nothing
+        } else if markers.iter().any(secret) {
+            Self::Secret
+        } else {
+            Self::Formats
+        }
     }
 }
 
@@ -249,8 +314,12 @@ impl Clipboard {
 /// a local clipboard backend: receives clipboard contents to set locally,
 /// reports local clipboard changes through the sender passed to `spawn`
 type BackendTx = mpsc::UnboundedSender<Arc<ClipboardData>>;
+/// local clipboard changes: the contents to send (empty for a clear), or
+/// `None` when the clipboard holds contents that are not shared (marked
+/// secret, no supported format)
+type ChangesTx = mpsc::UnboundedSender<Option<Arc<ClipboardData>>>;
 
-fn spawn_backend(changes: BackendTx) -> Option<BackendTx> {
+fn spawn_backend(changes: ChangesTx) -> Option<BackendTx> {
     #[cfg(all(unix, not(target_os = "macos")))]
     return Some(portal::spawn(changes));
     #[cfg(windows)]
@@ -357,16 +426,25 @@ impl ClipboardTask {
         listener.abort();
     }
 
-    fn local_changed(&mut self, data: Arc<ClipboardData>) {
+    fn local_changed(&mut self, change: Option<Arc<ClipboardData>>) {
+        let Some(data) = change else {
+            // entering a client must not push the previous contents
+            self.current = None;
+            return;
+        };
         let digest = data.digest();
         if self.current.as_ref().is_some_and(|(d, _)| *d == digest) {
             return;
         }
-        log::info!(
-            "local clipboard changed ({} bytes: {})",
-            data.total_size(),
-            data.mime_types().collect::<Vec<_>>().join(", ")
-        );
+        if data.is_empty() {
+            log::info!("local clipboard cleared");
+        } else {
+            log::info!(
+                "local clipboard changed ({} bytes: {})",
+                data.total_size(),
+                data.mime_types().collect::<Vec<_>>().join(", ")
+            );
+        }
         if data.files_size() > self.max_file_size {
             log::warn!(
                 "clipboard: copied files are not sent: {} bytes exceed max_file_size ({} bytes)",
@@ -510,4 +588,66 @@ fn client_addrs(client_manager: &ClientManager, handle: ClientHandle) -> Option<
         }
     }
     Some(addrs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn portal(mimes: &[&str]) -> Offer {
+        Offer::from_mime_types(&mimes.iter().map(|m| m.to_string()).collect::<Vec<_>>())
+    }
+
+    fn windows(count: usize, markers: &[(&str, &[u8])]) -> Offer {
+        let markers: Vec<_> = markers.iter().map(|(n, v)| (*n, v.to_vec())).collect();
+        Offer::from_windows_formats(count, &markers)
+    }
+
+    #[test]
+    fn portal_secret_marker() {
+        // KeePassXC on Linux
+        assert_eq!(
+            portal(&["text/plain", "x-kde-passwordManagerHint"]),
+            Offer::Secret
+        );
+        assert_eq!(portal(&[MIME_TEXT, "UTF8_STRING"]), Offer::Formats);
+    }
+
+    #[test]
+    fn portal_clear_is_not_unsupported() {
+        assert_eq!(portal(&[]), Offer::Nothing);
+        assert_eq!(portal(&["application/x-unsupported"]), Offer::Formats);
+    }
+
+    #[test]
+    fn windows_secret_markers() {
+        // KeePassXC on Windows
+        let keepassxc: &[(&str, &[u8])] = &[
+            ("ExcludeClipboardContentFromMonitorProcessing", b"1"),
+            ("CanIncludeInClipboardHistory", &[0; 4]),
+        ];
+        assert_eq!(windows(5, keepassxc), Offer::Secret);
+        for markers in [
+            &[("ExcludeClipboardContentFromMonitorProcessing", &b""[..])][..],
+            &[("CanIncludeInClipboardHistory", &[0; 4])],
+            // malformed: not a DWORD
+            &[("CanIncludeInClipboardHistory", &[1])],
+        ] {
+            assert_eq!(windows(3, markers), Offer::Secret, "{markers:?}");
+        }
+        for markers in [
+            &[][..],
+            &[("CanIncludeInClipboardHistory", &[1, 0, 0, 0][..])],
+            &[("CanUploadToCloudClipboard", &[0; 4])],
+        ] {
+            assert_eq!(windows(3, markers), Offer::Formats, "{markers:?}");
+        }
+    }
+
+    #[test]
+    fn windows_clear_is_not_unsupported() {
+        assert_eq!(windows(0, &[]), Offer::Nothing);
+        // e.g. only a private format no backend reads
+        assert_eq!(windows(1, &[]), Offer::Formats);
+    }
 }

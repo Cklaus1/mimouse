@@ -7,6 +7,11 @@
 //!
 //! Copied files are read from and offered as `text/uri-list` and
 //! `x-special/gnome-copied-files` (Nautilus).
+//!
+//! Copies offering `x-kde-passwordManagerHint` are secret and never read; an
+//! owner change without mime types is a clear, held back for
+//! [`RESTORE_WINDOW`] so that contents restored after a secret copy are
+//! dropped.
 
 use std::{
     borrow::Cow,
@@ -36,11 +41,12 @@ use tokio::{
     net::unix::pipe,
     sync::mpsc,
     task::{spawn_blocking, spawn_local},
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
 
 use super::{
-    BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML, MIME_PNG, MIME_TEXT,
+    BackendTx, ChangesTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML, MIME_PNG,
+    MIME_TEXT, Offer,
     files::{FileRef, cache_dir, local_files},
 };
 
@@ -49,6 +55,13 @@ const GNOME_FILES: &str = "x-special/gnome-copied-files";
 
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a local clear is held back. When the clipboard owner goes away
+/// (it exits, or a portal client unsets its selection), mutter's clipboard
+/// manager re-owns the clipboard right away (within the same signal
+/// emission, or 10 ms later for X11 clients) with the text or image it
+/// saved from that owner, without the owner's secret marker.
+const RESTORE_WINDOW: Duration = Duration::from_millis(300);
 
 /// mime types offered for each canonical format, most specific first
 const TEXT_MIMES: &[&str] = &[
@@ -86,13 +99,77 @@ impl From<tokio::time::error::Elapsed> for PortalError {
     }
 }
 
-pub(super) fn spawn(changes: BackendTx) -> BackendTx {
+/// what to do about a change of the clipboard owner
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// nothing for now (a clear is held back)
+    Wait,
+    /// send a clear instead of the restored contents of a secret copy
+    DropRestore,
+    /// a copy marked secret: not shared
+    Secret,
+    /// read the offered formats and send them
+    Read,
+}
+
+/// local owner changes; a clear waits for `RESTORE_WINDOW` so that
+/// contents restored after a secret copy are dropped
+struct OwnerChanges {
+    /// the latest offer other than a held-back clear
+    last: Offer,
+    /// when the held-back clear is due
+    clear_at: Option<Instant>,
+}
+
+impl OwnerChanges {
+    fn new() -> Self {
+        Self {
+            last: Offer::Formats,
+            clear_at: None,
+        }
+    }
+
+    /// another client became the owner at `now`
+    fn changed(&mut self, offer: Offer, now: Instant) -> Step {
+        if offer == Offer::Nothing {
+            self.clear_at.get_or_insert(now + RESTORE_WINDOW);
+            return Step::Wait;
+        }
+        // a restore keeps `last`, so restoring the secret again is dropped too
+        if self.clear_at.take().is_some() && self.last == Offer::Secret {
+            return Step::DropRestore;
+        }
+        self.last = offer;
+        match offer {
+            Offer::Secret => Step::Secret,
+            _ => Step::Read,
+        }
+    }
+
+    /// whether the held-back clear is due at `now`; it is sent only once
+    fn clear_due(&mut self, now: Instant) -> bool {
+        if self.clear_at.is_none_or(|at| at > now) {
+            return false;
+        }
+        self.clear_at = None;
+        self.last = Offer::Nothing;
+        true
+    }
+
+    /// we set the clipboard, which voids a held-back clear
+    fn set_by_us(&mut self) {
+        self.clear_at = None;
+        self.last = Offer::Formats;
+    }
+}
+
+pub(super) fn spawn(changes: ChangesTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
     spawn_local(run(changes, rx));
     tx
 }
 
-async fn run(changes: BackendTx, mut set_rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>) {
+async fn run(changes: ChangesTx, mut set_rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>) {
     // contents we own (set from a remote device), kept across portal sessions
     let mut owned: Option<Arc<ClipboardData>> = None;
     loop {
@@ -122,7 +199,7 @@ async fn run(changes: BackendTx, mut set_rx: mpsc::UnboundedReceiver<Arc<Clipboa
 
 /// runs one portal session; returns Ok(()) on shutdown
 async fn session(
-    changes: &BackendTx,
+    changes: &ChangesTx,
     set_rx: &mut mpsc::UnboundedReceiver<Arc<ClipboardData>>,
     owned: &mut Option<Arc<ClipboardData>>,
 ) -> Result<(), PortalError> {
@@ -170,7 +247,9 @@ async fn session(
         set_selection(&clipboard, &session, data).await?;
     }
 
+    let mut owner_changes = OwnerChanges::new();
     loop {
+        let clear_at = owner_changes.clear_at;
         tokio::select! {
             event = owner_changed.next() => {
                 let Some((_, event)) = event else { return Err(PortalError::Closed) };
@@ -178,15 +257,37 @@ async fn session(
                     continue;
                 }
                 *owned = None;
-                match read_selection(&clipboard, &session, event.mime_types()).await {
-                    Ok(data) if !data.is_empty() => {
-                        let _ = changes.send(Arc::new(data));
+                let mime_types = event.mime_types();
+                match owner_changes.changed(Offer::from_mime_types(mime_types), Instant::now()) {
+                    Step::Wait => {}
+                    Step::DropRestore => {
+                        log::debug!("clipboard portal: secret restored by compositor, not sent");
+                        let _ = changes.send(Some(Arc::new(ClipboardData::default())));
                     }
-                    Ok(_) => log::debug!(
-                        "clipboard portal: no supported format in {:?}",
-                        event.mime_types()
-                    ),
-                    Err(e) => log::warn!("clipboard portal: failed to read clipboard: {e}"),
+                    Step::Secret => {
+                        log::debug!("clipboard portal: not sending a copy marked secret");
+                        let _ = changes.send(None);
+                    }
+                    Step::Read => match read_selection(&clipboard, &session, mime_types).await {
+                        Ok(data) if data.is_empty() => {
+                            log::debug!("clipboard portal: no supported format in {mime_types:?}");
+                            let _ = changes.send(None);
+                        }
+                        Ok(data) => {
+                            let _ = changes.send(Some(Arc::new(data)));
+                        }
+                        Err(e) => log::warn!("clipboard portal: failed to read clipboard: {e}"),
+                    },
+                }
+            }
+            _ = async move {
+                match clear_at {
+                    Some(at) => sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if owner_changes.clear_due(Instant::now()) {
+                    let _ = changes.send(Some(Arc::new(ClipboardData::default())));
                 }
             }
             transfer = transfers.next() => {
@@ -211,6 +312,7 @@ async fn session(
                     data = newer;
                 }
                 set_selection(&clipboard, &session, &data).await?;
+                owner_changes.set_by_us();
                 *owned = Some(data);
             }
             _ = closed.next() => return Err(PortalError::Closed),
@@ -220,6 +322,9 @@ async fn session(
 
 /// the data to serve for a requested mime type
 fn lookup<'a>(data: &'a ClipboardData, mime: &str) -> Option<Cow<'a, [u8]>> {
+    if data.is_empty() {
+        return TEXT_MIMES.contains(&mime).then_some(Cow::Borrowed(&[]));
+    }
     if !data.files().is_empty() {
         match mime {
             MIME_FILES => return Some(Cow::Owned(uri_list(data.files()))),
@@ -239,11 +344,17 @@ async fn set_selection(
     session: &Session<RemoteDesktop>,
     data: &ClipboardData,
 ) -> Result<(), PortalError> {
-    let mut mimes: Vec<&str> = FORMATS
-        .iter()
-        .filter(|(canonical, _)| data.get(canonical).is_some())
-        .flat_map(|(_, mimes)| mimes.iter().copied())
-        .collect();
+    // a clear is set as empty text: when the selection is unset instead,
+    // mutter's clipboard manager restores the previous contents
+    let mut mimes: Vec<&str> = if data.is_empty() {
+        TEXT_MIMES.to_vec()
+    } else {
+        FORMATS
+            .iter()
+            .filter(|(canonical, _)| data.get(canonical).is_some())
+            .flat_map(|(_, mimes)| mimes.iter().copied())
+            .collect()
+    };
     if !data.files().is_empty() {
         mimes.extend([MIME_FILES, GNOME_FILES]);
     }
@@ -446,9 +557,70 @@ fn gnome_copied_files(files: &[FileRef]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
-    use super::{file_uri, parse_uri_list};
+    use tokio::time::Instant;
+
+    use super::{super::Offer, OwnerChanges, RESTORE_WINDOW, Step, file_uri, parse_uri_list};
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn restored_secret_is_dropped() {
+        let t = Instant::now();
+        let mut changes = OwnerChanges::new();
+        assert_eq!(changes.changed(Offer::Secret, t), Step::Secret);
+        // the owner exits, mutter restores its text without the marker
+        assert_eq!(changes.changed(Offer::Nothing, t), Step::Wait);
+        assert_eq!(changes.changed(Offer::Formats, t + MS), Step::DropRestore);
+        // the clear went out with the dropped restore
+        assert!(!changes.clear_due(t + RESTORE_WINDOW));
+        // restoring it again is dropped too
+        let t = t + 1000 * MS;
+        assert_eq!(changes.changed(Offer::Nothing, t), Step::Wait);
+        assert_eq!(changes.changed(Offer::Formats, t + MS), Step::DropRestore);
+        // a new copy is read
+        assert_eq!(changes.changed(Offer::Formats, t + 1000 * MS), Step::Read);
+    }
+
+    #[test]
+    fn restore_after_a_plain_copy_is_read() {
+        let t = Instant::now();
+        let mut changes = OwnerChanges::new();
+        assert_eq!(changes.changed(Offer::Formats, t), Step::Read);
+        assert_eq!(changes.changed(Offer::Nothing, t), Step::Wait);
+        assert_eq!(changes.changed(Offer::Formats, t + MS), Step::Read);
+        assert!(!changes.clear_due(t + RESTORE_WINDOW));
+    }
+
+    #[test]
+    fn clear_is_sent_once_after_the_window() {
+        let t = Instant::now();
+        let mut changes = OwnerChanges::new();
+        assert_eq!(changes.changed(Offer::Secret, t), Step::Secret);
+        assert_eq!(changes.changed(Offer::Nothing, t), Step::Wait);
+        // a second clear does not extend the window
+        assert_eq!(changes.changed(Offer::Nothing, t + 100 * MS), Step::Wait);
+        assert!(!changes.clear_due(t + RESTORE_WINDOW - MS));
+        assert!(changes.clear_due(t + RESTORE_WINDOW));
+        assert!(!changes.clear_due(t + 2 * RESTORE_WINDOW));
+        // the next owner is a new copy
+        assert_eq!(
+            changes.changed(Offer::Formats, t + 2 * RESTORE_WINDOW),
+            Step::Read
+        );
+    }
+
+    #[test]
+    fn own_selection_voids_a_held_back_clear() {
+        let t = Instant::now();
+        let mut changes = OwnerChanges::new();
+        assert_eq!(changes.changed(Offer::Secret, t), Step::Secret);
+        assert_eq!(changes.changed(Offer::Nothing, t), Step::Wait);
+        changes.set_by_us();
+        assert!(!changes.clear_due(t + RESTORE_WINDOW));
+        assert_eq!(changes.changed(Offer::Formats, t + MS), Step::Read);
+    }
 
     fn paths(list: &str) -> Vec<PathBuf> {
         parse_uri_list(list.as_bytes())
