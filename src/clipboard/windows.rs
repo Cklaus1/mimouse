@@ -1,27 +1,33 @@
 //! Windows clipboard backend.
 //!
 //! A monitor thread receives `WM_CLIPBOARDUPDATE` and reads text
-//! (`CF_UNICODETEXT`), HTML (`HTML Format`) and images (`PNG`, falling back to
-//! `CF_BITMAP` converted to PNG). A writer thread sets remote contents.
+//! (`CF_UNICODETEXT`), HTML (`HTML Format`), images (`PNG`, falling back to
+//! `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`), skipping
+//! copies marked secret and reporting an empty clipboard as a clear. A
+//! writer thread sets remote contents.
 //! Our own writes are recognized by their clipboard sequence number.
 
 use std::{
     io::Cursor,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clipboard_win::{
     Clipboard, Getter, Monitor, SysResult,
-    formats::{CF_DIB, CF_UNICODETEXT, Html, RawData, Unicode},
+    formats::{CF_DIB, CF_HDROP, CF_UNICODETEXT, FileList, Html, RawData, Unicode},
     options::NoClear,
     raw,
 };
 use image::ImageFormat;
-use tokio::sync::mpsc;
 
-use super::{BackendTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT};
+use super::{
+    BackendTx, ChangesTx, ClipboardData, LocalChange, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
+    MIME_TEXT, Offer, SetRx, StatusTx, WIN_MARKERS, files::local_files, own_seq_after_write,
+    set_channel,
+};
+use crate::ipc::{ClipboardState, ClipboardStatus};
 
 const OPEN_ATTEMPTS: usize = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -30,21 +36,44 @@ const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
 // fails with OS error 1418 and no further update is posted for that change
 const READ_ATTEMPTS: usize = 10;
 const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
+// writers often update in steps (OleSetClipboard, then OleFlushClipboard
+// right away); opening the clipboard on the first update makes their next
+// step fail (`Set-Clipboard` errors), so read once updates stop for this long
+const SETTLE_DELAY: Duration = Duration::from_millis(100);
+const SETTLE_ROUNDS: usize = 10;
 
-pub(super) fn spawn(changes: BackendTx) -> BackendTx {
-    let (tx, rx) = mpsc::unbounded_channel();
-    // sequence number of the clipboard after our latest write; the lock
-    // serializes clipboard access between the two threads, so the monitor
-    // sees the final value of a write before deciding whether it was ours
-    let own_seq = Arc::new(Mutex::new(0u32));
-    let seq = own_seq.clone();
+/// what the monitor and the writer share; the lock serializes clipboard
+/// access between the two threads, so the monitor sees the final value of a
+/// write before deciding whether it was ours, and the writer sees a copy the
+/// monitor noticed before it overwrites the clipboard
+#[derive(Default)]
+struct Own {
+    /// sequence number of the clipboard after our latest write
+    seq: u32,
+    /// when the monitor last noticed a change that was not our write
+    local: Option<Instant>,
+}
+
+pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
+    let (tx, rx) = set_channel();
+    let own = Arc::new(Mutex::new(Own::default()));
+    let monitor_own = own.clone();
     thread::Builder::new()
         .name("clipboard-monitor".into())
-        .spawn(move || monitor(changes, seq))
+        .spawn(move || {
+            // received contents are still set when monitoring fails
+            if let Err(e) = monitor(changes, &status, monitor_own) {
+                log::warn!("clipboard: {e}");
+                crate::telemetry::COUNTERS.clipboard_failures.bump();
+                status.send_replace(ClipboardStatus::disabled(format!(
+                    "{e}; local copies are not sent"
+                )));
+            }
+        })
         .expect("spawn thread");
     thread::Builder::new()
         .name("clipboard-writer".into())
-        .spawn(move || writer(rx, own_seq))
+        .spawn(move || writer(rx, own))
         .expect("spawn thread");
     tx
 }
@@ -53,44 +82,79 @@ fn seq_num() -> u32 {
     raw::seq_num().map_or(0, |n| n.get())
 }
 
-fn monitor(changes: BackendTx, own_seq: Arc<Mutex<u32>>) {
-    let mut monitor = match Monitor::new() {
-        Ok(m) => m,
-        Err(e) => return log::warn!("clipboard: failed to monitor clipboard: {e}"),
+/// reports clipboard changes until the receiving end is gone (Ok) or
+/// monitoring fails
+fn monitor(changes: ChangesTx, status: &StatusTx, own: Arc<Mutex<Own>>) -> Result<(), String> {
+    let mut monitor =
+        Monitor::new().map_err(|e| format!("failed to monitor the clipboard: {e}"))?;
+    status.send_replace(ClipboardStatus::new(ClipboardState::Enabled));
+    // records a change noticed at `changed` unless the clipboard holds our
+    // write; returns whether it does
+    let ours = |own: &mut Own, changed: Option<Instant>| {
+        if own.seq == seq_num() {
+            return true;
+        }
+        own.local = own.local.max(changed);
+        false
     };
     // returns false once the receiving end is gone
-    let report = || {
-        let own = own_seq.lock().expect("lock");
-        if *own == seq_num() {
+    let report = |changed: Option<Instant>| {
+        let mut own = own.lock().expect("lock");
+        if ours(&mut own, changed) {
             return true;
         }
         let data = read_settled();
         drop(own);
         match data {
-            Ok(data) if data.is_empty() => true,
-            Ok(data) => changes.send(Arc::new(data)).is_ok(),
+            Ok(data) => match LocalChange::read(changed, data) {
+                Some(change) => changes.send(change).is_ok(),
+                None => true,
+            },
             Err(e) => {
                 log::warn!("clipboard: failed to read clipboard: {e}");
                 true
             }
         }
     };
-    if !report() {
-        return;
+    if !report(None) {
+        return Ok(());
     }
     loop {
         match monitor.recv() {
             Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => return log::warn!("clipboard: monitor failed: {e}"),
+            Ok(false) => return Ok(()),
+            Err(e) => return Err(format!("clipboard monitor failed: {e}")),
         }
-        if !report() {
-            return;
+        let changed = Some(Instant::now());
+        // B21: the writer must not overwrite this copy with an older update
+        // while it settles
+        ours(&mut own.lock().expect("lock"), changed);
+        if let Err(e) = settle(&mut monitor) {
+            return Err(format!("clipboard monitor failed: {e}"));
+        }
+        if !report(changed) {
+            return Ok(());
         }
     }
 }
 
-fn read_settled() -> SysResult<ClipboardData> {
+/// wait until no clipboard update arrived for `SETTLE_DELAY` (at most
+/// `SETTLE_ROUNDS` times), consuming the updates seen meanwhile
+fn settle(monitor: &mut Monitor) -> SysResult<()> {
+    for _ in 0..SETTLE_ROUNDS {
+        thread::sleep(SETTLE_DELAY);
+        let mut updated = false;
+        while monitor.try_recv()? {
+            updated = true;
+        }
+        if !updated {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn read_settled() -> SysResult<Option<ClipboardData>> {
     let mut attempts = READ_ATTEMPTS;
     loop {
         match read() {
@@ -104,11 +168,24 @@ fn read_settled() -> SysResult<ClipboardData> {
     }
 }
 
-fn read() -> SysResult<ClipboardData> {
+/// the update to report: empty if the clipboard was cleared, `None` for
+/// secret copies and copies without a supported format
+fn read() -> SysResult<Option<ClipboardData>> {
     let mut data = ClipboardData::default();
     let mut bitmap = None;
+    let mut paths: Vec<String> = Vec::new();
     {
         let _clipboard = open()?;
+        // `None` (the count failed) is not taken for a clear
+        let count = raw::count_formats().unwrap_or(usize::MAX);
+        match Offer::from_windows_formats(count, &markers()) {
+            Offer::Nothing => return Ok(Some(data)),
+            Offer::Secret => {
+                log::debug!("clipboard: not sending a copy marked secret");
+                return Ok(None);
+            }
+            Offer::Formats => {}
+        }
         if raw::is_format_avail(CF_UNICODETEXT) {
             let mut text = String::new();
             Unicode.read_clipboard(&mut text)?;
@@ -132,6 +209,9 @@ fn read() -> SysResult<ClipboardData> {
             RawData(CF_DIB).read_clipboard(&mut dib)?;
             bitmap = dib_to_bmp(dib);
         }
+        if raw::is_format_avail(CF_HDROP) {
+            FileList.read_clipboard(&mut paths)?;
+        }
     }
     if let Some(bmp) = bitmap {
         match convert(&bmp, ImageFormat::Bmp, ImageFormat::Png) {
@@ -141,13 +221,37 @@ fn read() -> SysResult<ClipboardData> {
     }
     if data.size() > MAX_CLIPBOARD_SIZE {
         log::warn!("clipboard: contents too large ({} bytes)", data.size());
-        return Ok(ClipboardData::default());
+        return Ok(None);
     }
-    Ok(data)
+    // stat outside the clipboard lock: paths may be on slow network shares
+    data.set_files(local_files(paths.into_iter().map(Into::into).collect()));
+    // no supported format: nothing to send, and not a clear
+    Ok((!data.is_empty()).then_some(data))
 }
 
-fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mutex<u32>>) {
-    while let Some(data) = rx.blocking_recv() {
+/// the password manager marker formats on the (open) clipboard with their
+/// contents; a marker that cannot be read counts with empty contents
+fn markers() -> Vec<(&'static str, Vec<u8>)> {
+    WIN_MARKERS
+        .into_iter()
+        .filter_map(|name| {
+            let format = raw::register_format(name)?.get();
+            if !raw::is_format_avail(format) {
+                return None;
+            }
+            let mut value = Vec::new();
+            if let Err(e) = RawData(format).read_clipboard(&mut value) {
+                log::debug!("clipboard: cannot read {name}: {e}");
+                value.clear();
+            }
+            Some((name, value))
+        })
+        .collect()
+}
+
+fn writer(mut rx: SetRx, own: Arc<Mutex<Own>>) {
+    while let Some(set) = rx.blocking_recv() {
+        let data = &set.data;
         let text = data.get(MIME_TEXT).map(String::from_utf8_lossy);
         let html = data.get(MIME_HTML).map(String::from_utf8_lossy);
         let png = data.get(MIME_PNG);
@@ -160,11 +264,28 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
                 }
             },
         );
+        let files: Vec<&str> = data
+            .files()
+            .iter()
+            .filter_map(|f| {
+                let path = f.path.to_str();
+                if path.is_none() {
+                    log::warn!("clipboard: cannot offer {}", f.path.display());
+                }
+                path
+            })
+            .collect();
 
-        let mut seq = own_seq.lock().expect("lock");
+        let mut own = own.lock().expect("lock");
+        if set.older_than(own.local) {
+            continue;
+        }
+        // whether the clipboard changed: it was opened and emptied
+        let mut wrote = false;
         let result = (|| -> SysResult<()> {
             let _clipboard = open()?;
             raw::empty()?;
+            wrote = true;
             if let Some(text) = &text {
                 raw::set_string_with(text, NoClear)?;
             }
@@ -177,12 +298,15 @@ fn writer(mut rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>, own_seq: Arc<Mute
             if let Some(bmp) = &bmp {
                 raw::set_bitmap_with(bmp, NoClear)?;
             }
+            if !files.is_empty() {
+                raw::set_file_list_with(&files, NoClear)?;
+            }
             Ok(())
         })();
-        // the clipboard is closed now: this is the sequence number
-        // the monitor will see for our write
-        *seq = seq_num();
-        drop(seq);
+        // the clipboard is closed now: this is the sequence number the
+        // monitor will see for our write; without a write it is the user's
+        own.seq = own_seq_after_write(own.seq, wrote, seq_num());
+        drop(own);
         if let Err(e) = result {
             log::warn!("clipboard: failed to set clipboard: {e}");
         }

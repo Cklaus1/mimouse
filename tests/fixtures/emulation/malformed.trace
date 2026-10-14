@@ -1,0 +1,18 @@
+# Wire events a peer sends (format: input-emulation/src/contract.rs).
+# Values outside the protocol (A9) that a datagram can carry, and releases
+# of keys and buttons that are not held: none may reach a backend.
+key 30 2
+key 30 255
+button 272 2
+button 273 4294967295
+axis 2 1.0
+axis 255 -3.0
+v120 2 120
+v120 255 -120
+motion NaN 1.0
+motion 1.0 inf
+motion -inf NaN
+axis 0 NaN
+axis 1 -inf
+key 31 0
+button 274 0

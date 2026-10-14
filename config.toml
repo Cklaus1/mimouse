@@ -4,12 +4,23 @@
 release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 # double-tapping Ctrl also returns control; default true
 release_double_tap_ctrl = true
+# chord that brings control back to this machine from any client
+# local_hotkey = ["KeyLeftCtrl", "KeyLeftAlt", "Key0"]
 
-# default 4242; UDP for input, TCP for clipboard
+# default 4242; open UDP (input) and TCP (pairing, clipboard; needed even with clipboard = false)
 port = 4242
 
-# share clipboard (text, HTML, images); default false
+# share clipboard (text, HTML, images, copied files); default false
 clipboard = true
+# largest total size of copied files sent to a client (bytes, default 100 MiB)
+# max_file_size = 104857600
+
+# show a short notification on each switch of control ("Controlling <host>" / "Back on <this machine>");
+# approval waits and unknown-certificate connection attempts are always announced
+# notify_switch = true
+# keep this machine from idling/locking while it controls another one
+# (GNOME/other: session inhibit, Windows: SetThreadExecutionState + keepalive, macOS: IOPM assertion)
+# idle_inhibit = true
 
 # peers allowed to connect: fingerprint = name
 [authorized_fingerprints]
@@ -20,9 +31,17 @@ position = "right" # left | right | top | bottom
 hostname = "iridium"
 activate_on_startup = true
 ips = ["192.168.178.156"] # optional if hostname resolves
+# certificate this client must present (set by `mimouse cli pair`); if absent,
+# the first certificate seen is pinned and saved here (trust on first use)
+# fingerprint = "aa:bb:cc:..."
+# chord that moves control to this client (Windows/macOS: also while local;
+# GNOME: bind `mimouse cli focus <id>` as a custom shortcut instead)
+# hotkey = ["KeyLeftCtrl", "KeyLeftAlt", "Key1"]
 
 [[clients]]
 position = "left"
 hostname = "thorium" # optional if ips are given
 ips = ["192.168.178.189", "192.168.178.172"]
+# only the upper 40% of the left edge switches to thorium
+range = [0, 40]
 port = 4242

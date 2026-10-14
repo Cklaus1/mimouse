@@ -4,7 +4,7 @@ members = ["input-capture", "input-emulation", "input-event"]
 [package]
 name = "mimouse"
 description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.11.0"
+version = "1.0.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Cklaus1/mimouse"
@@ -17,6 +17,8 @@ panic = "abort"
 
 [build-dependencies]
 shadow-rs = "1.2.0"
+# Windows VERSIONINFO resource; see build.rs
+winresource = { version = "0.1.34", default-features = false }
 
 [dependencies]
 input-event = { path = "input-event", version = "0.4.0" }
@@ -45,7 +47,6 @@ tokio = { version = "1.32.0", features = [
 ] }
 futures = "0.3.28"
 clap = { version = "4.4.11", features = ["derive"] }
-slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
 local-channel = "0.1.5"
@@ -62,6 +63,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
 ] }
 rustls-pki-types = { version = "1.14", features = ["std"] }
+# telemetry upload (X1): OS root certificates for the HTTPS endpoint
+rustls-native-certs = "0.8.5"
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
 num_enum = "0.7.2"
 paste = "1.0"
@@ -79,13 +82,23 @@ windows = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 image = { version = "0.25", default-features = false, features = [
     "bmp",
     "png",
 ] }
+
+[dev-dependencies]
+# paused clock (`start_paused`) for timing tests (T3)
+tokio = { version = "1.32.0", features = ["test-util"] }
 
 [features]
 default = [
@@ -106,6 +119,54 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 # webrtc-util 0.11.0 with webrtc-rs/webrtc#812 backported (Windows WSAECONNRESET
-# tears down the DTLS listener, feschber/lan-mouse#262)
+# tears down the DTLS listener, feschber/lan-mouse#262) and MiMouse listener
+# limits (conn cap, per-conn buffer cap, idle timeout, close evicts the remote)
 [patch.crates-io]
 webrtc-util = { path = "vendor/webrtc-util" }
+
+# Linux packages: `cargo build --release && cargo deb --no-build && cargo generate-rpm`.
+# Runtime libraries come from the binary (libX11, libXtst, libgcc_s, libm, libc);
+# libei and the desktop portals are reached over sockets / D-Bus, not linked.
+[package.metadata.deb]
+maintainer = "cklaus <cklaus@fusen.world>"
+copyright = "Ferdinand Schober and MiMouse contributors"
+license-file = ["LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+recommends = "xdg-desktop-portal"
+extended-description = """\
+Share one mouse and keyboard between computers on a LAN. The service runs as \
+the systemd user unit mimouse.service (systemctl --user enable --now mimouse); \
+mimouse cli controls it. firewalld service: mimouse."""
+assets = [
+    ["target/release/mimouse", "usr/bin/", "755"],
+    ["service/mimouse.service", "usr/lib/systemd/user/", "644"],
+    ["firewall/mimouse.xml", "usr/lib/firewalld/services/", "644"],
+    ["README.md", "usr/share/doc/mimouse/", "644"],
+    ["config.toml", "usr/share/doc/mimouse/config.toml.example", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Software KVM switch: mouse and keyboard sharing over LAN"
+# the builtin auto-req emits glibc `(GLIBC_x)[WEAK]` requirements nothing provides,
+# so the binary's NEEDED sonames (readelf -d) are listed by hand
+auto-req = "no"
+assets = [
+    { source = "target/release/mimouse", dest = "/usr/bin/mimouse", mode = "755" },
+    { source = "service/mimouse.service", dest = "/usr/lib/systemd/user/mimouse.service", mode = "644" },
+    { source = "firewall/mimouse.xml", dest = "/usr/lib/firewalld/services/mimouse.xml", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/mimouse/README.md", mode = "644", doc = true },
+    { source = "config.toml", dest = "/usr/share/doc/mimouse/config.toml.example", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/mimouse/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.recommends]
+xdg-desktop-portal = "*"
+
+[package.metadata.generate-rpm.requires]
+"libX11.so.6()(64bit)" = "*"
+"libXtst.so.6()(64bit)" = "*"
+"libgcc_s.so.1()(64bit)" = "*"
+"libm.so.6()(64bit)" = "*"
+"libc.so.6()(64bit)" = "*"

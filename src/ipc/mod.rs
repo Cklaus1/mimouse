@@ -14,12 +14,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use input_event::scancode;
 use serde::{Deserialize, Serialize};
 
 mod connect_async;
 mod listen;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::current_user_sid;
 
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::{AsyncFrontendListener, ConnId, IpcEvent};
@@ -146,6 +149,17 @@ pub struct ClientConfig {
     /// enter hook
     #[serde(rename = "enter_hook")]
     pub cmd: Option<String>,
+    /// the part of the edge that switches to this client, in percent of its
+    /// length (`None`: all of it)
+    #[serde(default)]
+    pub range: Option<[u8; 2]>,
+    /// chord that switches control to this client
+    #[serde(default)]
+    pub hotkey: Option<Vec<scancode::Linux>>,
+    /// sha256 fingerprint of the client's certificate: outgoing connections
+    /// accept only this one (set by pairing, or on the first connection)
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -156,6 +170,9 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            range: None,
+            hotkey: None,
+            fingerprint: None,
         }
     }
 }
@@ -203,9 +220,9 @@ pub enum ClipboardDirection {
 
 /// Events from the service, one JSON object per line, tagged by `event`.
 /// `Reply` goes to the requesting connection only; a new connection first
-/// receives `clients`, `capture`, `emulation`, `port`, `fingerprint` and
-/// `authorized_keys`; everything else is broadcast. This is also the
-/// `mimouse cli watch --json` schema.
+/// receives `clients`, `emulation`, `capture`, `clipboard_status`, `port`,
+/// `fingerprint` and `authorized_keys`; everything else is broadcast. This
+/// is also the `mimouse cli watch --json` schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -224,10 +241,24 @@ pub enum FrontendEvent {
     Deleted { id: ClientHandle },
     /// listen port, with the reason if changing it failed
     Port { port: u16, error: Option<String> },
-    /// input capture enabled / disabled
-    Capture { enabled: bool },
-    /// input emulation enabled / disabled
-    Emulation { enabled: bool },
+    /// input capture state; `enabled` is `status == "enabled"`; `backend`:
+    /// the one in use while enabled (absent from older services)
+    Capture {
+        enabled: bool,
+        status: Status,
+        #[serde(default)]
+        backend: Option<BackendInUse>,
+    },
+    /// input emulation state; `enabled` is `status == "enabled"`; `backend`:
+    /// the one in use while enabled (absent from older services)
+    Emulation {
+        enabled: bool,
+        status: Status,
+        #[serde(default)]
+        backend: Option<BackendInUse>,
+    },
+    /// clipboard sharing state: `{"status": .., "reason": ..}`
+    ClipboardStatus(ClipboardStatus),
     /// authorized certificate fingerprints (fingerprint -> description)
     AuthorizedKeys { keys: HashMap<String, String> },
     /// certificate fingerprint of this machine
@@ -254,6 +285,28 @@ pub enum FrontendEvent {
         mime: Vec<String>,
         size: usize,
     },
+    /// a pairing reached the code comparison: compare `code` with the one
+    /// the other machine shows, then confirm or cancel
+    PairCode {
+        code: String,
+        /// host name the peer reported, or its address
+        peer: String,
+        fingerprint: String,
+        /// where the peer will be placed relative to this machine
+        position: Position,
+    },
+    /// both sides confirmed: the peer is trusted and configured as client
+    /// `id`; `not_saved`: why the config could not be saved (pairing stays
+    /// in effect until the service stops)
+    Paired {
+        id: ClientHandle,
+        peer: String,
+        fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_saved: Option<String>,
+    },
+    /// the pairing ended without trusting anyone
+    PairFailed { reason: String },
 }
 
 /// successful result of a request
@@ -261,8 +314,142 @@ pub enum FrontendEvent {
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
     Done,
-    Client(ClientInfo),
+    Client(Box<ClientInfo>),
     Clients(Vec<ClientInfo>),
+    /// the config in effect (`config`)
+    Config(ConfigReport),
+    /// telemetry state (`telemetry on|off|status`)
+    Telemetry(TelemetryStatus),
+    /// the next upload (`telemetry show`)
+    TelemetryShow(TelemetryShow),
+}
+
+/// telemetry as the service runs it
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryStatus {
+    /// `telemetry = true` in the config
+    pub enabled: bool,
+    /// random id of this installation; `None` while off
+    #[serde(default)]
+    pub install_id: Option<String>,
+    /// base URL uploads go to
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// why there is no usable endpoint
+    #[serde(default)]
+    pub endpoint_error: Option<String>,
+    /// why telemetry is enabled but not running
+    #[serde(default)]
+    pub error: Option<String>,
+    /// completed days waiting for the next upload
+    #[serde(default)]
+    pub queued_days: usize,
+    #[serde(default)]
+    pub queued_crashes: usize,
+    /// UTC date the current day's counts started
+    #[serde(default)]
+    pub counting_since: Option<String>,
+    /// UTC date of the last upload attempt
+    #[serde(default)]
+    pub last_attempt: Option<String>,
+    /// why the last upload failed
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// crashes recorded while telemetry was off: never uploaded
+    #[serde(default)]
+    pub local_crashes: Vec<TelemetryCrash>,
+}
+
+/// the next telemetry upload
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryShow {
+    pub enabled: bool,
+    /// the exact body of the next upload; `None`: nothing to send
+    #[serde(default)]
+    pub batch: Option<String>,
+    /// UTC date the current day's counts started (sent once it is over)
+    #[serde(default)]
+    pub counting_since: Option<String>,
+    /// crashes recorded while telemetry was off: never uploaded
+    #[serde(default)]
+    pub local_crashes: Vec<TelemetryCrash>,
+}
+
+/// a crash record, as shown
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryCrash {
+    /// `src/file.rs:line`
+    pub location: String,
+    pub message: String,
+}
+
+/// the capture or emulation backend in use: `{"name": .., "auto": ..}`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendInUse {
+    pub name: String,
+    /// picked from the backends that work here, since none is configured
+    pub auto: bool,
+}
+
+impl Display for BackendInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let selection = if self.auto { "auto" } else { "configured" };
+        write!(f, "{}, {selection}", self.name)
+    }
+}
+
+/// where the value in effect of a config key comes from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// a command line flag of the service
+    Flag,
+    /// the config file
+    File,
+    /// the built-in default
+    Default,
+    /// `mimouse cli change-port`
+    Cli,
+}
+
+impl Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Source::Flag => "flag",
+            Source::File => "file",
+            Source::Default => "default",
+            Source::Cli => "cli",
+        })
+    }
+}
+
+/// a config key in effect
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigValue {
+    pub key: String,
+    /// `null`: unset (e.g. no backend configured)
+    pub value: serde_json::Value,
+    pub source: Source,
+    /// a changed value takes effect only when the service restarts
+    pub restart: bool,
+}
+
+/// a restart-only key whose value in the file differs from the one in effect
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartPending {
+    pub key: String,
+    pub in_effect: serde_json::Value,
+    pub on_disk: serde_json::Value,
+}
+
+/// the config of the running service
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigReport {
+    /// the config file
+    pub path: std::path::PathBuf,
+    pub keys: Vec<ConfigValue>,
+    /// keys changed in the file that need a restart to take effect
+    pub awaiting_restart: Vec<RestartPending>,
 }
 
 /// a request on the wire: `{"seq": n, "request": {...}}`, answered by a
@@ -328,12 +515,55 @@ pub enum FrontendRequest {
         fingerprint: String,
     },
     SaveConfig,
+    /// move control to a client, as if the cursor crossed into it
+    Focus {
+        id: ClientHandle,
+    },
+    /// pair with the machine at `host` (running `pair --accept`), placing it
+    /// at `position`; `ips` are tried before resolving `host`
+    Pair {
+        host: String,
+        ips: Vec<IpAddr>,
+        port: u16,
+        position: Position,
+    },
+    /// accept one pairing request during the next `timeout` seconds
+    PairAccept {
+        timeout: u64,
+    },
+    /// the user compared the pairing code and it matches
+    PairConfirm {
+        code: String,
+    },
+    /// abort the current pairing
+    PairCancel,
+    /// the config in effect, with the source of each key
+    Config,
+    /// turn telemetry on (saved to the config)
+    TelemetryOn,
+    /// turn telemetry off, deleting the install id and the queue
+    TelemetryOff,
+    TelemetryStatus,
+    /// the next upload
+    TelemetryShow,
+    /// `command` (`doctor`, `discover`) ran without the service; only
+    /// counted for telemetry
+    CountCommand {
+        command: String,
+    },
 }
 
 impl FrontendRequest {
     /// read-only requests are not audited
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::List)
+        matches!(
+            self,
+            Self::List
+                | Self::Config
+                | Self::TelemetryStatus
+                | Self::TelemetryShow
+                | Self::CountCommand { .. }
+        )
     }
 
     /// the client this request refers to, which must exist
@@ -367,19 +597,91 @@ pub struct Peer {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
     Disabled,
     Enabled,
+    /// a permission request (e.g. the portal dialog) waits for the user
+    AwaitingApproval,
 }
 
 impl From<Status> for bool {
+    /// whether it is enabled
     fn from(status: Status) -> Self {
         match status {
             Status::Enabled => true,
-            Status::Disabled => false,
+            Status::Disabled | Status::AwaitingApproval => false,
         }
     }
+}
+
+impl Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Status::Disabled => write!(f, "disabled"),
+            Status::Enabled => write!(f, "enabled"),
+            Status::AwaitingApproval => write!(f, "awaiting approval"),
+        }
+    }
+}
+
+/// state of clipboard sharing
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardStatus {
+    pub status: ClipboardState,
+    /// why sharing is disabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ClipboardStatus {
+    pub fn new(status: ClipboardState) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: ClipboardState::Disabled,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+impl Display for ClipboardStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            ClipboardState::Off => write!(f, "off (`clipboard = false` in the config)")?,
+            ClipboardState::Starting => write!(f, "starting")?,
+            ClipboardState::AwaitingApproval => write!(f, "awaiting approval")?,
+            ClipboardState::Enabled => write!(f, "enabled")?,
+            ClipboardState::Disabled => write!(f, "disabled")?,
+        }
+        match &self.reason {
+            Some(reason) => write!(f, ": {reason}"),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardState {
+    /// turned off in the config
+    #[default]
+    Off,
+    /// the clipboard backend has not reported yet
+    Starting,
+    /// the clipboard portal dialog waits for the user; received updates
+    /// are kept until it is answered
+    AwaitingApproval,
+    Enabled,
+    /// the backend failed (retrying if `reason` says so), was denied, or
+    /// the platform has none; received updates are refused once it ended
+    Disabled,
 }
 
 #[cfg(unix)]
@@ -407,4 +709,56 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
         .join("Library")
         .join("Caches")
         .join(MIMOUSE_SOCKET_NAME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T5: the backend in use decodes; an older service's event without it
+    /// still does
+    #[test]
+    fn state_events_decode_with_and_without_backend() {
+        let new = r#"{"event":"capture","enabled":true,"status":"enabled","backend":{"name":"input-capture-portal","auto":true}}"#;
+        let libei = BackendInUse {
+            name: "input-capture-portal".into(),
+            auto: true,
+        };
+        match serde_json::from_str(new).unwrap() {
+            FrontendEvent::Capture {
+                status, backend, ..
+            } => assert_eq!((status, backend), (Status::Enabled, Some(libei))),
+            e => panic!("decoded as {e:?}"),
+        }
+        let old = r#"{"event":"emulation","enabled":true,"status":"enabled"}"#;
+        match serde_json::from_str(old).unwrap() {
+            FrontendEvent::Emulation {
+                status, backend, ..
+            } => assert_eq!((status, backend), (Status::Enabled, None)),
+            e => panic!("decoded as {e:?}"),
+        }
+    }
+
+    /// T5: an older CLI, which knows the event without `backend`, decodes
+    /// the newer one
+    #[test]
+    fn older_cli_decodes_state_event_with_backend() {
+        #[derive(Deserialize)]
+        #[serde(tag = "event", rename_all = "snake_case")]
+        enum OldEvent {
+            Emulation { enabled: bool, status: Status },
+        }
+        let event = FrontendEvent::Emulation {
+            enabled: true,
+            status: Status::Enabled,
+            backend: Some(BackendInUse {
+                name: "libei".into(),
+                auto: false,
+            }),
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        let OldEvent::Emulation { enabled, status } = serde_json::from_str(&line).unwrap();
+        assert!(enabled);
+        assert_eq!(status, Status::Enabled);
+    }
 }

@@ -38,7 +38,10 @@ fn main() {
 
     if let Err(e) = run() {
         log::error!("{e}");
-        process::exit(1);
+        process::exit(match e {
+            MiMouseError::Cli(e) => e.exit_code(),
+            _ => 1,
+        });
     }
 }
 
@@ -47,7 +50,7 @@ fn run() -> Result<(), MiMouseError> {
     match config.command() {
         Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args)),
         Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args)),
-        Some(Command::Cli(cli_args)) => run_async(cli::run(cli_args)),
+        Some(Command::Cli(cli_args)) => run_async(cli::run(cli_args, config)),
         // `mimouse` and `mimouse daemon` both run the service
         Some(Command::Daemon) | None => match run_async(run_service(config)) {
             Err(MiMouseError::Service(ServiceError::IpcListen(

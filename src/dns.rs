@@ -25,6 +25,25 @@ pub(crate) enum DnsEvent {
     Resolved(ClientHandle, String, Result<Vec<IpAddr>, ResolveError>),
 }
 
+/// requests resolutions of a [`DnsResolver`]; results arrive as its events
+#[derive(Clone)]
+pub(crate) struct DnsRequester(Sender<DnsRequest>);
+
+impl DnsRequester {
+    pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
+        // the resolver is gone only while the service shuts down
+        let _ = self.0.send(DnsRequest { handle, hostname });
+    }
+}
+
+#[cfg(test)]
+impl DnsRequester {
+    /// a requester whose requests go nowhere
+    pub(crate) fn detached() -> Self {
+        Self(channel().0)
+    }
+}
+
 struct DnsTask {
     resolver: TokioResolver,
     request_rx: Receiver<DnsRequest>,
@@ -55,9 +74,8 @@ impl DnsResolver {
         })
     }
 
-    pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
-        let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
+    pub(crate) fn requester(&self) -> DnsRequester {
+        DnsRequester(self.request_tx.clone())
     }
 
     pub(crate) async fn event(&mut self) -> DnsEvent {

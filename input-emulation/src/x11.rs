@@ -11,7 +11,15 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::geometry::{Rect, entry_point};
+use super::normalize::Steps;
+use super::{Edge, Emulation, EmulationHandle, error::X11EmulationCreationError};
+
+/// one scroll button click per wheel notch
+const V120_PER_CLICK: u32 = 120;
+/// clicks per scroll event at most, so one hostile value cannot keep the
+/// runtime busy
+const MAX_CLICKS: u32 = 16;
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
@@ -38,6 +46,21 @@ impl X11Emulation {
         }
     }
 
+    /// The screen as one display. Xlib alone does not list monitors
+    /// (that needs Xinerama / RandR); the server keeps the pointer on a
+    /// monitor.
+    fn screen(&self) -> Rect {
+        unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            Rect {
+                x: 0,
+                y: 0,
+                width: xlib::XDisplayWidth(self.display, screen),
+                height: xlib::XDisplayHeight(self.display, screen),
+            }
+        }
+    }
+
     fn emulate_mouse_button(&self, button: u32, state: u32) {
         unsafe {
             let x11_button = match button {
@@ -57,7 +80,8 @@ impl X11Emulation {
     const SCROLL_LEFT: u32 = 6;
     const SCROLL_RIGHT: u32 = 7;
 
-    fn emulate_scroll(&self, axis: u8, value: f64) {
+    /// `clicks` presses of the scroll button for the direction of `value`
+    fn emulate_scroll(&self, axis: u8, value: f64, clicks: u32) {
         let direction = match axis {
             1 => {
                 if value < 0.0 {
@@ -75,9 +99,11 @@ impl X11Emulation {
             }
         };
 
-        unsafe {
-            xtest::XTestFakeButtonEvent(self.display, direction, 1, 0);
-            xtest::XTestFakeButtonEvent(self.display, direction, 0, 0);
+        for _ in 0..clicks {
+            unsafe {
+                xtest::XTestFakeButtonEvent(self.display, direction, 1, 0);
+                xtest::XTestFakeButtonEvent(self.display, direction, 0, 0);
+            }
         }
     }
 
@@ -118,10 +144,11 @@ impl Emulation for X11Emulation {
                     axis,
                     value,
                 } => {
-                    self.emulate_scroll(axis, value);
+                    self.emulate_scroll(axis, value, 1);
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    self.emulate_scroll(axis, value as f64);
+                    let clicks = (value.unsigned_abs() / V120_PER_CLICK).min(MAX_CLICKS);
+                    self.emulate_scroll(axis, value as f64, clicks);
                 }
             },
             Event::Keyboard(KeyboardEvent::Key {
@@ -138,6 +165,31 @@ impl Emulation for X11Emulation {
         }
         // FIXME
         Ok(())
+    }
+
+    /// XTest moves in whole pixels and scrolls in whole wheel clicks
+    fn steps(&self) -> Steps {
+        Steps {
+            whole_pixels: true,
+            v120: V120_PER_CLICK as i32,
+        }
+    }
+
+    fn enter_at(
+        &mut self,
+        _: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let Some((x, y)) = entry_point(&[self.screen()], edge, fraction) else {
+            return Ok(None);
+        };
+        unsafe {
+            // screen -1: the screen the pointer is on
+            xtest::XTestFakeMotionEvent(self.display, -1, x, y, 0);
+            xlib::XFlush(self.display);
+        }
+        Ok(Some((x, y)))
     }
 
     async fn create(&mut self, _: EmulationHandle) {

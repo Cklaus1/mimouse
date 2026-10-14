@@ -1,18 +1,26 @@
+mod approval;
 mod audit;
 mod capture;
 pub mod capture_test;
 pub mod cli;
 pub mod client;
+mod clients;
 mod clipboard;
 pub mod config;
 mod connect;
 mod crypto;
+mod discover;
 mod dns;
+mod doctor;
 mod emulation;
 pub mod emulation_test;
+mod inhibit;
 pub mod ipc;
 mod listen;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
+mod notify;
+mod pair;
 mod proto;
 pub mod service;
+mod telemetry;

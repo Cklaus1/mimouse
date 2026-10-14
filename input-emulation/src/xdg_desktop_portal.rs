@@ -16,17 +16,21 @@ use input_event::{
     KeyboardEvent, PointerEvent,
 };
 
-use crate::error::EmulationError;
+use crate::{PermissionPending, error::EmulationError};
 
-use super::{Emulation, EmulationHandle, error::XdpEmulationCreationError};
+use super::{Edge, Emulation, EmulationHandle, error::XdpEmulationCreationError};
 
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    /// whether the missing absolute placement was logged
+    enter_at_logged: bool,
 }
 
 impl DesktopPortalEmulation {
-    pub(crate) async fn new() -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
+    pub(crate) async fn new(
+        permission_pending: &tokio::sync::watch::Sender<bool>,
+    ) -> Result<DesktopPortalEmulation, XdpEmulationCreationError> {
         log::debug!("connecting to org.freedesktop.portal.RemoteDesktop portal ...");
         let proxy = RemoteDesktop::new().await?;
 
@@ -41,15 +45,22 @@ impl DesktopPortalEmulation {
         proxy.select_devices(&session, options).await?;
 
         log::info!("requesting permission for input emulation");
-        let _devices = proxy
-            .start(&session, None, Default::default())
-            .await?
-            .response()?;
+        let _devices = {
+            let _pending = PermissionPending::new(permission_pending);
+            proxy
+                .start(&session, None, Default::default())
+                .await?
+                .response()?
+        };
 
         log::debug!("started session");
         let session = session;
 
-        Ok(Self { proxy, session })
+        Ok(Self {
+            proxy,
+            session,
+            enter_at_logged: false,
+        })
     }
 }
 
@@ -149,6 +160,22 @@ impl Emulation for DesktopPortalEmulation {
             }
         }
         Ok(())
+    }
+
+    fn enter_at(
+        &mut self,
+        _client: EmulationHandle,
+        _edge: Edge,
+        _fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        // NotifyPointerMotionAbsolute needs a ScreenCast stream
+        if !self.enter_at_logged {
+            self.enter_at_logged = true;
+            log::info!(
+                "xdg-desktop-portal emulation cannot place the pointer: it stays where it was on enter"
+            );
+        }
+        Ok(None)
     }
 
     async fn create(&mut self, _client: EmulationHandle) {}

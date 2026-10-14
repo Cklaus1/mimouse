@@ -6,8 +6,13 @@ use input_event::{
 
 use async_trait::async_trait;
 use std::ops::BitOrAssign;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
+use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -17,20 +22,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
+use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
+use windows::core::BOOL;
 
-use super::{Emulation, EmulationHandle};
+use super::geometry::{Rect, entry_point};
+use super::keys::{Repeat, RepeatPlanner};
+use super::normalize::Steps;
+use super::windows_logic::{Wheel, wheel};
+use super::{Edge, Emulation, EmulationHandle};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 
 pub(crate) struct WindowsEmulation {
+    repeat: RepeatPlanner,
     repeat_task: Option<AbortHandle>,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+        Ok(Self {
+            repeat: RepeatPlanner::default(),
+            repeat_task: None,
+        })
     }
 }
 
@@ -60,32 +74,92 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
-                    match state {
-                        // pressed
-                        0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
-                        _ => {}
+                    match self.repeat.key(key, state == 1) {
+                        Repeat::Start(key) => self.spawn_repeat_task(key),
+                        Repeat::Stop => self.kill_repeat_task(),
+                        Repeat::Keep => {}
                     }
                     key_event(key, state)
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
         }
-        // FIXME
         Ok(())
+    }
+
+    /// `SendInput` moves in whole pixels; its wheels take any 120th
+    fn steps(&self) -> Steps {
+        Steps {
+            whole_pixels: true,
+            v120: 1,
+        }
+    }
+
+    fn enter_at(
+        &mut self,
+        _: EmulationHandle,
+        edge: Edge,
+        fraction: u16,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let Some((x, y)) = entry_point(&monitors(), edge, fraction) else {
+            log::warn!("no monitors to place the pointer on");
+            return Ok(None);
+        };
+        // virtual-desktop coordinates, the same space EnumDisplayMonitors uses
+        if let Err(e) = unsafe { SetCursorPos(x, y) } {
+            log::warn!("SetCursorPos({x}, {y}): {e}");
+            return Ok(None);
+        }
+        Ok(Some((x, y)))
     }
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.kill_repeat_task();
+    }
+}
+
+/// Monitor rectangles on the virtual desktop.
+fn monitors() -> Vec<Rect> {
+    unsafe extern "system" fn add_monitor(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<Rect>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            let r = info.rcMonitor;
+            monitors.push(Rect {
+                x: r.left,
+                y: r.top,
+                width: r.right - r.left,
+                height: r.bottom - r.top,
+            });
+        }
+        true.into()
+    }
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(add_monitor),
+            LPARAM(&mut monitors as *mut Vec<Rect> as isize),
+        );
+    }
+    monitors
 }
 
 impl WindowsEmulation {
-    async fn spawn_repeat_task(&mut self, key: u32) {
-        // there can only be one repeating key and it's
-        // always the last to be pressed
+    fn spawn_repeat_task(&mut self, key: u32) {
         self.kill_repeat_task();
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
@@ -103,14 +177,31 @@ impl WindowsEmulation {
     }
 }
 
+/// at most one warning per interval about refused input
+const REFUSED_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// when the last warning was logged and how many events were refused since
+static REFUSED: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+
+/// Sends `input` once. Windows refuses injection while the secure desktop
+/// (lock screen, UAC) is shown or UIPI blocks it; the event is dropped then,
+/// since retrying would spin the runtime thread until the desktop returns.
 fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
-        }
+    // number of events submitted
+    if unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) } > 0 {
+        return;
+    }
+    let Ok(mut refused) = REFUSED.lock() else {
+        return;
+    };
+    let (last_warning, count) = &mut *refused;
+    *count += 1;
+    if last_warning.is_none_or(|t| t.elapsed() >= REFUSED_WARN_INTERVAL) {
+        log::warn!(
+            "Windows refused {count} injected input event(s), dropped (secure desktop or a more privileged window has focus)"
+        );
+        *last_warning = Some(Instant::now());
+        *count = 0;
     }
 }
 
@@ -176,16 +267,17 @@ fn mouse_button(button: u32, state: u32) {
 }
 
 fn scroll(axis: u8, value: i32) {
-    let event_type = match axis {
-        0 => MOUSEEVENTF_WHEEL,
-        1 => MOUSEEVENTF_HWHEEL,
-        _ => return,
+    let Some((wheel, data)) = wheel(axis, value) else {
+        return;
     };
     let mi = MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: -value as u32,
-        dwFlags: event_type,
+        mouseData: data as u32,
+        dwFlags: match wheel {
+            Wheel::Vertical => MOUSEEVENTF_WHEEL,
+            Wheel::Horizontal => MOUSEEVENTF_HWHEEL,
+        },
         time: 0,
         dwExtraInfo: 0,
     };
