@@ -1436,4 +1436,41 @@ mod tests {
             })
             .await;
     }
+
+    /// a focus whose capture never begins is answered with an error after
+    /// exactly 1 s, not before
+    #[tokio::test(start_paused = true)]
+    async fn focus_without_begin_times_out_after_1_s() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let Harness {
+                    mut task,
+                    mut capture,
+                    requests,
+                    mut events,
+                    ..
+                } = harness().await;
+                requests.send(CaptureRequest::Focus(1)).expect("send");
+                let session = task.do_capture_session(&mut capture);
+                tokio::pin!(session);
+                let just_before = Duration::from_secs(1) - Duration::from_millis(1);
+                assert!(
+                    tokio::time::timeout(just_before, &mut session)
+                        .await
+                        .is_err()
+                );
+                assert!(focus_results(&mut events).is_empty());
+                let at_deadline = Duration::from_millis(1);
+                assert!(
+                    tokio::time::timeout(at_deadline, &mut session)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    focus_results(&mut events),
+                    [Err("capture for client 1 did not start".to_string())]
+                );
+            })
+            .await;
+    }
 }

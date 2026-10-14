@@ -570,6 +570,62 @@ mod tests {
         assert_eq!(backoff.next(), Duration::from_secs(2));
     }
 
+    /// runs [`ping_pong`] over an in-memory pipe on the paused clock with
+    /// Pongs arriving at `pongs` (since start); returns when the connection
+    /// was closed and how many pings went out
+    async fn ping_pong_closes_after(pongs: &[Duration]) -> (Duration, usize) {
+        let (ours, theirs) = webrtc_util::conn::conn_pipe::pipe();
+        let conn: ArcConn = Arc::new(ours);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4242));
+        let responses = Rc::new(RefCell::new(HashSet::new()));
+        let start = tokio::time::Instant::now();
+        let pings = Rc::new(RefCell::new(0));
+        let counted = pings.clone();
+        spawn_local(async move {
+            let mut buf = [0u8; MAX_EVENT_SIZE];
+            while theirs.recv(&mut buf).await.is_ok() {
+                *counted.borrow_mut() += 1;
+            }
+        });
+        let answering = responses.clone();
+        let pongs = pongs.to_vec();
+        spawn_local(async move {
+            for at in pongs {
+                tokio::time::sleep_until(start + at).await;
+                answering.borrow_mut().insert(addr);
+            }
+        });
+        ping_pong(addr, &conn, &responses).await;
+        // let the counting task take the last ping
+        tokio::task::yield_now().await;
+        let sent = *pings.borrow();
+        (start.elapsed(), sent)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_pong_closes_after_4_s_without_pong() {
+        LocalSet::new()
+            .run_until(async {
+                let (closed, pings) = ping_pong_closes_after(&[]).await;
+                assert_eq!(closed, Duration::from_secs(4));
+                assert_eq!(pings, 8);
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_pong_pong_restarts_the_window() {
+        LocalSet::new()
+            .run_until(async {
+                // the Pong at 3.25 s is counted at the 3.5 s check, so the
+                // 8 silent intervals end at 7.5 s
+                let (closed, pings) = ping_pong_closes_after(&[Duration::from_millis(3250)]).await;
+                assert_eq!(closed, Duration::from_millis(7500));
+                assert_eq!(pings, 15);
+            })
+            .await;
+    }
+
     /// waits for the listener to accept a DTLS connection
     async fn accepted(listener: &mut MiMouseListener) -> SocketAddr {
         let accept = async {
@@ -599,6 +655,10 @@ mod tests {
         (listener, client_manager, handle)
     }
 
+    // real time on purpose: DTLS handshakes and retransmits run on loopback
+    // sockets, and a paused clock would jump their timers while the sockets
+    // wait; the exact 4 s window is covered by the paused-clock
+    // `ping_pong_*` tests above
     #[tokio::test]
     async fn keep_connected_connects_without_input_and_reconnects() {
         LocalSet::new()

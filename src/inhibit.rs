@@ -500,7 +500,10 @@ mod worker {
 mod tests {
     use super::*;
 
-    const D: Duration = Duration::from_secs(5);
+    // the worker loop runs `Debounce` on `RELEASE_DELAY` but reads
+    // `std::time::Instant::now()`, which a paused tokio clock does not move,
+    // so the release delay is pinned here on the pure state machine
+    const D: Duration = RELEASE_DELAY;
 
     #[test]
     fn acquires_at_once_releases_after_delay() {
@@ -508,7 +511,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(d.request(true, t0), Some(true));
         assert_eq!(d.request(false, t0), None);
-        assert_eq!(d.deadline(), Some(t0 + D));
+        assert_eq!(d.deadline(), Some(t0 + Duration::from_secs(5)));
         assert_eq!(d.poll(t0 + D - Duration::from_millis(1)), None);
         assert_eq!(d.poll(t0 + D), Some(false));
         assert_eq!(d.deadline(), None);
