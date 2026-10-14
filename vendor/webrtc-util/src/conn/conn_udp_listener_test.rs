@@ -218,3 +218,161 @@ async fn test_listener_concurrent() -> Result<()> {
 
     Ok(())
 }
+
+/// a socket on loopback that sent `packet` to `listener`
+async fn remote(listener: &impl Listener, packet: &[u8]) -> Result<UdpSocket> {
+    let remote = UdpSocket::bind("127.0.0.1:0").await?;
+    remote.connect(listener.addr().await?).await?;
+    remote.send(packet).await?;
+    Ok(remote)
+}
+
+/// whether reading `conn` fails because it is closed, instead of blocking
+async fn is_closed(conn: &Arc<dyn Conn + Send + Sync>) -> bool {
+    let mut b = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_secs(1), conn.recv(&mut b)).await;
+    matches!(read, Ok(Err(Error::ErrBufferClosed)))
+}
+
+/// the next accepted conn, unless none arrives within 200 ms
+async fn accepted(listener: &impl Listener) -> Option<(Arc<dyn Conn + Send + Sync>, SocketAddr)> {
+    tokio::time::timeout(Duration::from_millis(200), listener.accept())
+        .await
+        .ok()
+        .map(|c| c.expect("accept"))
+}
+
+#[tokio::test]
+async fn test_listener_close_forgets_conn() -> Result<()> {
+    let listener = listen("127.0.0.1:0").await?;
+    let remote = remote(&listener, &[1]).await?;
+    let (conn, raddr) = accepted(&listener).await.expect("first conn");
+    let mut b = [0u8; 8];
+    assert_eq!(conn.recv(&mut b).await?, 1);
+
+    conn.close().await?;
+    assert!(is_closed(&conn).await);
+
+    // the remote is forgotten: its next packet makes a new conn
+    remote.send(&[2]).await?;
+    let (again, raddr_again) = accepted(&listener).await.expect("new conn");
+    assert_eq!(raddr, raddr_again);
+    assert!(!Arc::ptr_eq(&conn, &again));
+    let n = again.recv(&mut b).await?;
+    assert_eq!(&b[..n], &[2]);
+
+    // closing the old conn again leaves the new one in place
+    conn.close().await?;
+    remote.send(&[3]).await?;
+    let n = again.recv(&mut b).await?;
+    assert_eq!(&b[..n], &[3]);
+    assert!(accepted(&listener).await.is_none());
+
+    listener.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_listener_max_conns() -> Result<()> {
+    let listener = ListenConfig {
+        max_conns: 2,
+        ..Default::default()
+    }
+    .listen("127.0.0.1:0")
+    .await?;
+
+    let first = remote(&listener, &[0]).await?;
+    let _second = remote(&listener, &[1]).await?;
+    let third = remote(&listener, &[2]).await?;
+    let (conn, raddr) = accepted(&listener).await.expect("first conn");
+    assert_eq!(raddr, first.local_addr()?);
+    assert!(accepted(&listener).await.is_some());
+    assert!(
+        accepted(&listener).await.is_none(),
+        "third remote over the cap"
+    );
+
+    // closing a conn frees its slot
+    conn.close().await?;
+    third.send(&[3]).await?;
+    let (conn, raddr) = accepted(&listener).await.expect("third conn");
+    assert_eq!(raddr, third.local_addr()?);
+    let mut b = [0u8; 8];
+    let n = conn.recv(&mut b).await?;
+    assert_eq!(&b[..n], &[3]);
+
+    listener.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_listener_conn_buffer_size() -> Result<()> {
+    let listener = ListenConfig {
+        conn_buffer_size: 100,
+        ..Default::default()
+    }
+    .listen("127.0.0.1:0")
+    .await?;
+
+    // each packet takes 32 bytes of the 100, so three fit
+    let remote = remote(&listener, &[0; 30]).await?;
+    for i in 1..10 {
+        remote.send(&[i; 30]).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (conn, _) = accepted(&listener).await.expect("conn");
+    let mut b = [0u8; 64];
+    for i in 0..3 {
+        let n = conn.recv(&mut b).await?;
+        assert_eq!(&b[..n], &[i; 30]);
+    }
+    let rest = tokio::time::timeout(Duration::from_millis(100), conn.recv(&mut b)).await;
+    assert!(rest.is_err(), "packets over the buffer size were kept");
+
+    // reading made room again
+    remote.send(&[10; 30]).await?;
+    let n = conn.recv(&mut b).await?;
+    assert_eq!(&b[..n], &[10; 30]);
+
+    listener.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_listener_idle_timeout() -> Result<()> {
+    let listener = ListenConfig {
+        idle_timeout: Duration::from_millis(200),
+        ..Default::default()
+    }
+    .listen("127.0.0.1:0")
+    .await?;
+
+    let silent = remote(&listener, &[0]).await?;
+    let (silent_conn, _) = accepted(&listener).await.expect("silent conn");
+    let active = remote(&listener, &[0]).await?;
+    let (active_conn, _) = accepted(&listener).await.expect("active conn");
+
+    let mut b = [0u8; 8];
+    for i in 1..10 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        active.send(&[i]).await?;
+    }
+
+    // the silent remote's conn is closed and forgotten ...
+    assert_eq!(silent_conn.recv(&mut b).await?, 1);
+    assert!(is_closed(&silent_conn).await);
+    silent.send(&[1]).await?;
+    let (_, raddr) = accepted(&listener).await.expect("new conn");
+    assert_eq!(raddr, silent.local_addr()?);
+
+    // ... the active one is kept
+    for i in 0..10 {
+        let n = active_conn.recv(&mut b).await?;
+        assert_eq!(&b[..n], &[i]);
+    }
+    assert!(accepted(&listener).await.is_none());
+
+    listener.close().await?;
+    Ok(())
+}
