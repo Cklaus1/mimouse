@@ -71,7 +71,7 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
 
 /// create (or truncate) `path` readable and writable by the current user only
 #[cfg(unix)]
-fn create_private(path: &Path) -> io::Result<File> {
+pub(crate) fn create_private(path: &Path) -> io::Result<File> {
     let f = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -104,12 +104,14 @@ fn restrict(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+pub(crate) use windows_acl::create_private;
+#[cfg(windows)]
 pub(crate) use windows_acl::key_file_is_private;
 #[cfg(windows)]
-use windows_acl::{create_private, restrict};
+use windows_acl::restrict;
 
 #[cfg(not(any(unix, windows)))]
-fn create_private(path: &Path) -> io::Result<File> {
+pub(crate) fn create_private(path: &Path) -> io::Result<File> {
     File::create(path)
 }
 
@@ -202,7 +204,7 @@ mod windows_acl {
         Ok(Descriptor(sd))
     }
 
-    pub(super) fn create_private(path: &Path) -> io::Result<File> {
+    pub(crate) fn create_private(path: &Path) -> io::Result<File> {
         let sd = private_descriptor(&current_user_sid()?)?;
         let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,

@@ -276,11 +276,15 @@ pub enum FrontendEvent {
         /// where the peer will be placed relative to this machine
         position: Position,
     },
-    /// both sides confirmed: the peer is trusted and configured as client `id`
+    /// both sides confirmed: the peer is trusted and configured as client
+    /// `id`; `not_saved`: why the config could not be saved (pairing stays
+    /// in effect until the service stops)
     Paired {
         id: ClientHandle,
         peer: String,
         fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_saved: Option<String>,
     },
     /// the pairing ended without trusting anyone
     PairFailed { reason: String },
