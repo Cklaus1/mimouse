@@ -119,6 +119,7 @@ graph LR
 | 3 | net: N4; then svc: S1 |
 | 4 | svc: T5, T3; then rel: X1; then cfg: T2 |
 | 5 | P1 smoke matrix; docs D1, D4; then D3; then R1 |
+| | [REVISED 2026-10-14, wave 5: ~30 tracks of collected `doc_text` (session artifact `doc-text.md`) are still unwritten, too much for the owner to write serially. README (D1 then D3, one agent, worktree `readme`) and AGENTS (D4, one agent, worktree `agents`) each get one doc agent with exclusive ownership of that file; the owner reviews every line against the code and the specs before merging. P1 is done (all six rows recorded in public-release P1; macOS stays experimental/needs-human).] |
 
 Within a wave, a node starts when its dependencies are merged into `product-review`.
 
