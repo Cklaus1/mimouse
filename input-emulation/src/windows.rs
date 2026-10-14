@@ -6,7 +6,8 @@ use input_event::{
 
 use async_trait::async_trait;
 use std::ops::BitOrAssign;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -77,7 +78,6 @@ impl Emulation for WindowsEmulation {
                 KeyboardEvent::Modifiers { .. } => {}
             },
         }
-        // FIXME
         Ok(())
     }
 
@@ -163,14 +163,31 @@ impl WindowsEmulation {
     }
 }
 
+/// at most one warning per interval about refused input
+const REFUSED_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// when the last warning was logged and how many events were refused since
+static REFUSED: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+
+/// Sends `input` once. Windows refuses injection while the secure desktop
+/// (lock screen, UAC) is shown or UIPI blocks it; the event is dropped then,
+/// since retrying would spin the runtime thread until the desktop returns.
 fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
-        }
+    // number of events submitted
+    if unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) } > 0 {
+        return;
+    }
+    let Ok(mut refused) = REFUSED.lock() else {
+        return;
+    };
+    let (last_warning, count) = &mut *refused;
+    *count += 1;
+    if last_warning.is_none_or(|t| t.elapsed() >= REFUSED_WARN_INTERVAL) {
+        log::warn!(
+            "Windows refused {count} injected input event(s), dropped (secure desktop or a more privileged window has focus)"
+        );
+        *last_warning = Some(Instant::now());
+        *count = 0;
     }
 }
 

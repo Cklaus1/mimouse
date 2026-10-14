@@ -194,19 +194,19 @@ impl MiMouseConnection {
 
 /// delay before the next reconnect attempt: 1 s doubling up to 30 s
 #[derive(Debug)]
-struct Backoff(Duration);
+pub(crate) struct Backoff(Duration);
 
 impl Backoff {
     const MIN: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(30);
 
-    fn next(&mut self) -> Duration {
+    pub(crate) fn next(&mut self) -> Duration {
         let delay = self.0;
         self.0 = (delay * 2).min(Self::MAX);
         delay
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.0 = Self::MIN;
     }
 }

@@ -6,6 +6,53 @@ pub enum InputEmulationError {
     Emulate(#[from] EmulationError),
 }
 
+impl InputEmulationError {
+    /// the user denied the permission request
+    pub fn cancelled_by_user(&self) -> bool {
+        matches!(self, Self::Create(e) if e.cancelled_by_user())
+    }
+
+    /// the backend may come up by itself: the EIS / portal connection ended,
+    /// the portal is not on the bus yet (login) or no backend works yet
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Create(EmulationCreationError::NoAvailableBackend) => true,
+            #[cfg(libei)]
+            Self::Create(EmulationCreationError::Libei(LibeiEmulationCreationError::Ashpd(e))) => {
+                portal_not_on_bus(e)
+            }
+            #[cfg(rdp)]
+            Self::Create(EmulationCreationError::Xdp(XdpEmulationCreationError::Ashpd(e))) => {
+                portal_not_on_bus(e)
+            }
+            Self::Emulate(EmulationError::EndOfStream) => true,
+            #[cfg(any(rdp, libei))]
+            Self::Emulate(EmulationError::Ashpd(e)) => portal_not_on_bus(e),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(any(libei, rdp))]
+fn portal_not_on_bus(e: &ashpd::Error) -> bool {
+    use ashpd::zbus::{self, fdo};
+    const NOT_ON_BUS: &[&str] = &[
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+    ];
+    match e {
+        ashpd::Error::PortalNotFound(_) => true,
+        ashpd::Error::Zbus(zbus::Error::FDO(e)) => matches!(
+            **e,
+            fdo::Error::ServiceUnknown(_) | fdo::Error::NameHasNoOwner(_)
+        ),
+        ashpd::Error::Zbus(zbus::Error::MethodError(name, ..)) => {
+            NOT_ON_BUS.contains(&name.as_str())
+        }
+        _ => false,
+    }
+}
+
 #[cfg(any(libei, rdp))]
 use ashpd::{Error::Response, desktop::ResponseError};
 use std::io;
@@ -58,7 +105,7 @@ pub enum EmulationCreationError {
     #[cfg(windows)]
     #[error("windows: `{0}`")]
     Windows(#[from] WindowsEmulationCreationError),
-    #[error("capture error")]
+    #[error("no emulation backend available")]
     NoAvailableBackend,
 }
 
@@ -158,3 +205,35 @@ pub enum MacOSEmulationCreationError {
 #[cfg(windows)]
 #[derive(Debug, Error)]
 pub enum WindowsEmulationCreationError {}
+
+#[cfg(all(test, libei))]
+mod tests {
+    use super::*;
+    use ashpd::zbus::{self, fdo, names::OwnedInterfaceName};
+
+    fn libei(e: ashpd::Error) -> InputEmulationError {
+        EmulationCreationError::Libei(LibeiEmulationCreationError::Ashpd(e)).into()
+    }
+
+    #[test]
+    fn portal_not_up_yet_is_transient() {
+        let missing = OwnedInterfaceName::try_from("org.freedesktop.portal.RemoteDesktop").unwrap();
+        assert!(libei(ashpd::Error::PortalNotFound(missing)).is_transient());
+        let unknown = zbus::Error::FDO(Box::new(fdo::Error::ServiceUnknown(String::new())));
+        assert!(libei(ashpd::Error::Zbus(unknown)).is_transient());
+        assert!(
+            InputEmulationError::from(EmulationCreationError::NoAvailableBackend).is_transient()
+        );
+        assert!(InputEmulationError::from(EmulationError::EndOfStream).is_transient());
+    }
+
+    #[test]
+    fn denied_dialog_is_final() {
+        let denied = libei(Response(ResponseError::Cancelled));
+        assert!(denied.cancelled_by_user());
+        assert!(!denied.is_transient());
+        let io = InputEmulationError::from(EmulationError::Io(io::ErrorKind::Other.into()));
+        assert!(!io.is_transient());
+        assert!(!io.cancelled_by_user());
+    }
+}

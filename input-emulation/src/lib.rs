@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    future::Future,
 };
 use tokio::sync::watch;
 
@@ -30,7 +31,7 @@ mod macos;
 #[cfg(any(target_os = "macos", test))]
 mod macos_logic;
 
-/// fallback input emulation (logs events)
+/// configured-only emulation that discards events
 mod dummy;
 mod error;
 mod geometry;
@@ -126,32 +127,10 @@ impl InputEmulation {
             return b;
         }
 
-        for backend in [
-            #[cfg(wlroots)]
-            Backend::Wlroots,
-            #[cfg(libei)]
-            Backend::Libei,
-            #[cfg(rdp)]
-            Backend::Xdp,
-            #[cfg(x11)]
-            Backend::X11,
-            #[cfg(windows)]
-            Backend::Windows,
-            #[cfg(target_os = "macos")]
-            Backend::MacOs,
-            Backend::Dummy,
-        ] {
-            match Self::with_backend(backend, &permission_pending).await {
-                Ok(b) => {
-                    log::info!("using emulation backend: {backend}");
-                    return Ok(b);
-                }
-                Err(e) if e.cancelled_by_user() => return Err(e),
-                Err(e) => log::warn!("{e}"),
-            }
-        }
-
-        Err(EmulationCreationError::NoAvailableBackend)
+        first_available(AUTO_BACKENDS, |backend| {
+            Self::with_backend(backend, &permission_pending)
+        })
+        .await
     }
 
     pub async fn consume(
@@ -294,6 +273,46 @@ impl InputEmulation {
     }
 }
 
+/// backends tried in order when none is configured; never Dummy, which would
+/// report emulation as enabled while replaying nothing
+const AUTO_BACKENDS: &[Backend] = &[
+    #[cfg(wlroots)]
+    Backend::Wlroots,
+    #[cfg(libei)]
+    Backend::Libei,
+    #[cfg(rdp)]
+    Backend::Xdp,
+    #[cfg(x11)]
+    Backend::X11,
+    #[cfg(windows)]
+    Backend::Windows,
+    #[cfg(target_os = "macos")]
+    Backend::MacOs,
+];
+
+/// the first of `backends` that `create` succeeds with; stops early when the
+/// user denied a permission request
+async fn first_available<T, F, Fut>(
+    backends: &[Backend],
+    mut create: F,
+) -> Result<T, EmulationCreationError>
+where
+    F: FnMut(Backend) -> Fut,
+    Fut: Future<Output = Result<T, EmulationCreationError>>,
+{
+    for &backend in backends {
+        match create(backend).await {
+            Ok(b) => {
+                log::info!("using emulation backend: {backend}");
+                return Ok(b);
+            }
+            Err(e) if e.cancelled_by_user() => return Err(e),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+    Err(EmulationCreationError::NoAvailableBackend)
+}
+
 /// flags a permission request as pending while alive, also when the request
 /// is cancelled
 #[cfg(any(libei, rdp))]
@@ -332,4 +351,25 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_selection_without_a_working_backend_fails() {
+        let mut tried = Vec::new();
+        let result = futures::executor::block_on(first_available(AUTO_BACKENDS, |backend| {
+            tried.push(backend);
+            async { Err::<(), _>(EmulationCreationError::NoAvailableBackend) }
+        }));
+        assert!(matches!(
+            result,
+            Err(EmulationCreationError::NoAvailableBackend)
+        ));
+        assert_eq!(tried, AUTO_BACKENDS);
+        // never silently replays remote input into the log
+        assert!(!tried.contains(&Backend::Dummy));
+    }
 }

@@ -1,4 +1,5 @@
 use crate::approval;
+use crate::connect::Backoff;
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
@@ -293,6 +294,7 @@ impl EmulationProxy {
             permission_pending,
             handles: Default::default(),
             next_id: 0,
+            backoff: Backoff::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -372,28 +374,62 @@ struct EmulationTask {
     permission_pending: watch::Sender<bool>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    /// delay before recreating a backend that ended with a transient error
+    backoff: Backoff,
 }
 
 impl EmulationTask {
     async fn run(mut self) {
         loop {
-            if let Err(e) = self.do_emulation().await {
-                log::warn!("input emulation exited: {e}");
-            }
+            let retry = match self.do_emulation().await {
+                Ok(()) => None,
+                Err(e) => {
+                    log::warn!("input emulation exited: {e}");
+                    match recovery(&e, &mut self.backoff) {
+                        Recovery::Retry(delay) => {
+                            log::info!("retrying input emulation in {delay:?}");
+                            Some(delay)
+                        }
+                        Recovery::Denied => {
+                            log::warn!(
+                                "input emulation denied, `mimouse cli enable-emulation` asks again"
+                            );
+                            None
+                        }
+                        Recovery::Stop => None,
+                    }
+                }
+            };
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request
+            // wait for the retry or a reenable request
+            let retry = async {
+                match retry {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(retry);
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::EnterAt(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::PushPointer(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                select! {
+                    _ = &mut retry => break,
+                    request = self.request_rx.recv() => match request.expect("channel closed") {
+                        ProxyRequest::Reenable => {
+                            self.backoff.reset();
+                            break;
+                        }
+                        ProxyRequest::Terminate => return,
+                        ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                        ProxyRequest::EnterAt(..) => { /* emulation inactive => ignore */ }
+                        ProxyRequest::PushPointer(..) => { /* emulation inactive => ignore */ }
+                        ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    },
                 }
             }
+            // the previous attempt's permission request ended with it, so no
+            // second dialog can be opened next to a pending one
+            debug_assert!(!*self.permission_pending.borrow());
         }
     }
 
@@ -404,6 +440,7 @@ impl EmulationTask {
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
+        self.backoff.reset();
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
@@ -491,6 +528,31 @@ impl EmulationTask {
         emulation.create(handle).await;
         self.handles.insert(addr, handle);
         handle
+    }
+}
+
+/// what the emulation task does after the backend ended with an error
+#[derive(Debug, PartialEq)]
+enum Recovery {
+    /// recreate the backend after the delay
+    Retry(Duration),
+    /// the user denied the permission request: wait for `enable-emulation`
+    /// instead of showing the dialog again
+    Denied,
+    /// wait for `enable-emulation`
+    Stop,
+}
+
+/// Retries errors the backend can recover from by itself (EIS or portal
+/// gone, portal not up yet at login, no backend available yet) with
+/// `backoff`; anything else waits for `enable-emulation`.
+fn recovery(error: &InputEmulationError, backoff: &mut Backoff) -> Recovery {
+    if error.cancelled_by_user() {
+        Recovery::Denied
+    } else if error.is_transient() {
+        Recovery::Retry(backoff.next())
+    } else {
+        Recovery::Stop
     }
 }
 
@@ -600,6 +662,61 @@ mod tests {
         assert!(take_expired(&mut seen, at(4000), WATCHDOG_TIMEOUT).is_empty());
         assert_eq!(take_expired(&mut seen, at(6400), WATCHDOG_TIMEOUT), [lossy]);
         assert!(seen.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use input_emulation::{EmulationCreationError, EmulationError};
+
+    #[test]
+    fn transient_errors_retry_with_backoff_until_a_backend_comes_up() {
+        let mut backoff = Backoff::default();
+        let none = InputEmulationError::from(EmulationCreationError::NoAvailableBackend);
+        let gone = InputEmulationError::from(EmulationError::EndOfStream);
+        let secs = |s| Recovery::Retry(Duration::from_secs(s));
+        assert_eq!(recovery(&none, &mut backoff), secs(1));
+        assert_eq!(recovery(&none, &mut backoff), secs(2));
+        assert_eq!(recovery(&none, &mut backoff), secs(4));
+        // a later attempt created the backend (`do_emulation` resets) and
+        // the session ended: the next retry starts over
+        backoff.reset();
+        assert_eq!(recovery(&gone, &mut backoff), secs(1));
+        for _ in 0..8 {
+            recovery(&gone, &mut backoff);
+        }
+        assert_eq!(recovery(&gone, &mut backoff), secs(30));
+    }
+
+    #[test]
+    fn other_errors_wait_for_enable_emulation() {
+        let mut backoff = Backoff::default();
+        let io = InputEmulationError::from(EmulationError::Io(std::io::ErrorKind::Other.into()));
+        assert_eq!(recovery(&io, &mut backoff), Recovery::Stop);
+        // no attempt consumed a delay
+        let none = InputEmulationError::from(EmulationCreationError::NoAvailableBackend);
+        assert_eq!(
+            recovery(&none, &mut backoff),
+            Recovery::Retry(Duration::from_secs(1))
+        );
+    }
+
+    #[cfg(libei_emulation)]
+    #[test]
+    fn denied_dialog_is_not_shown_again() {
+        use ashpd::desktop::ResponseError;
+        let mut backoff = Backoff::default();
+        let denied = InputEmulationError::from(EmulationCreationError::Libei(
+            ashpd::Error::Response(ResponseError::Cancelled).into(),
+        ));
+        assert_eq!(recovery(&denied, &mut backoff), Recovery::Denied);
+        // a transient error afterwards still starts at the first delay
+        let gone = InputEmulationError::from(EmulationError::EndOfStream);
+        assert_eq!(
+            recovery(&gone, &mut backoff),
+            Recovery::Retry(Duration::from_secs(1))
+        );
     }
 }
 
