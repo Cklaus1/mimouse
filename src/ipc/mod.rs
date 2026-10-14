@@ -156,6 +156,10 @@ pub struct ClientConfig {
     /// chord that switches control to this client
     #[serde(default)]
     pub hotkey: Option<Vec<scancode::Linux>>,
+    /// sha256 fingerprint of the client's certificate: outgoing connections
+    /// accept only this one (set by pairing, or on the first connection)
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -168,6 +172,7 @@ impl Default for ClientConfig {
             cmd: None,
             range: None,
             hotkey: None,
+            fingerprint: None,
         }
     }
 }
@@ -295,7 +300,7 @@ pub enum FrontendEvent {
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
     Done,
-    Client(ClientInfo),
+    Client(Box<ClientInfo>),
     Clients(Vec<ClientInfo>),
 }
 

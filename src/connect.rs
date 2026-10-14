@@ -1,4 +1,5 @@
 use crate::client::ClientManager;
+use crate::crypto::{self, peers::Policy};
 use crate::dns::DnsRequester;
 use crate::ipc::{ClientHandle, DEFAULT_PORT};
 use crate::proto::{MAX_EVENT_SIZE, ProtoEvent};
@@ -19,11 +20,7 @@ use tokio::{
     task::{JoinSet, spawn_local},
 };
 use tokio_util::sync::CancellationToken;
-use webrtc_dtls::{
-    config::{Config, ExtendedMasterSecretType},
-    conn::DTLSConn,
-    crypto::Certificate,
-};
+use webrtc_dtls::{conn::DTLSConn, crypto::Certificate};
 use webrtc_util::Conn;
 
 #[derive(Debug, Error)]
@@ -40,14 +37,19 @@ pub(crate) enum MiMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+    #[error("server certificate {0} is not the one pinned for this client")]
+    Untrusted(String),
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// a DTLS connection to `addr` whose server `policy` trusts, with the
+/// server's certificate fingerprint
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, MiMouseConnectionError)> {
+    policy: Policy,
+) -> Result<(ArcConn, SocketAddr, String), (SocketAddr, MiMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
     let conn = Arc::new(
         UdpSocket::bind("0.0.0.0:0")
@@ -55,30 +57,41 @@ async fn connect(
             .map_err(|e| (addr, e.into()))?,
     );
     conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
-    let config = Config {
-        certificates: vec![cert],
-        server_name: "ignored".to_owned(),
-        insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
-        ..Default::default()
-    };
+    let (config, rejected) = crypto::peers::dtls_client_config(cert, policy);
     let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
-    tokio::select! {
-        _ = timeout => Err((addr, MiMouseConnectionError::Timeout)),
+    let dtls_conn = tokio::select! {
+        _ = timeout => return Err((addr, MiMouseConnectionError::Timeout)),
         result = DTLSConn::new(conn, config, true, None) => match result {
-            Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
-            Err(e) => Err((addr, e.into())),
+            Ok(dtls_conn) => dtls_conn,
+            Err(e) => {
+                let e = match rejected.get() {
+                    Some(fingerprint) => MiMouseConnectionError::Untrusted(fingerprint.clone()),
+                    None => e.into(),
+                };
+                return Err((addr, e));
+            }
         }
-    }
+    };
+    let state = dtls_conn.connection_state().await;
+    let Some(fingerprint) = state
+        .peer_certificates
+        .first()
+        .map(|c| crypto::generate_fingerprint(c))
+    else {
+        let _ = dtls_conn.close().await;
+        return Err((addr, webrtc_dtls::Error::ErrNoCertificates.into()));
+    };
+    Ok((Arc::new(dtls_conn), addr, fingerprint))
 }
 
 async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
-) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), MiMouseConnectionError> {
+    policy: Policy,
+) -> Result<(ArcConn, SocketAddr, String), MiMouseConnectionError> {
     let mut joinset = JoinSet::new();
     for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
+        joinset.spawn_local(connect(addr, cert.clone(), policy.clone()));
     }
     loop {
         match joinset.join_next().await {
@@ -341,13 +354,17 @@ impl Connector {
             .client_manager
             .get_ips(handle)
             .ok_or(MiMouseConnectionError::NotConnected)?;
+        let policy = self
+            .client_manager
+            .server_policy(handle)
+            .ok_or(MiMouseConnectionError::NotConnected)?;
         let port = self.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
         let addrs = ips
             .into_iter()
             .map(|a| SocketAddr::new(a, port))
             .collect::<Vec<_>>();
         log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let (conn, addr) = connect_any(&addrs, self.cert.clone()).await?;
+        let (conn, addr, fingerprint) = connect_any(&addrs, self.cert.clone(), policy).await?;
         // the client may have been removed or moved while connecting
         let current = self
             .client_manager
@@ -357,6 +374,10 @@ impl Connector {
         if !current {
             let _ = conn.close().await;
             return Err(MiMouseConnectionError::NotConnected);
+        }
+        if !self.client_manager.pin(handle, addr, &fingerprint) {
+            let _ = conn.close().await;
+            return Err(MiMouseConnectionError::Untrusted(fingerprint));
         }
         log::info!("client ({handle}) connected @ {addr}");
         self.client_manager.set_active_addr(handle, Some(addr));
@@ -640,6 +661,47 @@ mod tests {
                 assert!(!connector.is_connected(handle).await);
                 assert_eq!(client_manager.active_addr(handle), None);
                 listener.terminate().await;
+            })
+            .await;
+    }
+
+    /// A2: an unpinned client is pinned to the first server it reaches; a
+    /// server with another certificate at its address is then refused
+    #[tokio::test]
+    async fn unpinned_client_is_pinned_on_first_use() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (mut first, client_manager, handle) = peer(&cert).await;
+                let (mut other, other_manager, other_handle) = peer(&cert).await;
+                let conn = MiMouseConnection::new(cert, client_manager.clone());
+                let connector = conn.connector();
+                connector.keep_connected(handle);
+                accepted(&mut first).await;
+                while !connector.is_connected(handle).await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let pin = client_manager.get_state(handle).unwrap().0.fingerprint;
+                assert!(pin.is_some(), "no pin recorded");
+
+                // the client now points at a server with another certificate
+                connector.stop(handle);
+                client_manager.set_port(handle, other_manager.get_port(other_handle).unwrap());
+                connector.keep_connected(handle);
+                let refused = tokio::time::timeout(Duration::from_secs(3), async {
+                    while let Some(event) = other.next().await {
+                        assert!(
+                            !matches!(event, ListenEvent::Accept { .. }),
+                            "server with another certificate accepted"
+                        );
+                    }
+                });
+                assert!(refused.await.is_err(), "listener closed");
+                assert!(!connector.is_connected(handle).await);
+                assert_eq!(client_manager.get_state(handle).unwrap().0.fingerprint, pin);
+                connector.stop(handle);
+                first.terminate().await;
+                other.terminate().await;
             })
             .await;
     }

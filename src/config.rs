@@ -76,6 +76,7 @@ struct TomlClient {
     enter_hook: Option<String>,
     range: Option<[u8; 2]>,
     hotkey: Option<Vec<scancode::Linux>>,
+    fingerprint: Option<String>,
 }
 
 impl ConfigToml {
@@ -339,6 +340,9 @@ pub struct ConfigClient {
     pub range: Option<[u8; 2]>,
     /// chord that switches control to this client
     pub hotkey: Option<Vec<scancode::Linux>>,
+    /// certificate fingerprint outgoing connections accept (`None`: trust
+    /// the first one seen)
+    pub fingerprint: Option<String>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -360,6 +364,7 @@ impl From<TomlClient> for ConfigClient {
             enter_hook,
             range,
             hotkey,
+            fingerprint: toml.fingerprint,
         }
     }
 }
@@ -391,6 +396,7 @@ impl From<ConfigClient> for TomlClient {
             enter_hook,
             range,
             hotkey,
+            fingerprint: client.fingerprint,
         }
     }
 }
@@ -1085,6 +1091,7 @@ port = 4243
             enter_hook: None,
             range: Some([0, 100]),
             hotkey: Some(vec![KeyLeftCtrl, KeyLeftAlt, scancode::Linux::Key1]),
+            fingerprint: None,
         });
         merge_config(&mut doc, &cfg).unwrap();
         let out = doc.to_string();
@@ -1440,6 +1447,37 @@ future_client_key = "kept"
         assert!(out.contains("port = 4244"), "{out}");
         assert!(out.contains("\"cc:dd\" = \"phone\""), "{out}");
         assert_eq!(fs::read_to_string(&last_good).unwrap(), out);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// clients without `fingerprint` load unpinned; a pin set at runtime is
+    /// saved into its client's table and loads back
+    #[tokio::test]
+    async fn fingerprint_round_trips() {
+        let dir = temp_dir("fingerprint");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, COMMENTED).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let mut clients = config.clients();
+        assert!(clients.iter().all(|c| c.fingerprint.is_none()));
+
+        clients[1].fingerprint = Some("aa:01".into());
+        config
+            .save(clients, config.authorized_fingerprints())
+            .await
+            .unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out,
+            COMMENTED.replace("port = 4243\n", "port = 4243\nfingerprint = \"aa:01\"\n")
+        );
+        let pins: Vec<_> = Config::at(&path)
+            .unwrap()
+            .clients()
+            .into_iter()
+            .map(|c| c.fingerprint)
+            .collect();
+        assert_eq!(pins, [None, Some("aa:01".to_owned())]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

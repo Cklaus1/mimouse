@@ -1,8 +1,8 @@
 //! TLS over TCP transport for clipboard updates.
 //!
-//! Uses the mimouse DTLS certificate on both ends. A connection is accepted
-//! only if the peer's certificate fingerprint is in `authorized_fingerprints`
-//! (checked by both the client and the server).
+//! Uses the mimouse DTLS certificate on both ends. The server accepts only
+//! certificates in `authorized_fingerprints`; the client accepts the server
+//! its client is pinned to, trusting it on first use (`crypto::peers`).
 //!
 //! One connection carries one update: the client sends a frame
 //! (`len: u32 BE | payload`, payload see `wire`), the server answers with a
@@ -21,13 +21,7 @@ use std::{
     time::Duration,
 };
 
-use rustls::{
-    DigitallySignedStruct, DistinguishedName, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{WebPkiSupportedAlgorithms, ring},
-    server::danger::{ClientCertVerified, ClientCertVerifier},
-};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls_pki_types::{CertificateDer, ServerName};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -40,7 +34,10 @@ use tokio_rustls::{LazyConfigAcceptor, StartHandshake, TlsAcceptor, TlsConnector
 use webrtc_dtls::crypto::Certificate;
 
 use super::{ClipboardData, files::FileStore, wire};
-use crate::{crypto, pair};
+use crate::{
+    crypto::{self, peers::Policy},
+    pair,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,6 +68,10 @@ pub(crate) enum TransportError {
     NoAck,
     #[error("no address reachable")]
     Unreachable,
+    #[error("server certificate {0} is not the one pinned for this client")]
+    Untrusted(String),
+    #[error("peer presented no certificate")]
+    NoCertificate,
 }
 
 impl From<tokio::time::error::Elapsed> for TransportError {
@@ -79,9 +80,13 @@ impl From<tokio::time::error::Elapsed> for TransportError {
     }
 }
 
+/// a clipboard update received from the peer at an address, with the
+/// fingerprint of its certificate
+pub(crate) type Received = (Arc<ClipboardData>, IpAddr, String);
+
 pub(crate) struct Tls {
     acceptor: TlsAcceptor,
-    connector: TlsConnector,
+    cert: Certificate,
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 }
 
@@ -90,140 +95,29 @@ impl Tls {
         cert: &Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, TransportError> {
-        // the PEM file uses a nonstandard `PRIVATE_KEY` tag, so take the
-        // already parsed certificate; mimouse generates PKCS#8 keys
-        let certs = cert.certificate.clone();
-        let key: PrivateKeyDer =
-            PrivatePkcs8KeyDer::from(cert.private_key.serialized_der.clone()).into();
-        let provider = Arc::new(ring::default_provider());
-        let verifier = Arc::new(PeerVerifier {
-            authorized_keys: authorized_keys.clone(),
-            algorithms: provider.signature_verification_algorithms,
-        });
-        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(verifier.clone())
-            .with_single_cert(certs.clone(), key.clone_key())?;
-        let client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(certs, key)?;
+        let server =
+            crypto::peers::tls_server_config(cert, Policy::Authorized(authorized_keys.clone()))?;
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(server)),
-            connector: TlsConnector::from(Arc::new(client)),
+            cert: cert.clone(),
             authorized_keys,
         })
     }
 
-    fn describe(&self, cert: Option<&CertificateDer>) -> String {
-        let Some(cert) = cert else {
-            return "unknown peer".into();
-        };
-        let fingerprint = crypto::generate_fingerprint(cert);
+    /// the name `fingerprint` is authorized as, else the fingerprint
+    fn describe(&self, fingerprint: &str) -> String {
         let keys = self.authorized_keys.read().expect("lock");
-        keys.get(&fingerprint).cloned().unwrap_or(fingerprint)
+        keys.get(fingerprint)
+            .cloned()
+            .unwrap_or_else(|| fingerprint.to_owned())
     }
 }
 
-/// accepts peers whose certificate fingerprint is authorized;
-/// mimouse certificates are self-signed, so there is no chain to verify
-#[derive(Debug)]
-struct PeerVerifier {
-    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
-    algorithms: WebPkiSupportedAlgorithms,
-}
-
-impl PeerVerifier {
-    fn check(&self, cert: &CertificateDer) -> Result<(), rustls::Error> {
-        let fingerprint = crypto::generate_fingerprint(cert);
-        if self
-            .authorized_keys
-            .read()
-            .expect("lock")
-            .contains_key(&fingerprint)
-        {
-            Ok(())
-        } else {
-            Err(rustls::Error::General(format!(
-                "unauthorized certificate fingerprint {fingerprint}"
-            )))
-        }
-    }
-}
-
-impl ServerCertVerifier for PeerVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        self.check(end_entity)
-            .map(|_| ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
-}
-
-impl ClientCertVerifier for PeerVerifier {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        self.check(end_entity)
-            .map(|_| ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
+fn fingerprint(certs: Option<&[CertificateDer]>) -> Result<String, TransportError> {
+    certs
+        .and_then(|c| c.first())
+        .map(|c| crypto::generate_fingerprint(c))
+        .ok_or(TransportError::NoCertificate)
 }
 
 /// time allowed to transfer a frame of `len` bytes
@@ -231,13 +125,16 @@ fn transfer_timeout(len: u64) -> Duration {
     TRANSFER_TIMEOUT + Duration::from_secs(len / MIN_TRANSFER_RATE)
 }
 
-/// send `data` to the first reachable address; copied files are read when
-/// sending and may total at most `max_file_size` bytes
+/// send `data` to the first reachable address whose server `policy` and
+/// `trust` (given the address and the server's fingerprint) accept; copied
+/// files are read when sending and may total at most `max_file_size` bytes
 pub(crate) async fn send(
     tls: &Tls,
     addrs: &[SocketAddr],
     data: Arc<ClipboardData>,
     max_file_size: u64,
+    policy: Policy,
+    trust: impl Fn(SocketAddr, &str) -> bool,
 ) -> Result<SocketAddr, TransportError> {
     let payload = spawn_blocking(move || wire::encode(&data, max_file_size))
         .await
@@ -245,9 +142,12 @@ pub(crate) async fn send(
     if u32::try_from(payload.len()).is_err() {
         return Err(TransportError::TooLarge(payload.len() as u64));
     }
+    let connector = TlsConnector::from(Arc::new(crypto::peers::tls_client_config(
+        &tls.cert, policy,
+    )?));
     let mut last_err = TransportError::Unreachable;
     for &addr in addrs {
-        match send_to(tls, addr, &payload).await {
+        match send_to(&connector, addr, &payload, &trust).await {
             Ok(()) => return Ok(addr),
             Err(e) => {
                 log::debug!("clipboard: {addr}: {e}");
@@ -258,11 +158,20 @@ pub(crate) async fn send(
     Err(last_err)
 }
 
-async fn send_to(tls: &Tls, addr: SocketAddr, payload: &[u8]) -> Result<(), TransportError> {
+async fn send_to(
+    connector: &TlsConnector,
+    addr: SocketAddr,
+    payload: &[u8],
+    trust: impl Fn(SocketAddr, &str) -> bool,
+) -> Result<(), TransportError> {
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
     let name = ServerName::try_from("mimouse").expect("valid server name");
-    let mut stream = timeout(HANDSHAKE_TIMEOUT, tls.connector.connect(name, stream)).await??;
+    let mut stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream)).await??;
+    let fingerprint = fingerprint(stream.get_ref().1.peer_certificates())?;
+    if !trust(addr, &fingerprint) {
+        return Err(TransportError::Untrusted(fingerprint));
+    }
     timeout(transfer_timeout(payload.len() as u64), async {
         stream
             .write_all(&(payload.len() as u32).to_be_bytes())
@@ -285,7 +194,7 @@ pub(crate) fn listen(
     port: u16,
     tls: Rc<Tls>,
     max_file_size: u64,
-    tx: Option<mpsc::UnboundedSender<(Arc<ClipboardData>, IpAddr)>>,
+    tx: Option<mpsc::UnboundedSender<Received>>,
     pair_tx: mpsc::UnboundedSender<pair::Incoming>,
 ) -> JoinHandle<()> {
     let store = tx.as_ref().and_then(|_| FileStore::new());
@@ -328,13 +237,14 @@ pub(crate) fn listen(
                     return log::debug!("tcp {peer}: clipboard sharing is disabled");
                 };
                 match receive(&tls, start, max_file_size, store).await {
-                    Ok((data, from)) => {
+                    Ok((data, fingerprint)) => {
                         log::info!(
-                            "clipboard received from {from} ({} bytes: {})",
+                            "clipboard received from {} ({} bytes: {})",
+                            tls.describe(&fingerprint),
                             data.total_size(),
                             data.mime_types().collect::<Vec<_>>().join(", ")
                         );
-                        let _ = tx.send((Arc::new(data), peer.ip()));
+                        let _ = tx.send((Arc::new(data), peer.ip(), fingerprint));
                     }
                     Err(e) => log::warn!("clipboard: {peer}: {e}"),
                 }
@@ -349,6 +259,7 @@ async fn client_hello(stream: TcpStream) -> Result<StartHandshake<TcpStream>, Tr
     Ok(timeout(HANDSHAKE_TIMEOUT, acceptor).await??)
 }
 
+/// a clipboard update and the fingerprint of the peer that sent it
 async fn receive(
     tls: &Tls,
     start: StartHandshake<TcpStream>,
@@ -357,13 +268,7 @@ async fn receive(
 ) -> Result<(ClipboardData, String), TransportError> {
     let config = tls.acceptor.config().clone();
     let mut stream = timeout(HANDSHAKE_TIMEOUT, start.into_stream(config)).await??;
-    let from = tls.describe(
-        stream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|c| c.first()),
-    );
+    let from = fingerprint(stream.get_ref().1.peer_certificates())?;
     let payload = read_frame(&mut stream, wire::max_frame_len(max_file_size)).await?;
     let data = spawn_blocking(move || {
         let frame = wire::decode(&payload, max_file_size).ok_or(TransportError::Invalid)?;
