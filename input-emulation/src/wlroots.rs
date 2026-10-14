@@ -48,6 +48,12 @@ use super::{Edge, EmulationHandle};
 /// then and is retried later.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a key-up or button-up waits for the compositor to read a full
+/// connection. Discarding it would leave the key or button held; a
+/// compositor that reads nothing for this long ends the backend, which is
+/// then recreated.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// the seat's keymap, uploaded to every virtual keyboard
 struct Keymap {
     format: u32,
@@ -100,7 +106,11 @@ struct Output {
 
 // App State, implements Dispatch event handlers
 pub(crate) struct WlrootsEmulation {
+    conn: Connection,
     last_flush_failed: bool,
+    /// the compositor read nothing for `RELEASE_TIMEOUT` while a release
+    /// waited: the backend ends
+    stalled: bool,
     state: State,
     queue: EventQueue<State>,
 }
@@ -150,7 +160,9 @@ impl WlrootsEmulation {
         }
 
         let mut emulate = WlrootsEmulation {
+            conn: conn.clone(),
             last_flush_failed: false,
+            stalled: false,
             state: State {
                 keymap: None,
                 keyboard: None,
@@ -235,6 +247,31 @@ impl WlrootsEmulation {
             })?;
         Ok(())
     }
+
+    /// Waits until the compositor has read everything queued, at most
+    /// `RELEASE_TIMEOUT`.
+    async fn drain(&mut self) -> Result<(), EmulationError> {
+        let backend = self.conn.backend();
+        let fd = AsyncFd::with_interest(backend.poll_fd(), Interest::WRITABLE)?;
+        let deadline = tokio::time::Instant::now() + RELEASE_TIMEOUT;
+        loop {
+            let Ok(writable) = tokio::time::timeout_at(deadline, fd.writable()).await else {
+                self.stalled = true;
+                return Err(EmulationError::Stalled(RELEASE_TIMEOUT));
+            };
+            let mut writable = writable?;
+            match self.queue.flush() {
+                Ok(()) => {
+                    self.last_flush_failed = false;
+                    return Ok(());
+                }
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    writable.clear_ready()
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 }
 
 impl State {
@@ -309,31 +346,42 @@ impl Emulation for WlrootsEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        if self.stalled {
+            return Err(EmulationError::Stalled(RELEASE_TIMEOUT));
+        }
         self.read_events()?;
-        if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
-            if self.last_flush_failed {
-                match self.queue.flush() {
-                    Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                        /*
-                         * outgoing buffer is full - sending more events
-                         * will overwhelm the output buffer and leave the
-                         * wayland connection in a broken state
-                         */
+        if !self.state.input_for_client.contains_key(&handle) {
+            return Ok(());
+        }
+        if self.last_flush_failed {
+            match self.queue.flush() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    /*
+                     * outgoing buffer is full - sending more events
+                     * will overwhelm the output buffer and leave the
+                     * wayland connection in a broken state
+                     */
+                    if !is_release(event) {
                         log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                         return Ok(());
                     }
-                    _ => {}
+                    // a discarded release would leave the key or button held
+                    self.drain().await?;
                 }
+                _ => {}
             }
+        }
+        if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
             virtual_input.consume_event(event)?;
-            match self.queue.flush() {
-                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.last_flush_failed = true;
-                    log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
-                }
-                Ok(()) => self.last_flush_failed = false,
-                Err(e) => Err(e)?,
+        }
+        match self.queue.flush() {
+            // queued, sent with the next flush
+            Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.last_flush_failed = true;
+                log::warn!("can't keep up, event ({handle}) delayed");
             }
+            Ok(()) => self.last_flush_failed = false,
+            Err(e) => Err(e)?,
         }
         Ok(())
     }
@@ -417,6 +465,15 @@ impl Emulation for WlrootsEmulation {
     async fn terminate(&mut self) {
         /* nothing to do */
     }
+}
+
+/// a key-up or button-up
+fn is_release(event: Event) -> bool {
+    matches!(
+        event,
+        Event::Keyboard(KeyboardEvent::Key { state: 0, .. })
+            | Event::Pointer(PointerEvent::Button { state: 0, .. })
+    )
 }
 
 struct VirtualInput {
@@ -703,9 +760,10 @@ impl XMods {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::{Backend, InputEmulation, InputEmulationError, Selected};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// the globals the backend binds; the seat has no keyboard
     const GLOBALS: &[(&str, u32)] = &[
@@ -735,14 +793,19 @@ pub(crate) mod tests {
         message(registry, 0, &args)
     }
 
+    /// a request: object, opcode and the encoded arguments
+    type Request = (u32, u32, Vec<u8>);
+
     /// The compositor end of a fake connection: it announces `GLOBALS` and
     /// answers `wl_display.sync`, anything else the test sends. It records
-    /// every request as (object, opcode).
+    /// every request.
     struct Compositor {
         stream: Arc<Mutex<UnixStream>>,
         /// the client's `wl_registry`
         registry: Arc<AtomicU32>,
-        requests: Arc<Mutex<Vec<(u32, u32)>>>,
+        requests: Arc<Mutex<Vec<Request>>>,
+        /// reads no further request while set, as a busy compositor
+        paused: Arc<AtomicBool>,
     }
 
     impl Compositor {
@@ -753,16 +816,24 @@ pub(crate) mod tests {
                 stream: Arc::new(Mutex::new(server)),
                 registry: Arc::default(),
                 requests: Arc::default(),
+                paused: Arc::default(),
             };
-            let (stream, registry, requests) = (
+            let (stream, registry, requests, paused) = (
                 compositor.stream.clone(),
                 compositor.registry.clone(),
                 compositor.requests.clone(),
+                compositor.paused.clone(),
             );
             std::thread::spawn(move || {
                 let mut header = [0; 8];
                 // ends when the client hangs up
-                while reader.read_exact(&mut header).is_ok() {
+                loop {
+                    while paused.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if reader.read_exact(&mut header).is_err() {
+                        return;
+                    }
                     let word = |b: &[u8]| u32::from_ne_bytes(b[..4].try_into().unwrap());
                     let (object, size_opcode) = (word(&header), word(&header[4..]));
                     let mut args = vec![0; (size_opcode >> 16) as usize - 8];
@@ -772,7 +843,7 @@ pub(crate) mod tests {
                     requests
                         .lock()
                         .unwrap()
-                        .push((object, size_opcode & 0xffff));
+                        .push((object, size_opcode & 0xffff, args.clone()));
                     // both requests carry the new object's id first
                     let id = || word(&args);
                     let reply = match (object, size_opcode & 0xffff) {
@@ -809,8 +880,116 @@ pub(crate) mod tests {
         fn received(&self, object: &impl Proxy, opcode: u32) -> usize {
             let id = object.id().protocol_id();
             let requests = self.requests.lock().unwrap();
-            requests.iter().filter(|&&r| r == (id, opcode)).count()
+            requests
+                .iter()
+                .filter(|(o, op, _)| (*o, *op) == (id, opcode))
+                .count()
         }
+
+        /// how many `zwp_virtual_keyboard_v1.key` requests released `key`:
+        /// the only requests with opcode 1 and the arguments time, key, state
+        fn key_ups(&self, key: u32) -> usize {
+            let up = [0, key, 0].map(u32::to_ne_bytes);
+            let requests = self.requests.lock().unwrap();
+            requests
+                .iter()
+                .filter(|(_, opcode, args)| {
+                    *opcode == 1 && args.len() == 12 && args[4..] == up[1..].concat()
+                })
+                .count()
+        }
+
+        /// stops reading requests, so the client's socket buffer fills
+        fn pause(&self) {
+            self.paused.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Compositor {
+        /// lets the reader see the client hang up
+        fn drop(&mut self) {
+            self.paused.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// far more motion than a Unix socket buffer holds (`wmem_default`,
+    /// 208 KiB by default), so the backend falls behind a paused compositor
+    const FILL: usize = 1 << 16;
+
+    fn key(key: u32, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key,
+            state,
+        })
+    }
+
+    const MOTION: Event = Event::Pointer(PointerEvent::Motion {
+        time: 0,
+        dx: 1.,
+        dy: 0.,
+    });
+
+    const KEY_A: u32 = 30;
+
+    /// A key-up that meets a full connection waits for the compositor to
+    /// read instead of being discarded: discarded, it counted as emulated,
+    /// so the key stayed held in the compositor and `destroy` did not
+    /// repeat it.
+    #[tokio::test]
+    async fn a_release_reaches_a_compositor_that_fell_behind() {
+        let (conn, compositor) = Compositor::start();
+        let selected = Selected {
+            backend: Backend::Wlroots,
+            auto: false,
+        };
+        let mut emulation = InputEmulation::with_emulation(Box::new(bound(&conn)), selected);
+        emulation.create(1).await;
+        emulation.consume(key(KEY_A, 1), 1).await.unwrap();
+        compositor.pause();
+        for _ in 0..FILL {
+            emulation.consume(MOTION, 1).await.unwrap();
+        }
+        let paused = compositor.paused.clone();
+        let resume = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            paused.store(false, Ordering::SeqCst);
+        });
+        emulation.consume(key(KEY_A, 0), 1).await.unwrap();
+        resume.join().unwrap();
+        // the compositor reads everything queued
+        loop {
+            match conn.flush() {
+                Ok(()) => break,
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(1)).await
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        emulation.destroy(1).await;
+        conn.roundtrip().unwrap();
+        assert_eq!(compositor.key_ups(KEY_A), 1);
+    }
+
+    /// A compositor that stops reading fails a key-up after
+    /// `RELEASE_TIMEOUT` with a transient error, so the backend is
+    /// recreated; later events fail at once instead of waiting again.
+    #[tokio::test]
+    async fn a_release_fails_when_the_compositor_stops_reading() {
+        use futures::FutureExt;
+        let (conn, compositor) = Compositor::start();
+        let mut emulation = bound(&conn);
+        emulation.create(1).await;
+        emulation.consume(key(KEY_A, 1), 1).await.unwrap();
+        compositor.pause();
+        for _ in 0..FILL {
+            emulation.consume(MOTION, 1).await.unwrap();
+        }
+        let error = emulation.consume(key(KEY_A, 0), 1).await.unwrap_err();
+        assert!(InputEmulationError::from(error).is_transient());
+        let again = emulation.consume(key(KEY_A, 0), 1).now_or_never();
+        assert!(matches!(again, Some(Err(EmulationError::Stalled(_)))));
     }
 
     /// a keymap fd holding `text`, as the compositor sends it

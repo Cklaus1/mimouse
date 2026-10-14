@@ -13,7 +13,8 @@ impl InputEmulationError {
     }
 
     /// the backend may come up by itself: the EIS / portal / compositor
-    /// connection ended or is not there yet (login), or no backend works yet
+    /// connection ended, stalled or is not there yet (login), or no backend
+    /// works yet
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Create(EmulationCreationError::NoAvailableBackend) => true,
@@ -36,6 +37,8 @@ impl InputEmulationError {
             Self::Emulate(EmulationError::Ashpd(e)) => portal_not_on_bus(e),
             #[cfg(wlroots)]
             Self::Emulate(EmulationError::Wayland(e)) => compositor_gone(e),
+            #[cfg(wlroots)]
+            Self::Emulate(EmulationError::Stalled(_)) => true,
             _ => false,
         }
     }
@@ -95,6 +98,10 @@ pub enum EmulationError {
     #[cfg(wlroots)]
     #[error("event not representable by the backend: {0:?}")]
     InvalidEvent(input_event::Event),
+    /// the compositor read nothing while a release waited
+    #[cfg(wlroots)]
+    #[error("the compositor read no input for {0:?}")]
+    Stalled(std::time::Duration),
     #[cfg(any(rdp, libei))]
     #[error("xdg-desktop-portal: `{0}`")]
     Ashpd(#[from] ashpd::Error),
