@@ -54,6 +54,7 @@ Tracks group tasks by file scope; each track runs in its own worktree `/home/ckl
 | T2 | T2 | cfg | src/config.rs, consts in src/{connect,emulation,pair}.rs | S1, X1 |
 | T3 | T3 | svc | Cargo.toml (dev tokio `test-util`), tests in src/{connect,capture,inhibit,approval}.rs | S1 |
 | X0 | T-1a | rel | deny.toml, .github/workflows/rust.yml, AGENTS.md (gate) | - |
+| W1 | P2 REVISED (Defender) | rel | build.rs, Cargo.toml/Cargo.lock (`winresource` build-dep, MIT) | - | [added 2026-10-14 by integrator after the wave-1 smoke: Defender ML quarantine] |
 | X1 | T-1, T-2, T-3, T-4 | rel | src/telemetry.rs (new), src/cli.rs, src/config.rs, src/main.rs, .github/workflows/release.yml, Cargo.toml (`rustls-native-certs`) | S1, T5, X0 |
 | X2 | T-5 | rel | telemetry-collector/ (new) | - |
 | D1 | T4, T-6, P5 | docs | README.md, .github/FUNDING.yml, packaging/winget locale, src/main.rs/cli (`after_help`) | X1, T2, T3, G2 |

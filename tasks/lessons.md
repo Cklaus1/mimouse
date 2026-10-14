@@ -1,3 +1,5 @@
 # Lessons
 
 - The capture task reads `CaptureRequest`s only after `InputCapture::new` returns; while a portal dialog waits, anything that expects a reply (e.g. `Focus`) hangs and fires late. Gate such requests in the service on `capture_status`/`capture_awaiting` (fixed for `cli focus` in 10fffe9).
+- A megapc deploy that prints a `Get-FileHash` read error means Defender quarantined the exe: check `Get-MpThreatDetection` before suspecting the build. Test candidate exes by copying them to a scratch folder (write scan) and running `--version` (execution scan); never add exclusions (owner decision 2026-10-14).
+- Agent briefs must quote the spec's latest `[REVISED]` text, not the integrator's memory of the item (K4 brief asked for routing that A-arch-3 REVISED had dropped).
