@@ -149,6 +149,21 @@ impl EmulationCreationError {
         }
         false
     }
+
+    /// The backend's desktop runs but is not ready yet: a wlroots seat
+    /// without a keyboard sends no keymap. Auto selection retries it rather
+    /// than fall back to a backend that reaches only part of the desktop
+    /// (X11 on Xwayland).
+    pub(crate) fn not_ready(&self) -> bool {
+        #[cfg(wlroots)]
+        if matches!(
+            self,
+            EmulationCreationError::Wlroots(WlrootsEmulationCreationError::Timeout { .. })
+        ) {
+            return true;
+        }
+        false
+    }
 }
 
 #[cfg(wlroots)]
