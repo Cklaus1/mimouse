@@ -80,7 +80,7 @@ Ship MiMouse as a publicly supported product. Decided by the product owner on 20
 
 | # | Item | Recommendation |
 |---|---|---|
-| N1 | T-5 deployment: Cloudflare account, domain, `wrangler deploy`, setting `MIMOUSE_TELEMETRY_URL` as a repo secret | Deploy after v1 code lands; until then release builds have no endpoint and `telemetry on` explains why |
+| N1 | T-5 deployment: Cloudflare account, domain, `wrangler deploy`, setting `MIMOUSE_TELEMETRY_URL` as a repository variable (`release.yml` reads `vars.*`; a secret would leave release builds without an endpoint) [REVISED 2026-10-14, review R-1: was "repo secret"] | Deploy after v1 code lands; until then release builds have no endpoint and `telemetry on` explains why |
 | N2 | P1 on real hardware for desktops that can't run headless here (KDE/sway/Hyprland on a real GPU, macOS) | Smoke headless here; record real-hardware runs as they happen |
 | N3 | P4 go/no-go: merge `product-review` into `main`, push `v1.0.0` | Merge after the implementation review and smoke are green |
 | N4 | X11 capture backend (X11 can only receive today) | Not in v1; README says receive-only |

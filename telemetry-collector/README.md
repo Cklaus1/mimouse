@@ -85,6 +85,7 @@ Needs a Cloudflare account and a domain on it.
    for the Worker.
 6. Smoke: post `example-batch.json` and `DELETE` its install id as in
    "Develop and test", against `https://<hostname>`.
-7. Set the repository secret `MIMOUSE_TELEMETRY_URL` to the base URL
-   `https://<hostname>` for tag builds; the client appends `/v1/batch` and
-   `/v1/installs/<id>`.
+7. Set the repository variable (not a secret: `release.yml` reads
+   `vars.MIMOUSE_TELEMETRY_URL`; Settings → Secrets and variables → Actions →
+   Variables) `MIMOUSE_TELEMETRY_URL` to the base URL `https://<hostname>` for
+   tag builds; the client appends `/v1/batch` and `/v1/installs/<id>`.
