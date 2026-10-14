@@ -63,6 +63,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
 ] }
 rustls-pki-types = { version = "1.14", features = ["std"] }
+# telemetry upload (X1): OS root certificates for the HTTPS endpoint
+rustls-native-certs = "0.8.5"
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
 num_enum = "0.7.2"
 paste = "1.0"
