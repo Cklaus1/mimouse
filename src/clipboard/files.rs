@@ -506,6 +506,8 @@ pub(super) mod tests {
         );
     }
 
+    // on Windows `\` separates path components, so no file name holds it
+    #[cfg(unix)]
     #[test]
     fn untransferable_name_is_reported() {
         let tmp = TempDir::new();
