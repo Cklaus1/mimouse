@@ -301,6 +301,7 @@ impl Service {
         }
 
         self.terminate().await;
+        shutdown.done();
         Ok(())
     }
 
@@ -892,9 +893,10 @@ fn push_target(pos: input_capture::Position, range: Option<EdgeRange>) -> (Edge,
 }
 
 /// the signals that stop the service: CTRL+C, and what the system sends to
-/// end it (SIGTERM, SIGHUP; on Windows a closed console, logoff, shutdown).
-/// Each ends the run loop, so the controlled peer is left and held keys are
-/// released
+/// end it: SIGTERM and SIGHUP on Unix; on Windows a closed console
+/// (CTRL_CLOSE), and logoff and shutdown as WM_QUERYENDSESSION /
+/// WM_ENDSESSION (see `end_session`). Each ends the run loop, so the
+/// controlled peer is left and held keys are released
 struct Shutdown {
     #[cfg(unix)]
     terminate: signal::unix::Signal,
@@ -903,9 +905,7 @@ struct Shutdown {
     #[cfg(windows)]
     close: signal::windows::CtrlClose,
     #[cfg(windows)]
-    logoff: signal::windows::CtrlLogoff,
-    #[cfg(windows)]
-    shutdown: signal::windows::CtrlShutdown,
+    end_session: end_session::EndSession,
 }
 
 impl Shutdown {
@@ -920,9 +920,7 @@ impl Shutdown {
             #[cfg(windows)]
             close: signal::windows::ctrl_close()?,
             #[cfg(windows)]
-            logoff: signal::windows::ctrl_logoff()?,
-            #[cfg(windows)]
-            shutdown: signal::windows::ctrl_shutdown()?,
+            end_session: end_session::EndSession::start(),
         })
     }
 
@@ -938,9 +936,166 @@ impl Shutdown {
         tokio::select! {
             r = signal::ctrl_c() => r.map(|()| "CTRL+C"),
             Some(()) = self.close.recv() => Ok("CTRL_CLOSE"),
-            Some(()) = self.logoff.recv() => Ok("CTRL_LOGOFF"),
-            Some(()) = self.shutdown.recv() => Ok("CTRL_SHUTDOWN"),
+            Some(message) = self.end_session.recv() => Ok(message),
         }
+    }
+
+    /// the service has cleaned up: on Windows, a session end held for that
+    /// goes on
+    fn done(self) {}
+}
+
+/// logoff and shutdown on Windows. A console process that loads user32 or
+/// gdi32 (mimouse does: SendInput, hooks, the tray icon) gets no
+/// CTRL_LOGOFF_EVENT or CTRL_SHUTDOWN_EVENT (SetConsoleCtrlHandler docs);
+/// it learns of them from WM_QUERYENDSESSION and WM_ENDSESSION sent to its
+/// top-level windows, which a message-only window never gets. A hidden
+/// top-level window of class `MiMouseEndSession`, on its own thread, turns
+/// WM_QUERYENDSESSION and WM_ENDSESSION with wParam TRUE into a stop. Windows
+/// may end the process once WM_ENDSESSION returns, so that waits until the
+/// service has cleaned up, at most `WAIT`
+#[cfg(windows)]
+mod end_session {
+    use std::{
+        cell::OnceCell,
+        sync::mpsc::{self, RecvTimeoutError},
+        time::Duration,
+    };
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+    use windows::{
+        Win32::{
+            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG,
+                RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION,
+                WNDCLASSW,
+            },
+        },
+        core::w,
+    };
+
+    /// how long WM_ENDSESSION holds the session end for the cleanup
+    const WAIT: Duration = Duration::from_secs(2);
+
+    /// the window thread's side
+    struct Link {
+        stop: UnboundedSender<&'static str>,
+        /// disconnected once the service has cleaned up
+        done: mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static LINK: OnceCell<Link> = const { OnceCell::new() };
+    }
+
+    /// the service's side; dropping it lets a held session end go on
+    pub(super) struct EndSession {
+        stop: UnboundedReceiver<&'static str>,
+        _done: mpsc::Sender<()>,
+    }
+
+    impl EndSession {
+        /// starts the window thread
+        pub(super) fn start() -> Self {
+            let (stop_tx, stop) = unbounded_channel();
+            let (done_tx, done) = mpsc::channel();
+            let link = Link {
+                stop: stop_tx,
+                done,
+            };
+            if let Err(e) = std::thread::Builder::new()
+                .name("end-session".into())
+                .spawn(move || run(link))
+            {
+                log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            }
+            Self {
+                stop,
+                _done: done_tx,
+            }
+        }
+
+        /// the message that ends the session
+        pub(super) async fn recv(&mut self) -> Option<&'static str> {
+            self.stop.recv().await
+        }
+    }
+
+    fn run(link: Link) {
+        LINK.with(|l| {
+            let _ = l.set(link);
+        });
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            lpszClassName: w!("MiMouseEndSession"),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&class) } == 0 {
+            let e = std::io::Error::last_os_error();
+            log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            return;
+        }
+        // top-level (no parent) and never shown
+        if let Err(e) = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("MiMouseEndSession"),
+                w!("MiMouse"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        } {
+            log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            return;
+        }
+        let mut msg = MSG::default();
+        // -1 is an error
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+            unsafe { DispatchMessageW(&msg) };
+        }
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_QUERYENDSESSION => {
+                stop("WM_QUERYENDSESSION", false);
+                // the session may end
+                LRESULT(1)
+            }
+            WM_ENDSESSION => {
+                // FALSE: the end was cancelled
+                if wparam.0 != 0 {
+                    stop("WM_ENDSESSION", true);
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// asks the service to stop; `wait`: until it has cleaned up, at most
+    /// `WAIT`
+    fn stop(message: &'static str, wait: bool) {
+        LINK.with(|link| {
+            let Some(link) = link.get() else { return };
+            // the service may have stopped already
+            let _ = link.stop.send(message);
+            if wait && matches!(link.done.recv_timeout(WAIT), Err(RecvTimeoutError::Timeout)) {
+                log::warn!("{message}: the session ends before the service cleaned up");
+            }
+        });
     }
 }
 
