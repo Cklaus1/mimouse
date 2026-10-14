@@ -22,7 +22,7 @@ Wave 2
 - [ ] E3 A-arch-4, B15, B17, B18, B19, B20
 - [ ] E4 C13, C14
 - [ ] E5 T6
-- [ ] K4 A-arch-3, B12, B13, B14
+- [x] K4 A-arch-3, B12, B13, B14
 - [ ] K5 C1, C2, C12
 - [ ] L2 B21, B22, B23, B24
 - [ ] L3 C6, C7, C8
