@@ -63,6 +63,31 @@ type VerifyPeerCertificateFn = Arc<
         + Sync,
 >;
 
+/// accepts a chain of exactly one authorized certificate; the fingerprint of
+/// an unauthorized one is queued in `connection_attempts`
+fn verify_peer_certificate(
+    authorized: Arc<RwLock<HashMap<String, String>>>,
+    connection_attempts: Arc<Mutex<VecDeque<String>>>,
+) -> VerifyPeerCertificateFn {
+    Arc::new(
+        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
+            let [cert] = certs else {
+                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+            };
+            let fingerprint = crypto::generate_fingerprint(cert);
+            if authorized.read().expect("lock").contains_key(&fingerprint) {
+                Ok(())
+            } else {
+                connection_attempts
+                    .lock()
+                    .expect("lock")
+                    .push_back(fingerprint);
+                Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+            }
+        },
+    )
+}
+
 impl MiMouseListener {
     pub(crate) async fn new(
         port: u16,
@@ -74,33 +99,10 @@ impl MiMouseListener {
         let (port_changed_tx, port_changed) = channel();
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
-        let authorized = authorized_keys.clone();
-        let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
-            Some(Arc::new(
-                move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
-                        Ok(())
-                    } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
-                        Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
-                    }
-                },
-            ))
-        };
+        let verify_peer_certificate = Some(verify_peer_certificate(
+            authorized_keys,
+            connection_attempts.clone(),
+        ));
         let cfg = Config {
             certificates: vec![cert.clone()],
             extended_master_secret: ExtendedMasterSecretType::Require,
@@ -128,12 +130,15 @@ impl MiMouseListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
+                                let Some(cert) = certs.first() else {
+                                    log::warn!("{addr}: no client certificate");
+                                    let _ = conn.close().await;
+                                    continue;
+                                };
                                 let fingerprint = crypto::generate_fingerprint(cert);
+                                conns_clone.lock().await.push((addr, conn.clone()));
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
                                 spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
                             },
@@ -308,5 +313,23 @@ mod tests {
         assert!(matches!(received[..], [ProtoEvent::Ping]), "{received:?}");
         // the connection is dropped only once the transport fails
         assert!(conns.lock().await.is_empty());
+    }
+
+    #[test]
+    fn verifier_rejects_chains_without_exactly_one_cert() {
+        let (known, unknown) = (vec![1u8; 32], vec![2u8; 32]);
+        let authorized = HashMap::from([(crypto::generate_fingerprint(&known), "k".into())]);
+        let attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
+        let verify = verify_peer_certificate(Arc::new(RwLock::new(authorized)), attempts.clone());
+
+        assert!(verify(&[], &[]).is_err());
+        assert!(verify(&[known.clone(), unknown.clone()], &[]).is_err());
+        assert!(attempts.lock().unwrap().is_empty());
+
+        // the verifier stays usable for well-formed chains
+        assert!(verify(&[known], &[]).is_ok());
+        assert!(verify(std::slice::from_ref(&unknown), &[]).is_err());
+        let rejected = attempts.lock().unwrap().pop_front();
+        assert_eq!(rejected, Some(crypto::generate_fingerprint(&unknown)));
     }
 }
