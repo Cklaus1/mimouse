@@ -213,15 +213,12 @@ impl Emulation for WlrootsEmulation {
                     _ => {}
                 }
             }
-            virtual_input
-                .consume_event(event)
-                .unwrap_or_else(|_| panic!("failed to convert event: {event:?}"));
+            virtual_input.consume_event(event)?;
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
                     log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                 }
-                Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
                 Ok(()) => self.last_flush_failed = false,
                 Err(e) => Err(e)?,
             }
@@ -325,7 +322,7 @@ struct VirtualInput {
 }
 
 impl VirtualInput {
-    fn consume_event(&self, event: Event) -> Result<(), ()> {
+    fn consume_event(&self, event: Event) -> Result<(), EmulationError> {
         let now: u32 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -340,16 +337,22 @@ impl VirtualInput {
                         button,
                         state,
                     } => {
-                        let state: ButtonState = state.try_into()?;
+                        let state: ButtonState = state
+                            .try_into()
+                            .map_err(|_| EmulationError::InvalidEvent(event))?;
                         self.pointer.button(time, button, state);
                     }
                     PointerEvent::Axis { time, axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let axis: Axis = (axis as u32)
+                            .try_into()
+                            .map_err(|_| EmulationError::InvalidEvent(event))?;
                         self.pointer.axis(time, axis, value);
                         self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let axis: Axis = (axis as u32)
+                            .try_into()
+                            .map_err(|_| EmulationError::InvalidEvent(event))?;
                         self.pointer
                             .axis_discrete(now, axis, value as f64 / 8., value / 120);
                         self.pointer.axis_source(AxisSource::Wheel);

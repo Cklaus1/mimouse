@@ -28,6 +28,9 @@ pub enum EmulationError {
     #[cfg(wlroots)]
     #[error("wayland error: `{0}`")]
     Wayland(#[from] wayland_client::backend::WaylandError),
+    #[cfg(wlroots)]
+    #[error("event not representable by the backend: {0:?}")]
+    InvalidEvent(input_event::Event),
     #[cfg(any(rdp, libei))]
     #[error("xdg-desktop-portal: `{0}`")]
     Ashpd(#[from] ashpd::Error),
