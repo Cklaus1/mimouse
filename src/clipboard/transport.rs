@@ -152,9 +152,10 @@ fn transfer_timeout(len: u64) -> Duration {
 }
 
 /// send the update `encoded` to the first reachable address whose server
-/// `policy` and `trust` (given the address and the server's fingerprint)
-/// accept; copied files are read when sending and may total at most
-/// `max_file_size` bytes
+/// `policy` accepts and that acknowledges it; `trust` (given the address and
+/// the server's fingerprint) is asked after the acknowledgement, so a client
+/// pins on first use only a server that accepted this machine. Copied files
+/// are read when sending and may total at most `max_file_size` bytes
 pub(crate) async fn send(
     tls: &Tls,
     addrs: &[SocketAddr],
@@ -191,9 +192,6 @@ async fn send_to(
     let name = ServerName::try_from("mimouse").expect("valid server name");
     let mut stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream)).await??;
     let fingerprint = fingerprint(stream.get_ref().1.peer_certificates())?;
-    if !trust(addr, &fingerprint) {
-        return Err(TransportError::Untrusted(fingerprint));
-    }
     let paths = encoded.paths();
     let opened = spawn_blocking(move || wire::open(&paths, max_file_size))
         .await
@@ -209,7 +207,14 @@ async fn send_to(
             _ => Err(TransportError::NoAck),
         }
     })
-    .await?
+    .await??;
+    // a server refusing this machine checks its certificate after the
+    // client finished the handshake, so only the ACK shows it accepted;
+    // `policy` already refused any other server for a pinned client
+    if !trust(addr, &fingerprint) {
+        return Err(TransportError::Untrusted(fingerprint));
+    }
+    Ok(())
 }
 
 /// Accept TLS connections on `port`: pairing requests (by ALPN) go to
@@ -602,6 +607,40 @@ mod tests {
                     "acknowledged although the backend ended"
                 );
                 server.abort();
+            })
+            .await;
+    }
+
+    /// A2: an unpinned client pins the clipboard server once it accepted
+    /// the update, never a server that refuses this machine (its refusal
+    /// only arrives after the client's side of the handshake finished)
+    #[tokio::test]
+    async fn a_refusing_server_is_not_pinned() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = certificate();
+                let (refusing, _keys, _rx, refusing_server) = server(&[]).await;
+                let (accepting, _keys, _rx, accepting_server) = server(&[&cert]).await;
+                let tls = Tls::new(&cert, Default::default()).unwrap();
+                let encoded = wire::encode(&text("copied"), 0).unwrap();
+                let pinned = Cell::new(Vec::new());
+                let trust = |addr, _: &str| {
+                    let mut seen = pinned.take();
+                    seen.push(addr);
+                    pinned.set(seen);
+                    true
+                };
+
+                let sent = send(&tls, &[refusing], &encoded, 0, Policy::Any, trust).await;
+                assert!(sent.is_err(), "a refused update was acknowledged");
+                assert_eq!(pinned.take(), vec![], "pinned the refusing server");
+
+                let addrs = [refusing, accepting];
+                let sent = send(&tls, &addrs, &encoded, 0, Policy::Any, trust).await;
+                assert_eq!(sent.expect("acknowledged"), accepting);
+                assert_eq!(pinned.take(), vec![accepting]);
+                refusing_server.abort();
+                accepting_server.abort();
             })
             .await;
     }
