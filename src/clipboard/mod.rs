@@ -15,7 +15,8 @@
 //! enters, up to `max_file_size` bytes in total; the receiver stores them in
 //! its cache directory and puts them on its clipboard as files.
 //!
-//! Both peers must have authorized each other's certificate fingerprint.
+//! The receiving peer must have authorized the sender's certificate
+//! fingerprint; the sender accepts the receiver its client is pinned to.
 
 mod files;
 mod transport;
@@ -411,7 +412,7 @@ impl ClipboardTask {
                     Some(Request::PortChanged(_)) => {}
                 },
                 Some(data) = local_rx.recv() => self.local_changed(data),
-                Some((data, ip)) = received_rx.recv() => self.received(data, ip, &backend),
+                Some(received) = received_rx.recv() => self.received(received, &backend),
                 Some(delivered) = delivered_rx.recv() => {
                     if let Some((_, sending)) = self.senders.get(&delivered.handle) {
                         if sending.get() == Some(delivered.digest) {
@@ -467,16 +468,23 @@ impl ClipboardTask {
         }
     }
 
-    fn received(&mut self, data: Arc<ClipboardData>, from: IpAddr, backend: &BackendTx) {
+    fn received(&mut self, (data, from, fingerprint): transport::Received, backend: &BackendTx) {
         let _ = self.event_tx.send(ClipboardEvent::new(
             ClipboardDirection::Received,
             from,
             &data,
         ));
         let digest = data.digest();
-        // the sender already has this clipboard
-        for (handle, _, state) in self.client_manager.get_client_states() {
-            if state.ips.contains(&from) || state.active_addr.is_some_and(|a| a.ip() == from) {
+        // the sender already has this clipboard: the client pinned to its
+        // certificate, or an unpinned one at its address
+        for (handle, config, state) in self.client_manager.get_client_states() {
+            let sender = match &config.fingerprint {
+                Some(pinned) => *pinned == fingerprint,
+                None => {
+                    state.ips.contains(&from) || state.active_addr.is_some_and(|a| a.ip() == from)
+                }
+            };
+            if sender {
                 self.delivered.insert(handle, digest);
             }
         }
@@ -546,7 +554,14 @@ async fn client_sender(
                 }
                 Some(addrs) => {
                     sending.set(Some(digest));
-                    match transport::send(&tls, &addrs, data.clone(), max_file_size).await {
+                    let Some(policy) = client_manager.server_policy(handle) else {
+                        return; /* client removed */
+                    };
+                    let trust =
+                        |addr, fingerprint: &str| client_manager.pin(handle, addr, fingerprint);
+                    let sent =
+                        transport::send(&tls, &addrs, data.clone(), max_file_size, policy, trust);
+                    match sent.await {
                         Ok(addr) => {
                             log::info!("clipboard sent to {addr} ({} bytes)", data.total_size());
                             let _ = delivered_tx.send(Delivered {

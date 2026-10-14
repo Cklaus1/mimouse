@@ -12,12 +12,7 @@ use std::{
 
 use futures::{StreamExt, future::join_all};
 use hickory_resolver::TokioResolver;
-use rustls::{
-    DigitallySignedStruct, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{WebPkiSupportedAlgorithms, ring},
-};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls_pki_types::ServerName;
 use serde::Serialize;
 use tokio::{
     io::AsyncWriteExt,
@@ -26,15 +21,11 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
-use webrtc_dtls::{
-    config::{Config as DtlsConfig, ExtendedMasterSecretType},
-    conn::DTLSConn,
-    crypto::Certificate,
-};
+use webrtc_dtls::{conn::DTLSConn, crypto::Certificate};
 
 use crate::{
     config::{self, Config},
-    crypto,
+    crypto::{self, peers::Policy},
     ipc::{ClientInfo, FrontendEvent, connect_async},
 };
 
@@ -694,13 +685,9 @@ async fn dtls_probe(addr: SocketAddr, cert: Certificate, wait: Duration) -> Dtls
     if let Err(e) = socket.connect(addr).await {
         return Dtls::NoAnswer(e.to_string());
     }
-    let config = DtlsConfig {
-        certificates: vec![cert],
-        server_name: "ignored".to_owned(),
-        insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
-        ..Default::default()
-    };
+    // any certificate: the probe reports the fingerprint and the caller
+    // decides whether it is trusted
+    let (config, _) = crypto::peers::dtls_client_config(cert, Policy::Any);
     match timeout(wait, DTLSConn::new(Arc::new(socket), config, true, None)).await {
         Err(_) => Dtls::NoAnswer("timed out".into()),
         Ok(Ok(conn)) => {
@@ -718,57 +705,8 @@ async fn dtls_probe(addr: SocketAddr, cert: Certificate, wait: Duration) -> Dtls
     }
 }
 
-/// accepts any server certificate: the probe reports the fingerprint and
-/// the caller decides whether it is trusted
-#[derive(Debug)]
-struct AnyServerCert(WebPkiSupportedAlgorithms);
-
-impl ServerCertVerifier for AnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.supported_schemes()
-    }
-}
-
 fn tls_connector(cert: &Certificate) -> Result<TlsConnector, rustls::Error> {
-    let provider = Arc::new(ring::default_provider());
-    let key: PrivateKeyDer =
-        PrivatePkcs8KeyDer::from(cert.private_key.serialized_der.clone()).into();
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AnyServerCert(
-            provider.signature_verification_algorithms,
-        )))
-        .with_client_auth_cert(cert.certificate.clone(), key)?;
+    let config = crypto::peers::tls_client_config(cert, Policy::Any)?;
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
@@ -815,6 +753,8 @@ struct Target {
     hostname: Option<String>,
     fix_ips: Vec<IpAddr>,
     port: u16,
+    /// the certificate fingerprint outgoing connections accept
+    pin: Option<String>,
 }
 
 async fn resolve(resolver: &Option<TokioResolver>, host: &str) -> Result<Vec<IpAddr>, String> {
@@ -1005,7 +945,8 @@ async fn client_checks(
     }
 
     let name = format!("{label}: trusted here");
-    match peer_fingerprint(&dtls, &tls) {
+    let peer = peer_fingerprint(&dtls, &tls);
+    match peer {
         Some(fp) => match authorized.get(fp) {
             Some(desc) => checks.push(Check::pass(name, format!("authorized as \"{desc}\""))),
             None => checks.push(Check::fail(
@@ -1023,7 +964,37 @@ async fn client_checks(
             "fix reachability first",
         )),
     }
+    checks.push(pin_check(label, target.pin.as_deref(), peer));
     checks
+}
+
+/// whether the certificate `peer` presented is the one outgoing connections
+/// to the client are pinned to
+fn pin_check(label: &str, pin: Option<&str>, peer: Option<&str>) -> Check {
+    let name = format!("{label}: pinned certificate");
+    match (pin, peer) {
+        (Some(pin), Some(fp)) if pin == fp => Check::pass(name, format!("{pin} matches")),
+        (Some(pin), Some(fp)) => Check::fail(
+            name,
+            format!("it presents {fp}, but {pin} is pinned: input and clipboard to it are refused"),
+            "if it got a new key, compare the fingerprint with `mimouse cli watch` on the client, then pair again",
+        ),
+        (Some(pin), None) => Check::warn(
+            name,
+            format!("{pin}; unchecked: no handshake revealed its certificate"),
+            "fix reachability first",
+        ),
+        (None, Some(fp)) => Check::warn(
+            name,
+            format!("none yet; its certificate {fp} is pinned on the first connection"),
+            "activate it, or pair with it, to pin it",
+        ),
+        (None, None) => Check::warn(
+            name,
+            "none yet: pinned on the first connection",
+            "fix reachability first",
+        ),
+    }
 }
 
 /// run all checks
@@ -1080,6 +1051,7 @@ pub async fn checks(config: &Config) -> Vec<Check> {
                 hostname: c.config.hostname,
                 fix_ips: c.config.fix_ips,
                 port: c.config.port,
+                pin: c.config.fingerprint,
             })
             .collect(),
         None => config
@@ -1094,6 +1066,7 @@ pub async fn checks(config: &Config) -> Vec<Check> {
                 hostname: c.hostname,
                 fix_ips: c.ips.into_iter().collect(),
                 port: c.port,
+                pin: c.fingerprint,
             })
             .collect(),
     };
@@ -1368,5 +1341,19 @@ Ok.
         let fix = config_check(&path).fix.unwrap();
         assert!(fix.contains(&config::restore_command(&path)), "{fix}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A2: doctor shows the pin and fails on a mismatch
+    #[test]
+    fn pin_check_reports_mismatch() {
+        let check = |pin, peer| pin_check("client 0", pin, peer);
+        assert_eq!(check(Some("aa:01"), Some("aa:01")).status, Outcome::Pass);
+        let mismatch = check(Some("aa:01"), Some("bb:02"));
+        assert_eq!(mismatch.status, Outcome::Fail);
+        assert!(mismatch.detail.contains("bb:02") && mismatch.detail.contains("aa:01"));
+        let unpinned = check(None, Some("bb:02"));
+        assert_eq!(unpinned.status, Outcome::Warn);
+        assert!(unpinned.detail.contains("bb:02"));
+        assert!(check(Some("aa:01"), None).detail.contains("aa:01"));
     }
 }

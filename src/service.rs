@@ -1,6 +1,7 @@
 use crate::ipc::{
-    AsyncFrontendListener, ClientHandle, ClientInfo, ConnId, FrontendEvent, FrontendRequest,
-    IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
+    AsyncFrontendListener, ClientConfig, ClientHandle, ClientInfo, ClientState, ConnId,
+    FrontendEvent, FrontendRequest, IpcEvent, IpcListenerCreationError, Peer, Position, Reply,
+    Request, Status,
 };
 use crate::{
     approval::reported_status,
@@ -217,6 +218,7 @@ impl Service {
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 event = self.pairing.event() => self.handle_pair_event(event).await,
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = self.client_manager.pinned() => self.save_pins().await,
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
@@ -461,7 +463,7 @@ impl Service {
 
     fn client_reply(&self, handle: ClientHandle) -> Reply {
         self.client_info(handle)
-            .map(Reply::Client)
+            .map(|info| Reply::Client(Box::new(info)))
             .unwrap_or(Reply::Done)
     }
 
@@ -480,6 +482,7 @@ impl Service {
                     enter_hook: c.cmd,
                     range: c.range,
                     hotkey: c.hotkey,
+                    fingerprint: c.fingerprint,
                 };
                 (h, client)
             })
@@ -502,6 +505,16 @@ impl Service {
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.config_reload |= save(&mut self.config, clients, keys).await?;
         Ok(())
+    }
+
+    /// saves fingerprints pinned on first use
+    async fn save_pins(&mut self) {
+        if let Err(e) = self.save_config().await {
+            log::warn!(
+                "pinned certificate not saved ({e}); it is trusted until the service restarts"
+            );
+        }
+        self.reload_if_merged();
     }
 
     /// a save merged changes from the file the runtime lacks: apply them
@@ -573,6 +586,9 @@ impl Service {
             }
             self.client_manager.set_port(h, c.port);
             self.reconnect_if_moved(h, before);
+            if self.client_manager.set_fingerprint(h, c.fingerprint) {
+                self.connector.reconnect(h);
+            }
             self.client_manager.set_enter_hook(h, c.enter_hook);
             self.client_manager.set_hotkey(h, c.hotkey);
             self.broadcast_client(h);
@@ -649,9 +665,10 @@ impl Service {
         self.reload_if_merged();
     }
 
-    /// trust a paired machine and configure it as a client, reusing a client
-    /// with the same host name or address. The peer already trusts this
-    /// machine, so a failed save keeps the pairing live and reports it unsaved
+    /// trust a paired machine and configure it as a client pinned to its
+    /// certificate (see [`paired_client`] for which client). The peer
+    /// already trusts this machine, so a failed save keeps the pairing live
+    /// and reports it unsaved
     async fn paired(&mut self, peer: pair::Trusted) -> FrontendEvent {
         log::info!(
             "paired with {} ({}), fingerprint {}",
@@ -660,19 +677,15 @@ impl Service {
             peer.fingerprint
         );
         self.add_authorized_key(peer.name.clone(), peer.fingerprint.clone());
-        let existing = self
-            .client_manager
-            .get_client_states()
-            .into_iter()
-            .find(|(_, config, _)| {
-                let same_host = matches!(
-                    (&config.hostname, &peer.hostname),
-                    (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
-                );
-                same_host || config.fix_ips.iter().any(|ip| peer.ips.contains(ip))
-            })
-            .map(|(handle, _, _)| handle);
+        let existing = paired_client(&self.client_manager.get_client_states(), &peer);
         let handle = existing.unwrap_or_else(|| self.add_client());
+        if self
+            .client_manager
+            .set_fingerprint(handle, Some(peer.fingerprint.clone()))
+        {
+            // a connection made before pairing trusted any server
+            self.connector.reconnect(handle);
+        }
         // the address pairing used first, then previously known ones
         let known = self
             .client_manager
@@ -1215,6 +1228,30 @@ fn plan_activate(clients: &mut [(ClientHandle, ConfigClient)], id: ClientHandle)
     }
 }
 
+/// the client a paired `peer` configures: the one pinned to its certificate,
+/// else an unpinned one with its host name or an address of it. A client
+/// pinned to another certificate is another machine (same name, reused
+/// address)
+fn paired_client(
+    clients: &[(ClientHandle, ClientConfig, ClientState)],
+    peer: &pair::Trusted,
+) -> Option<ClientHandle> {
+    let pinned = clients
+        .iter()
+        .find(|(_, c, _)| c.fingerprint.as_ref() == Some(&peer.fingerprint));
+    let same_machine = || {
+        clients.iter().find(|(_, c, _)| {
+            let same_host = matches!(
+                (&c.hostname, &peer.hostname),
+                (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
+            );
+            c.fingerprint.is_none()
+                && (same_host || c.fix_ips.iter().any(|ip| peer.ips.contains(ip)))
+        })
+    };
+    pinned.or_else(same_machine).map(|(h, _, _)| *h)
+}
+
 /// where to push the local pointer to cross the barrier at `pos`: that edge
 /// of this desktop, in the middle of `range` (`None`: the whole edge)
 fn push_target(pos: input_capture::Position, range: Option<EdgeRange>) -> (Edge, u16) {
@@ -1258,6 +1295,7 @@ mod tests {
             enter_hook: None,
             range: None,
             hotkey: None,
+            fingerprint: None,
         }
     }
 
@@ -1271,6 +1309,46 @@ mod tests {
         plan_activate(&mut clients, 2);
         let active: Vec<_> = clients.iter().map(|(_, c)| c.active).collect();
         assert_eq!(active, [false, true, true]);
+    }
+
+    /// B4: pairing configures the client pinned to the peer's certificate;
+    /// a same-named or same-address client counts only while unpinned
+    #[test]
+    fn paired_client_matches_fingerprint_first() {
+        let ip: IpAddr = "192.168.0.7".parse().unwrap();
+        let config =
+            |hostname: &str, fix_ips: Vec<IpAddr>, fingerprint: Option<&str>| ClientConfig {
+                hostname: Some(hostname.into()),
+                fix_ips,
+                fingerprint: fingerprint.map(Into::into),
+                ..Default::default()
+            };
+        let peer = |name: &str, fingerprint: &str| pair::Trusted {
+            name: name.into(),
+            fingerprint: fingerprint.into(),
+            hostname: Some(name.into()),
+            ips: vec![ip],
+            port: crate::ipc::DEFAULT_PORT,
+            position: Position::Left,
+        };
+        let state = ClientState::default;
+        let clients = vec![
+            (0, config("ubuntu", vec![ip], Some("aa:01")), state()),
+            (1, config("other", vec![], Some("bb:02")), state()),
+        ];
+        // pinned: by fingerprint, whatever the name or address
+        assert_eq!(paired_client(&clients, &peer("ubuntu", "aa:01")), Some(0));
+        assert_eq!(paired_client(&clients, &peer("renamed", "bb:02")), Some(1));
+        // a second machine named `ubuntu` on a reused address is new
+        assert_eq!(paired_client(&clients, &peer("ubuntu", "cc:03")), None);
+
+        // an unpinned client (Lan Mouse peer, old config) by name or address
+        let clients = vec![
+            (0, config("ubuntu", vec![], None), state()),
+            (1, config("lap", vec![ip], None), state()),
+        ];
+        assert_eq!(paired_client(&clients, &peer("UBUNTU", "cc:03")), Some(0));
+        assert_eq!(paired_client(&clients, &peer("lap2", "cc:03")), Some(1));
     }
 
     /// B7: a failed save leaves the key untrusted; once the file is

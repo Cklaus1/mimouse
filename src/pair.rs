@@ -21,13 +21,8 @@ use std::{
     time::Duration,
 };
 
-use rustls::{
-    ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{WebPkiSupportedAlgorithms, ring},
-    server::danger::{ClientCertVerified, ClientCertVerifier},
-};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ServerConfig, crypto::ring};
+use rustls_pki_types::{CertificateDer, ServerName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -41,7 +36,10 @@ use tokio::{
 use tokio_rustls::{StartHandshake, TlsConnector};
 use webrtc_dtls::crypto::Certificate;
 
-use crate::{crypto, ipc::Position};
+use crate::{
+    crypto::{self, peers::Policy},
+    ipc::Position,
+};
 
 /// ALPN protocol of pairing connections
 pub(crate) const ALPN: &[u8] = b"mimouse-pair/1";
@@ -364,27 +362,15 @@ pub(crate) struct Pairing {
 }
 
 impl Pairing {
-    /// pairing with `cert`; connections arrive through the returned sender
+    /// pairing with `cert`; connections arrive through the returned sender.
+    /// Both sides accept any certificate (handshake signatures are still
+    /// checked): the users decide trust by comparing codes
     pub(crate) fn new(
         cert: &Certificate,
     ) -> Result<(Self, mpsc::UnboundedSender<Incoming>), rustls::Error> {
-        let certs = cert.certificate.clone();
-        let key: PrivateKeyDer =
-            PrivatePkcs8KeyDer::from(cert.private_key.serialized_der.clone()).into();
-        let provider = Arc::new(ring::default_provider());
-        let verifier = Arc::new(AnyPeer {
-            algorithms: provider.signature_verification_algorithms,
-        });
-        let mut server = ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(verifier.clone())
-            .with_single_cert(certs.clone(), key.clone_key())?;
+        let mut server = crypto::peers::tls_server_config(cert, Policy::Any)?;
         server.alpn_protocols = vec![ALPN.to_vec()];
-        let mut client = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(certs, key)?;
+        let mut client = crypto::peers::tls_client_config(cert, Policy::Any)?;
         client.alpn_protocols = vec![ALPN.to_vec()];
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -841,85 +827,6 @@ where
     }
     let _ = w.shutdown().await;
     Ok(())
-}
-
-/// accepts any certificate (still checking the handshake signatures): the
-/// users decide trust by comparing codes
-#[derive(Debug)]
-struct AnyPeer {
-    algorithms: WebPkiSupportedAlgorithms,
-}
-
-impl ServerCertVerifier for AnyPeer {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
-}
-
-impl ClientCertVerifier for AnyPeer {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, rustls::Error> {
-        Ok(ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,9 @@ use std::{
 
 use input_event::scancode;
 use slab::Slab;
+use tokio::sync::Notify;
 
+use crate::crypto::peers::Policy;
 use crate::ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
@@ -15,6 +17,8 @@ use crate::config::ConfigClient;
 #[derive(Clone, Default)]
 pub struct ClientManager {
     clients: Rc<RefCell<Slab<(ClientConfig, ClientState)>>>,
+    /// notified when a fingerprint was pinned on first use
+    pinned: Rc<Notify>,
 }
 
 impl ClientManager {
@@ -36,6 +40,7 @@ impl ClientManager {
             cmd: config_client.enter_hook,
             range: config_client.range,
             hotkey: config_client.hotkey,
+            fingerprint: config_client.fingerprint,
         };
         let state = ClientState {
             active: config_client.active,
@@ -244,6 +249,62 @@ impl ClientManager {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             c.hotkey = hotkey;
         }
+    }
+
+    /// set the certificate fingerprint outgoing connections to the client
+    /// accept; true if it changed
+    pub(crate) fn set_fingerprint(
+        &self,
+        handle: ClientHandle,
+        fingerprint: Option<String>,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.fingerprint != fingerprint => {
+                c.fingerprint = fingerprint;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// the server certificates outgoing connections to the client accept:
+    /// the pinned one, or any until one is pinned
+    pub(crate) fn server_policy(&self, handle: ClientHandle) -> Option<Policy> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.fingerprint.clone().map_or(Policy::Any, Policy::Pinned))
+    }
+
+    /// whether the client at `addr` presenting `fingerprint` is trusted:
+    /// pins it if the client has no pin yet (trust on first use)
+    pub(crate) fn pin(&self, handle: ClientHandle, addr: SocketAddr, fingerprint: &str) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((c, _)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        match &c.fingerprint {
+            Some(pinned) if pinned == fingerprint => true,
+            Some(pinned) => {
+                log::warn!(
+                    "client {handle} @ {addr}: certificate {fingerprint} is not the pinned {pinned}, refused"
+                );
+                false
+            }
+            None => {
+                log::info!(
+                    "client {handle} @ {addr}: pinned certificate {fingerprint} on first use"
+                );
+                c.fingerprint = Some(fingerprint.to_owned());
+                self.pinned.notify_one();
+                true
+            }
+        }
+    }
+
+    /// waits until a connection pinned a client's fingerprint
+    pub(crate) async fn pinned(&self) {
+        self.pinned.notified().await
     }
 
     /// set resolving status of the client

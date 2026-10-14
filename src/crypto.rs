@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webrtc_dtls::crypto::Certificate;
 
+pub(crate) mod peers;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]

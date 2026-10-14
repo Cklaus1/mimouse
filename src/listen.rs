@@ -1,14 +1,13 @@
 use crate::proto::{MAX_EVENT_SIZE, ProtoEvent};
 use futures::{Stream, StreamExt};
 use local_channel::mpsc::{Receiver, Sender, channel};
-use rustls::pki_types::CertificateDer;
 use std::{
     collections::HashMap,
     future::{Future, ready},
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -16,18 +15,13 @@ use tokio::{
     sync::Mutex as AsyncMutex,
     task::{JoinHandle, JoinSet, spawn_local},
 };
-use webrtc_dtls::{
-    config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
-    conn::DTLSConn,
-    content::ContentType,
-    crypto::Certificate,
-};
+use webrtc_dtls::{conn::DTLSConn, content::ContentType, crypto::Certificate};
 use webrtc_util::{
     Conn,
     conn::{Listener, conn_udp_listener::ListenConfig},
 };
 
-use crate::crypto;
+use crate::crypto::{self, peers};
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {
@@ -67,34 +61,6 @@ pub(crate) struct MiMouseListener {
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: Sender<u16>,
     port_changed: Receiver<Result<u16, ListenerCreationError>>,
-}
-
-type VerifyPeerCertificateFn = Arc<
-    dyn (Fn(&[Vec<u8>], &[CertificateDer<'static>]) -> Result<(), webrtc_dtls::Error>)
-        + Send
-        + Sync,
->;
-
-/// accepts a chain of exactly one authorized certificate; the fingerprint of
-/// an unauthorized one is stored in `rejected`
-fn verify_peer_certificate(
-    authorized: Arc<RwLock<HashMap<String, String>>>,
-    rejected: Arc<OnceLock<String>>,
-) -> VerifyPeerCertificateFn {
-    Arc::new(
-        move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-            let [cert] = certs else {
-                return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
-            };
-            let fingerprint = crypto::generate_fingerprint(cert);
-            if authorized.read().expect("lock").contains_key(&fingerprint) {
-                Ok(())
-            } else {
-                let _ = rejected.set(fingerprint);
-                Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
-            }
-        },
-    )
 }
 
 /// a UDP listener on `port` that opens a conn per remote sending a DTLS
@@ -251,14 +217,7 @@ async fn serve(
     conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>>,
     listen_tx: Sender<ListenEvent>,
 ) {
-    let rejected = Arc::new(OnceLock::new());
-    let cfg = Config {
-        certificates: vec![cert],
-        extended_master_secret: ExtendedMasterSecretType::Require,
-        client_auth: RequireAnyClientCert,
-        verify_peer_certificate: Some(verify_peer_certificate(authorized, rejected.clone())),
-        ..Default::default()
-    };
+    let (cfg, rejected) = peers::dtls_server_config(cert, peers::Policy::Authorized(authorized));
     let handshake = DTLSConn::new(conn.clone(), cfg, false, None);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
         Ok(Ok(dtls)) => {
@@ -380,27 +339,6 @@ mod tests {
         assert!(conns.lock().await.is_empty());
     }
 
-    #[test]
-    fn verifier_rejects_chains_without_exactly_one_cert() {
-        let (known, unknown) = (vec![1u8; 32], vec![2u8; 32]);
-        let authorized = HashMap::from([(crypto::generate_fingerprint(&known), "k".into())]);
-        let authorized = Arc::new(RwLock::new(authorized));
-        let rejected = Arc::new(OnceLock::new());
-        let verify = verify_peer_certificate(authorized.clone(), rejected.clone());
-
-        assert!(verify(&[], &[]).is_err());
-        assert!(verify(&[known.clone(), unknown.clone()], &[]).is_err());
-        assert_eq!(rejected.get(), None);
-
-        // the verifier stays usable for well-formed chains
-        assert!(verify(&[known], &[]).is_ok());
-        assert!(verify(std::slice::from_ref(&unknown), &[]).is_err());
-        assert_eq!(
-            rejected.get(),
-            Some(&crypto::generate_fingerprint(&unknown))
-        );
-    }
-
     /// a listener on a free loopback port trusting `client`
     async fn listener(client: &Certificate) -> (MiMouseListener, SocketAddr) {
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -416,14 +354,8 @@ mod tests {
         (listener, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
     }
 
-    fn client_config(cert: Certificate) -> Config {
-        Config {
-            certificates: vec![cert],
-            server_name: "ignored".to_owned(),
-            insecure_skip_verify: true,
-            extended_master_secret: ExtendedMasterSecretType::Require,
-            ..Default::default()
-        }
+    fn client_config(cert: Certificate) -> webrtc_dtls::config::Config {
+        peers::dtls_client_config(cert, peers::Policy::Any).0
     }
 
     /// a socket on loopback sending to `addr`
