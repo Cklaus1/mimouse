@@ -40,10 +40,12 @@ Wave 4
 
 Wave 5
 - [x] P1 smoke matrix
-- [ ] D1 T4, T-6, P5
-- [ ] D4 T1, T8
-- [ ] D3 P2
-- [ ] R1 P4
+- [x] D1 T4, T-6, P5
+- [x] D4 T1, T8
+- [x] D3 P2
+- [x] R1 P4
+
+Wave 5 smoke (2026-10-14 20:04, 1.0.0 at 63b84ca + README CHANGELOG link): linux aa221f07, win d4271845 deployed; megapc -> gpumaster `entering client 0`, gpumaster `entered at 1,337 (left edge)`, Ctrl double-tap `releasing capture`, `cli list` exit 0 + active on both. megapc clock is 8.6 s behind gpumaster.
 
 Stop condition
 - [ ] Implementation review + fixes

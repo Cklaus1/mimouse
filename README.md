@@ -224,4 +224,4 @@ cargo fmt && cargo clippy --workspace --all-targets --all-features -- -D warning
 git config core.hooksPath .githooks   # optional pre-commit: fmt, clippy, test
 ```
 
-See [AGENTS.md](AGENTS.md) for architecture, [CONTRIBUTING.md](CONTRIBUTING.md) to contribute and [SECURITY.md](SECURITY.md) to report vulnerabilities privately.
+See [CHANGELOG.md](CHANGELOG.md) for release notes, [AGENTS.md](AGENTS.md) for architecture, [CONTRIBUTING.md](CONTRIBUTING.md) to contribute and [SECURITY.md](SECURITY.md) to report vulnerabilities privately.
