@@ -631,11 +631,14 @@ impl Service {
     }
 
     fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
-        self.notify_frontend(FrontendEvent::Clipboard {
-            direction: event.direction,
-            peer: event.peer,
-            mime: event.mime,
-            size: event.size,
+        self.notify_frontend(match event {
+            ClipboardEvent::Transfer(t) => FrontendEvent::Clipboard {
+                direction: t.direction,
+                peer: t.peer,
+                mime: t.mime,
+                size: t.size,
+            },
+            ClipboardEvent::Status(status) => FrontendEvent::ClipboardStatus(status),
         });
     }
 
@@ -880,6 +883,7 @@ impl Service {
             },
             self.emulation_event(),
             self.capture_event(),
+            FrontendEvent::ClipboardStatus(self.clipboard.status()),
             FrontendEvent::Port {
                 port: self.port,
                 error: None,

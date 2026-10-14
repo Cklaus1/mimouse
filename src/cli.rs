@@ -10,8 +10,8 @@ use crate::{
     doctor,
     ipc::{
         AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ClientInfo,
-        ClipboardDirection, ConnectionError, DEFAULT_PORT, FrontendEvent, FrontendRequest,
-        IpcError, Position, Reply, Status, connect_async,
+        ClipboardDirection, ClipboardStatus, ConnectionError, DEFAULT_PORT, FrontendEvent,
+        FrontendRequest, IpcError, Position, Reply, Status, connect_async,
     },
 };
 
@@ -383,11 +383,14 @@ async fn pair(
     }
 }
 
-/// capture / emulation state from the events the service sends first
+/// capture / emulation / clipboard state from the events the service sends
+/// first
 #[derive(Debug, Default)]
 struct ServiceState {
     capture: Status,
     emulation: Status,
+    /// `None` from services that do not report it
+    clipboard: Option<ClipboardStatus>,
 }
 
 /// skip state events until the reply to `seq` arrives, at most `limit`
@@ -405,6 +408,7 @@ async fn wait_for_reply(
                 }
                 FrontendEvent::Capture { status, .. } => state.capture = status,
                 FrontendEvent::Emulation { status, .. } => state.emulation = status,
+                FrontendEvent::ClipboardStatus(status) => state.clipboard = Some(status),
                 _ => {}
             }
         }
@@ -427,6 +431,7 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
                 "clients": clients,
                 "capture": state.capture,
                 "emulation": state.emulation,
+                "clipboard": state.clipboard,
             })
         ),
         (Reply::Clients(clients), false) => {
@@ -435,6 +440,9 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
             }
             println!("capture: {}", state.capture);
             println!("emulation: {}", state.emulation);
+            if let Some(clipboard) = &state.clipboard {
+                println!("clipboard: {clipboard}");
+            }
         }
     }
 }
@@ -470,6 +478,7 @@ fn print_event(event: &FrontendEvent) {
         } => println!("port change failed, still on {port}: {e}"),
         FrontendEvent::Capture { status, .. } => println!("capture: {status}"),
         FrontendEvent::Emulation { status, .. } => println!("emulation: {status}"),
+        FrontendEvent::ClipboardStatus(status) => println!("clipboard: {status}"),
         FrontendEvent::AuthorizedKeys { keys } => {
             for (fingerprint, description) in keys {
                 println!("authorized: {description} {fingerprint}");

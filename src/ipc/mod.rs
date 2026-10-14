@@ -220,9 +220,9 @@ pub enum ClipboardDirection {
 
 /// Events from the service, one JSON object per line, tagged by `event`.
 /// `Reply` goes to the requesting connection only; a new connection first
-/// receives `clients`, `capture`, `emulation`, `port`, `fingerprint` and
-/// `authorized_keys`; everything else is broadcast. This is also the
-/// `mimouse cli watch --json` schema.
+/// receives `clients`, `emulation`, `capture`, `clipboard_status`, `port`,
+/// `fingerprint` and `authorized_keys`; everything else is broadcast. This
+/// is also the `mimouse cli watch --json` schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum FrontendEvent {
@@ -245,6 +245,8 @@ pub enum FrontendEvent {
     Capture { enabled: bool, status: Status },
     /// input emulation state; `enabled` is `status == "enabled"`
     Emulation { enabled: bool, status: Status },
+    /// clipboard sharing state: `{"status": .., "reason": ..}`
+    ClipboardStatus(ClipboardStatus),
     /// authorized certificate fingerprints (fingerprint -> description)
     AuthorizedKeys { keys: HashMap<String, String> },
     /// certificate fingerprint of this machine
@@ -455,6 +457,64 @@ impl Display for Status {
             Status::AwaitingApproval => write!(f, "awaiting approval"),
         }
     }
+}
+
+/// state of clipboard sharing
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardStatus {
+    pub status: ClipboardState,
+    /// why sharing is disabled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ClipboardStatus {
+    pub fn new(status: ClipboardState) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: ClipboardState::Disabled,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+impl Display for ClipboardStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            ClipboardState::Off => write!(f, "off (`clipboard = false` in the config)")?,
+            ClipboardState::Starting => write!(f, "starting")?,
+            ClipboardState::AwaitingApproval => write!(f, "awaiting approval")?,
+            ClipboardState::Enabled => write!(f, "enabled")?,
+            ClipboardState::Disabled => write!(f, "disabled")?,
+        }
+        match &self.reason {
+            Some(reason) => write!(f, ": {reason}"),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardState {
+    /// turned off in the config
+    #[default]
+    Off,
+    /// the clipboard backend has not reported yet
+    Starting,
+    /// the clipboard portal dialog waits for the user; received updates
+    /// are kept until it is answered
+    AwaitingApproval,
+    Enabled,
+    /// the backend failed (retrying if `reason` says so), was denied, or
+    /// the platform has none; received updates are refused once it ended
+    Disabled,
 }
 
 #[cfg(unix)]

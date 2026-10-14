@@ -45,10 +45,11 @@ use tokio::{
 };
 
 use super::{
-    BackendTx, ChangesTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML, MIME_PNG,
-    MIME_TEXT, Offer,
+    BackendTx, ChangesTx, ClipboardData, LocalChange, MAX_CLIPBOARD_SIZE, MIME_FILES, MIME_HTML,
+    MIME_PNG, MIME_TEXT, Offer, StatusTx,
     files::{FileRef, cache_dir, local_files},
 };
+use crate::ipc::{ClipboardState, ClipboardStatus};
 
 /// file list format of GNOME Files: `copy` or `cut`, then one URI per line
 const GNOME_FILES: &str = "x-special/gnome-copied-files";
@@ -163,25 +164,40 @@ impl OwnerChanges {
     }
 }
 
-pub(super) fn spawn(changes: ChangesTx) -> BackendTx {
+pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
     let (tx, rx) = mpsc::unbounded_channel();
-    spawn_local(run(changes, rx));
+    spawn_local(run(changes, status, rx));
     tx
 }
 
-async fn run(changes: ChangesTx, mut set_rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>) {
+async fn run(
+    changes: ChangesTx,
+    status: StatusTx,
+    mut set_rx: mpsc::UnboundedReceiver<Arc<ClipboardData>>,
+) {
     // contents we own (set from a remote device), kept across portal sessions
     let mut owned: Option<Arc<ClipboardData>> = None;
     loop {
-        match session(&changes, &mut set_rx, &mut owned).await {
+        let ended = match session(&changes, &status, &mut set_rx, &mut owned).await {
             Ok(()) => return,
             Err(PortalError::Ashpd(ashpd::Error::Response(e))) => {
-                return log::warn!("clipboard portal: permission request failed: {e}");
+                Some(format!("permission request failed: {e}"))
             }
-            Err(PortalError::NotGranted) => {
-                return log::warn!("clipboard portal: clipboard access was not granted");
+            Err(e @ PortalError::NotGranted) => Some(e.to_string()),
+            Err(e) => {
+                log::warn!("clipboard portal: {e}, retrying in {RETRY_DELAY:?}");
+                status.send_replace(ClipboardStatus::disabled(format!(
+                    "{e}, retrying in {RETRY_DELAY:?}"
+                )));
+                None
             }
-            Err(e) => log::warn!("clipboard portal: {e}, retrying in {RETRY_DELAY:?}"),
+        };
+        if let Some(reason) = ended {
+            log::warn!("clipboard portal: {reason}");
+            status.send_replace(ClipboardStatus::disabled(format!(
+                "{reason}; restart the service to ask again"
+            )));
+            return;
         }
         // keep the latest remote contents while waiting
         let mut sleep = pin!(tokio::time::sleep(RETRY_DELAY));
@@ -197,27 +213,76 @@ async fn run(changes: ChangesTx, mut set_rx: mpsc::UnboundedReceiver<Arc<Clipboa
     }
 }
 
+/// a portal session that can be closed; faked in tests
+trait Close {
+    async fn close(&self);
+}
+
+impl Close for Session<RemoteDesktop> {
+    async fn close(&self) {
+        if let Err(e) = Session::close(self).await {
+            log::debug!("clipboard portal: failed to close the session: {e}");
+        }
+    }
+}
+
+/// runs `body` on `session`, then closes it whatever the outcome, so that
+/// errors do not leave sessions behind in the compositor
+async fn closing<S: Close, T>(session: S, body: impl AsyncFnOnce(&S) -> T) -> T {
+    let result = body(&session).await;
+    session.close().await;
+    result
+}
+
 /// runs one portal session; returns Ok(()) on shutdown
 async fn session(
     changes: &ChangesTx,
+    status: &StatusTx,
     set_rx: &mut mpsc::UnboundedReceiver<Arc<ClipboardData>>,
     owned: &mut Option<Arc<ClipboardData>>,
 ) -> Result<(), PortalError> {
     let remote_desktop = RemoteDesktop::new().await?;
     let clipboard = Clipboard::new().await?;
     let session = remote_desktop.create_session(Default::default()).await?;
+    closing(session, async |session| {
+        use_session(
+            &remote_desktop,
+            &clipboard,
+            session,
+            changes,
+            status,
+            set_rx,
+            owned,
+        )
+        .await
+    })
+    .await
+}
+
+/// asks for clipboard access on `session`, then shares the clipboard until
+/// shutdown (Ok) or a portal error
+async fn use_session(
+    remote_desktop: &RemoteDesktop,
+    clipboard: &Clipboard,
+    session: &Session<RemoteDesktop>,
+    changes: &ChangesTx,
+    status: &StatusTx,
+    set_rx: &mut mpsc::UnboundedReceiver<Arc<ClipboardData>>,
+    owned: &mut Option<Arc<ClipboardData>>,
+) -> Result<(), PortalError> {
     let restore_token = read_token();
     let options = SelectDevicesOptions::default()
         .set_devices(BitFlags::from(DeviceType::Keyboard))
         .set_persist_mode(PersistMode::ExplicitlyRevoked)
         .set_restore_token(restore_token.as_deref());
-    remote_desktop.select_devices(&session, options).await?;
+    remote_desktop.select_devices(session, options).await?;
     clipboard
-        .request(&session, RequestClipboardOptions::default())
+        .request(session, RequestClipboardOptions::default())
         .await?;
     log::info!("clipboard portal: requesting clipboard access");
+    status.send_replace(ClipboardStatus::new(ClipboardState::AwaitingApproval));
     let response = remote_desktop
-        .start(&session, None, Default::default())
+        .start(session, None, Default::default())
         .await?
         .response()?;
     if let Some(token) = response.restore_token() {
@@ -226,7 +291,6 @@ async fn session(
         }
     }
     if !response.is_clipboard_enabled() {
-        let _ = session.close().await;
         return Err(PortalError::NotGranted);
     }
     log::info!("clipboard portal: clipboard access granted");
@@ -244,8 +308,9 @@ async fn session(
     let mut closed = pin!(session.receive_closed().await?);
 
     if let Some(data) = owned.as_ref() {
-        set_selection(&clipboard, &session, data).await?;
+        set_selection(clipboard, session, data).await?;
     }
+    status.send_replace(ClipboardStatus::new(ClipboardState::Enabled));
 
     let mut owner_changes = OwnerChanges::new();
     loop {
@@ -256,25 +321,27 @@ async fn session(
                 if event.session_is_owner() == Some(true) {
                     continue;
                 }
+                let at = std::time::Instant::now();
+                let changed = |data| changes.send(LocalChange::Changed(at, data));
                 *owned = None;
                 let mime_types = event.mime_types();
                 match owner_changes.changed(Offer::from_mime_types(mime_types), Instant::now()) {
                     Step::Wait => {}
                     Step::DropRestore => {
                         log::debug!("clipboard portal: secret restored by compositor, not sent");
-                        let _ = changes.send(Some(Arc::new(ClipboardData::default())));
+                        let _ = changed(Some(Arc::new(ClipboardData::default())));
                     }
                     Step::Secret => {
                         log::debug!("clipboard portal: not sending a copy marked secret");
-                        let _ = changes.send(None);
+                        let _ = changed(None);
                     }
-                    Step::Read => match read_selection(&clipboard, &session, mime_types).await {
+                    Step::Read => match read_selection(clipboard, session, mime_types).await {
                         Ok(data) if data.is_empty() => {
                             log::debug!("clipboard portal: no supported format in {mime_types:?}");
-                            let _ = changes.send(None);
+                            let _ = changed(None);
                         }
                         Ok(data) => {
-                            let _ = changes.send(Some(Arc::new(data)));
+                            let _ = changed(Some(Arc::new(data)));
                         }
                         Err(e) => log::warn!("clipboard portal: failed to read clipboard: {e}"),
                     },
@@ -287,31 +354,31 @@ async fn session(
                 }
             } => {
                 if owner_changes.clear_due(Instant::now()) {
-                    let _ = changes.send(Some(Arc::new(ClipboardData::default())));
+                    // the clear happened when it was held back
+                    let at = (clear_at.expect("due") - RESTORE_WINDOW).into_std();
+                    let clear = Some(Arc::new(ClipboardData::default()));
+                    let _ = changes.send(LocalChange::Changed(at, clear));
                 }
             }
             transfer = transfers.next() => {
                 let Some((_, mime, serial)) = transfer else { return Err(PortalError::Closed) };
                 let served = match owned.as_ref().and_then(|d| lookup(d, &mime)) {
-                    Some(data) => write_selection(&clipboard, &session, serial, &data).await,
+                    Some(data) => write_selection(clipboard, session, serial, &data).await,
                     None => Err(PortalError::Io(io::ErrorKind::NotFound.into())),
                 };
                 if let Err(e) = served {
                     log::warn!("clipboard portal: failed to serve {mime}: {e}");
-                    clipboard.selection_write_done(&session, serial, false).await?;
+                    clipboard.selection_write_done(session, serial, false).await?;
                 }
             }
             data = set_rx.recv() => {
-                let Some(mut data) = data else {
-                    let _ = session.close().await;
-                    return Ok(());
-                };
+                let Some(mut data) = data else { return Ok(()) };
                 // only the latest update matters: every SetSelection cancels
                 // transfers requested from the previous one
                 while let Ok(newer) = set_rx.try_recv() {
                     data = newer;
                 }
-                set_selection(&clipboard, &session, &data).await?;
+                set_selection(clipboard, session, &data).await?;
                 owner_changes.set_by_us();
                 *owned = Some(data);
             }
@@ -561,7 +628,10 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use super::{super::Offer, OwnerChanges, RESTORE_WINDOW, Step, file_uri, parse_uri_list};
+    use super::{
+        super::Offer, Close, OwnerChanges, PortalError, RESTORE_WINDOW, Step, closing, file_uri,
+        parse_uri_list,
+    };
 
     const MS: Duration = Duration::from_millis(1);
 
@@ -667,5 +737,34 @@ mod tests {
         let uri = file_uri(&path);
         assert_eq!(uri, "file:///tmp/%FF%20x%23%3F%25");
         assert_eq!(paths(&uri), [path]);
+    }
+
+    /// a session that counts how often it was closed
+    struct FakeSession(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Close for FakeSession {
+        async fn close(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// B22: a portal error after `create_session` (e.g. the D-Bus call of a
+    /// failed serve) closes the session before the retry, as does shutdown
+    #[tokio::test]
+    async fn session_is_closed_on_every_exit() {
+        for fail_at in [None, Some(0), Some(1)] {
+            let closed = std::rc::Rc::default();
+            let result = closing(FakeSession(std::rc::Rc::clone(&closed)), async |_| {
+                for step in 0..2 {
+                    if fail_at == Some(step) {
+                        Err(PortalError::Closed)?;
+                    }
+                }
+                Ok::<_, PortalError>(())
+            })
+            .await;
+            assert_eq!(result.is_ok(), fail_at.is_none());
+            assert_eq!(closed.get(), 1, "fail at {fail_at:?}");
+        }
     }
 }

@@ -6,9 +6,10 @@
 //!
 //! One connection carries one update: the client sends a frame
 //! (`len: u32 BE | payload`, payload see `wire`), the server answers with a
-//! single ack byte once the update (including copied files) is stored. A
-//! connection whose peer's fingerprint gets removed from
-//! `authorized_fingerprints` is closed without an ack.
+//! single ack byte once the update (including copied files) is stored and
+//! handed to the clipboard. A connection whose peer's fingerprint gets
+//! removed from `authorized_fingerprints` is closed without an ack, as is
+//! every update once the local clipboard backend has ended.
 //!
 //! Pairing connections (`crate::pair`) arrive on the same listener and are
 //! told apart by their ALPN protocol before the handshake completes.
@@ -20,7 +21,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls_pki_types::{CertificateDer, ServerName};
@@ -81,6 +82,8 @@ pub(crate) enum TransportError {
     NoCertificate,
     #[error("certificate {0} is no longer authorized")]
     Revoked(String),
+    #[error("the local clipboard backend has ended")]
+    BackendEnded,
 }
 
 impl From<tokio::time::error::Elapsed> for TransportError {
@@ -90,8 +93,8 @@ impl From<tokio::time::error::Elapsed> for TransportError {
 }
 
 /// a clipboard update received from the peer at an address, with the
-/// fingerprint of its certificate
-pub(crate) type Received = (Arc<ClipboardData>, IpAddr, String);
+/// fingerprint of its certificate and when its connection was accepted
+pub(crate) type Received = (Arc<ClipboardData>, IpAddr, String, Instant);
 
 pub(crate) struct Tls {
     acceptor: TlsAcceptor,
@@ -224,6 +227,7 @@ pub(crate) fn listen(
         accept_loop(
             async || listener.accept().await,
             |stream, peer| {
+                let accepted = Instant::now();
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     return log::debug!("tcp {peer}: {MAX_CONNECTIONS} connections open, closing");
                 };
@@ -244,17 +248,9 @@ pub(crate) fn listen(
                     let Some(tx) = tx else {
                         return log::debug!("tcp {peer}: clipboard sharing is disabled");
                     };
-                    match receive(&tls, start, max_file_size, store).await {
-                        Ok((data, fingerprint)) => {
-                            log::info!(
-                                "clipboard received from {} ({} bytes: {})",
-                                tls.describe(&fingerprint),
-                                data.total_size(),
-                                data.mime_types().collect::<Vec<_>>().join(", ")
-                            );
-                            let _ = tx.send((Arc::new(data), peer.ip(), fingerprint));
-                        }
-                        Err(e) => log::warn!("clipboard: {peer}: {e}"),
+                    let received = receive(&tls, start, max_file_size, store, &tx, peer, accepted);
+                    if let Err(e) = received.await {
+                        log::warn!("clipboard: {peer}: {e}");
                     }
                 });
             },
@@ -298,14 +294,21 @@ async fn client_hello(stream: TcpStream) -> Result<StartHandshake<TcpStream>, Tr
     Ok(timeout(HANDSHAKE_TIMEOUT, acceptor).await??)
 }
 
-/// a clipboard update and the fingerprint of the peer that sent it; the
-/// connection is dropped once that fingerprint is no longer authorized
+/// receives a clipboard update and hands it to `tx` before acknowledging it;
+/// the connection is dropped once the peer's fingerprint is no longer
+/// authorized, or without an ack if `tx` is closed (the backend ended)
 async fn receive(
     tls: &Tls,
     start: StartHandshake<TcpStream>,
     max_file_size: u64,
     store: Option<FileStore>,
-) -> Result<(ClipboardData, String), TransportError> {
+    tx: &mpsc::UnboundedSender<Received>,
+    peer: SocketAddr,
+    accepted: Instant,
+) -> Result<(), TransportError> {
+    if tx.is_closed() {
+        return Err(TransportError::BackendEnded);
+    }
     let config = tls.acceptor.config().clone();
     let mut stream = timeout(HANDSHAKE_TIMEOUT, start.into_stream(config)).await??;
     let from = fingerprint(stream.get_ref().1.peer_certificates())?;
@@ -332,9 +335,18 @@ async fn receive(
     if policy.check(&from).is_err() {
         return Err(TransportError::Revoked(from));
     }
+    let description = format!(
+        "{} bytes: {}",
+        data.total_size(),
+        data.mime_types().collect::<Vec<_>>().join(", ")
+    );
+    let sender = tls.describe(&from);
+    tx.send((Arc::new(data), peer.ip(), from, accepted))
+        .map_err(|_| TransportError::BackendEnded)?;
+    log::info!("clipboard received from {sender} ({description})");
     stream.write_u8(ACK).await?;
     stream.shutdown().await?;
-    Ok((data, from))
+    Ok(())
 }
 
 /// resolves once `policy` no longer trusts `fingerprint`
@@ -364,13 +376,14 @@ mod tests {
     use std::cell::Cell;
     use tokio::task::LocalSet;
 
-    /// a clipboard listener on a free loopback port trusting `client`, and
-    /// its authorized keys
+    /// a clipboard listener on a free loopback port trusting `client`, its
+    /// authorized keys and the receiver of its updates
     async fn server(
         client: &Certificate,
     ) -> (
         SocketAddr,
         Arc<RwLock<HashMap<String, String>>>,
+        mpsc::UnboundedReceiver<Received>,
         JoinHandle<()>,
     ) {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -381,12 +394,17 @@ mod tests {
         let keys = Arc::new(RwLock::new(HashMap::from([(fingerprint, "test".into())])));
         let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
         let tls = Rc::new(Tls::new(&cert, keys.clone()).unwrap());
-        let (tx, _) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         let (pair_tx, _) = mpsc::unbounded_channel();
         let task = listen(port, tls, 0, Some(tx), pair_tx);
         // the listener binds on its first poll
         tokio::task::yield_now().await;
-        (SocketAddr::from((Ipv4Addr::LOCALHOST, port)), keys, task)
+        (
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            keys,
+            rx,
+            task,
+        )
     }
 
     /// whether the server closes `stream` within `within`
@@ -408,7 +426,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
-                let (addr, keys, server) = server(&cert).await;
+                let (addr, keys, _rx, server) = server(&cert).await;
                 let connector = TlsConnector::from(Arc::new(
                     crypto::peers::tls_client_config(&cert, Policy::Any).unwrap(),
                 ));
@@ -428,13 +446,43 @@ mod tests {
             .await;
     }
 
+    /// B24: updates are acknowledged while the clipboard backend runs (also
+    /// while its permission dialog is pending) and refused once it ended
+    #[tokio::test]
+    async fn updates_are_refused_once_the_backend_ended() {
+        LocalSet::new()
+            .run_until(async {
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+                let (addr, _keys, mut rx, server) = server(&cert).await;
+                let tls = Tls::new(&cert, Default::default()).unwrap();
+                let mut data = ClipboardData::default();
+                data.push(crate::clipboard::MIME_TEXT, b"copied".to_vec());
+                let data = Arc::new(data);
+                let addrs = [addr];
+                let push = || send(&tls, &addrs, data.clone(), 0, Policy::Any, |_, _| true);
+
+                push().await.expect("acknowledged");
+                let (received, ..) = rx.try_recv().expect("handed to the clipboard");
+                assert_eq!(received, data);
+
+                // the backend ended: the task drops the receiver
+                drop(rx);
+                assert!(
+                    push().await.is_err(),
+                    "acknowledged although the backend ended"
+                );
+                server.abort();
+            })
+            .await;
+    }
+
     /// B3: connections over the cap are closed at once, the others stay
     #[tokio::test]
     async fn connections_over_the_cap_are_closed() {
         LocalSet::new()
             .run_until(async {
                 let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
-                let (addr, _keys, server) = server(&cert).await;
+                let (addr, _keys, _rx, server) = server(&cert).await;
                 let mut open = vec![];
                 for _ in 0..MAX_CONNECTIONS {
                     open.push(TcpStream::connect(addr).await.unwrap());
