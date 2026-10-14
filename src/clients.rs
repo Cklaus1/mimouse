@@ -292,14 +292,11 @@ impl Clients {
         }
     }
 
-    /// saves the port the service now listens on
-    pub(crate) async fn save_port(&mut self, port: u16) {
+    /// saves the port the service now listens on; a `--port` flag still
+    /// wins at the next start
+    pub(crate) async fn save_port(&mut self, port: u16) -> Result<(), String> {
         self.config.set_port(port);
-        if let Err(e) = self.save().await {
-            log::warn!(
-                "listening on port {port}, but the config was not saved ({e}); fix it, then run `mimouse cli save-config`"
-            );
-        }
+        self.save().await
     }
 
     pub(crate) async fn authorize_key(

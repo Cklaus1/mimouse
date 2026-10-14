@@ -982,6 +982,9 @@ impl Config {
             .await
             .map_err(io::Error::other)??;
         let reload = merged != memory;
+        // a reload in flight read the file before this merge took it in;
+        // applying it later would undo the in-memory change just saved
+        self.loading = None;
         self.base = merged.clone();
         self.config_toml = merged;
         Ok(reload)
@@ -2032,6 +2035,37 @@ future_client_key = "kept"
         tokio::time::timeout(wait, config.changed())
             .await
             .expect("reloaded");
+    }
+
+    /// R-6: a reload cancelled mid-load read the file a save then merged;
+    /// the next `changed()` must not apply that stale read over the save
+    #[tokio::test]
+    async fn save_drops_the_reload_it_merged() {
+        use futures::FutureExt;
+        let dir = temp_dir("save-drops-reload");
+        let path = dir.join(CONFIG_FILE_NAME);
+        fs::write(&path, "notify_switch = true\n").unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        config.watch_rx = rx;
+        fs::write(&path, "notify_switch = false\n").unwrap();
+        let modify = EventKind::Modify(notify::event::ModifyKind::Any);
+        let event = notify::Event::new(modify).add_path(config.config_path.clone());
+        tx.send(Ok(event)).await.unwrap();
+        // the load starts, then another `select!` branch cancels `changed()`
+        assert!(config.changed().now_or_never().is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let authorized = HashMap::from([("fp".to_owned(), "x".to_owned())]);
+        assert!(
+            config.save(vec![], authorized).await.unwrap(),
+            "edit merged"
+        );
+        let wait = std::time::Duration::from_secs(1);
+        let reloaded = tokio::time::timeout(wait, config.changed()).await;
+        assert!(reloaded.is_err(), "stale load applied");
+        assert!(config.authorized_fingerprints().contains_key("fp"));
+        assert!(!config.notify_switch(), "merged edit lost");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// T4: a reload applies hot keys; restart-only keys keep the value the

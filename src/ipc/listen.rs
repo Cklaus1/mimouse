@@ -125,6 +125,26 @@ impl AsyncFrontendListener {
         })
     }
 
+    /// a listener without a socket or pipe, fed through the sender (tests)
+    #[cfg(test)]
+    fn fed() -> (Self, mpsc::UnboundedSender<Internal>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let listener = Self {
+            rx,
+            conns: HashMap::new(),
+            accept: spawn_local(std::future::pending()),
+            #[cfg(unix)]
+            socket_path: PathBuf::from("/nonexistent/mimouse-test.sock"),
+        };
+        (listener, tx)
+    }
+
+    /// a listener no frontend can reach (tests)
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self::fed().0
+    }
+
     /// next connection or request (cancel safe)
     pub async fn next(&mut self) -> IpcEvent {
         loop {
@@ -138,6 +158,9 @@ impl AsyncFrontendListener {
                     self.conns.insert(id, conn);
                     return IpcEvent::Connected(id);
                 }
+                // queued before the connection was closed: nobody to answer
+                Internal::Line(id, _) | Internal::Invalid(id, ..)
+                    if !self.conns.contains_key(&id) => {}
                 Internal::Line(id, request) => return IpcEvent::Request(id, request),
                 Internal::Invalid(id, seq, e) => {
                     log::warn!("invalid request from frontend {id}: {e}");
@@ -354,18 +377,6 @@ mod tests {
 
     use super::*;
 
-    /// a listener without a socket, fed by `register`
-    fn listener() -> (AsyncFrontendListener, mpsc::UnboundedSender<Internal>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let listener = AsyncFrontendListener {
-            rx,
-            conns: HashMap::new(),
-            accept: spawn_local(std::future::pending()),
-            socket_path: PathBuf::from("/nonexistent/mimouse-test.sock"),
-        };
-        (listener, tx)
-    }
-
     async fn connect(
         listener: &mut AsyncFrontendListener,
         tx: &mpsc::UnboundedSender<Internal>,
@@ -397,7 +408,7 @@ mod tests {
     async fn stalled_reader_does_not_block_others() {
         LocalSet::new()
             .run_until(async {
-                let (mut listener, tx) = listener();
+                let (mut listener, tx) = AsyncFrontendListener::fed();
                 let mut stalled = connect(&mut listener, &tx, 0).await;
                 let reader = connect(&mut listener, &tx, 1).await;
                 // far more than the socket buffer and the queue hold
@@ -433,7 +444,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         LocalSet::new()
             .run_until(async {
-                let (mut listener, tx) = listener();
+                let (mut listener, tx) = AsyncFrontendListener::fed();
                 let (rx, mut wx) = connect(&mut listener, &tx, 0).await.into_split();
                 let mut lines = BufReader::new(rx).lines();
                 // e.g. a request type only a newer service knows
@@ -460,6 +471,28 @@ mod tests {
                     line = timeout(Duration::from_secs(5), lines.next_line()) => line,
                 };
                 assert!(line.expect("not closed").unwrap().is_none());
+                assert!(listener.peer(0).is_none());
+            })
+            .await;
+    }
+
+    /// R-8: requests queued behind a line that closed the connection are
+    /// dropped with it, not run without a peer to audit or answer
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_of_a_closed_connection_are_dropped() {
+        use tokio::io::AsyncWriteExt;
+        LocalSet::new()
+            .run_until(async {
+                let (mut listener, tx) = AsyncFrontendListener::fed();
+                let mut client = connect(&mut listener, &tx, 0).await;
+                let request =
+                    r#"{"seq":1,"request":{"action":"remove_authorized_key","fingerprint":"aa"}}"#;
+                client
+                    .write_all(format!("garbage\n{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let next = timeout(Duration::from_millis(500), listener.next()).await;
+                assert!(next.is_err(), "request of a closed connection passed on");
                 assert!(listener.peer(0).is_none());
             })
             .await;

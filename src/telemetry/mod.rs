@@ -175,6 +175,19 @@ impl Telemetry {
         )
     }
 
+    /// telemetry as configured by `config`, keeping its files in `dirs`
+    #[cfg(test)]
+    pub(crate) fn for_test(config: &Config, dirs: Dirs) -> Self {
+        let clock = Rc::new(Timestamp::now);
+        Self::start(
+            Settings::of(config),
+            dirs,
+            clock,
+            Rc::new(Https::default()),
+            &COUNTERS,
+        )
+    }
+
     fn start(
         settings: Settings,
         dirs: Dirs,

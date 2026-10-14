@@ -35,6 +35,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
+use webrtc_dtls::crypto::Certificate;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -163,30 +164,50 @@ impl Sinks for Live<'_> {
 
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
-        let client_manager = ClientManager::default();
-
         // load certificate
         let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
-        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
-        log::info!("certificate fingerprint: {public_key_fingerprint}");
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
         // the running service only: crashes of CLI commands are not recorded
         telemetry::install_panic_hook(config.config_dir());
         let telemetry = Telemetry::new(&config);
-        telemetry::COUNTERS.set_peers(config.clients().len());
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
-        // listener + connection
         let listener =
             MiMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
-        let connector = conn.connector();
 
         // after the already-running check, so a second instance never prompts
         #[cfg(target_os = "macos")]
         crate::macos_permissions::request_permissions();
+
+        Self::assemble(
+            config,
+            cert,
+            frontend_listener,
+            telemetry,
+            authorized_keys,
+            listener,
+        )
+    }
+
+    /// the service around the parts that reach outside the process: the
+    /// certificate, the IPC and peer listeners, telemetry
+    fn assemble(
+        config: Config,
+        cert: Certificate,
+        frontend_listener: AsyncFrontendListener,
+        telemetry: Telemetry,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        listener: MiMouseListener,
+    ) -> Result<Self, ServiceError> {
+        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        log::info!("certificate fingerprint: {public_key_fingerprint}");
+        telemetry::COUNTERS.set_peers(config.clients().len());
+
+        let client_manager = ClientManager::default();
+        let conn = MiMouseConnection::new(cert.clone(), client_manager.clone());
+        let connector = conn.connector();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -279,6 +300,14 @@ impl Service {
             }
         }
 
+        self.terminate().await;
+        shutdown.done();
+        Ok(())
+    }
+
+    /// ends capture (held keys released), emulation, the clipboard and the
+    /// resolver, and saves the telemetry counters
+    async fn terminate(&mut self) {
         log::info!("terminating service ...");
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
@@ -290,8 +319,6 @@ impl Service {
         self.resolver.terminate().await;
         log::debug!("saving telemetry counters ...");
         self.telemetry.shutdown().await;
-
-        Ok(())
     }
 
     async fn handle_ipc_event(&mut self, event: IpcEvent) {
@@ -407,8 +434,14 @@ impl Service {
                 clients.edit(&fx, id, |c| c.enter_hook = enter_hook).await?;
                 clients.reply(id)
             }
-            // a different port and focus are handled in `handle_ipc_event`
-            FrontendRequest::ChangePort { .. } | FrontendRequest::Focus { .. } => Reply::Done,
+            // the port in use: nothing to rebind, but the file may hold
+            // another (a `--port` flag, an edit awaiting a restart)
+            FrontendRequest::ChangePort { port } => {
+                clients.save_port(port).await?;
+                Reply::Done
+            }
+            // focus is handled in `handle_ipc_event`
+            FrontendRequest::Focus { .. } => Reply::Done,
             FrontendRequest::EnableCapture => {
                 self.capture.reenable();
                 Reply::Done
@@ -604,7 +637,11 @@ impl Service {
                         self.port = port;
                         self.clipboard.port_changed(port);
                         self.notify_frontend(FrontendEvent::Port { port, error: None });
-                        self.clients.save_port(port).await;
+                        if let Err(e) = self.clients.save_port(port).await {
+                            log::warn!(
+                                "listening on port {port}, but the config was not saved ({e}); fix it, then run `mimouse cli save-config`"
+                            );
+                        }
                         Ok(())
                     }
                     Err(e) => {
@@ -620,6 +657,7 @@ impl Service {
                     self.audit.record(&peer, &request, &result);
                     self.reply(conn, seq, result.clone().map(|_| Reply::Done));
                 }
+                self.reload_if_merged();
             }
             EmulationEvent::EmulationDisabled => {
                 crate::telemetry::COUNTERS.emulation_disables.bump();
@@ -855,9 +893,10 @@ fn push_target(pos: input_capture::Position, range: Option<EdgeRange>) -> (Edge,
 }
 
 /// the signals that stop the service: CTRL+C, and what the system sends to
-/// end it (SIGTERM, SIGHUP; on Windows a closed console, logoff, shutdown).
-/// Each ends the run loop, so the controlled peer is left and held keys are
-/// released
+/// end it: SIGTERM and SIGHUP on Unix; on Windows a closed console
+/// (CTRL_CLOSE), and logoff and shutdown as WM_QUERYENDSESSION /
+/// WM_ENDSESSION (see `end_session`). Each ends the run loop, so the
+/// controlled peer is left and held keys are released
 struct Shutdown {
     #[cfg(unix)]
     terminate: signal::unix::Signal,
@@ -866,9 +905,7 @@ struct Shutdown {
     #[cfg(windows)]
     close: signal::windows::CtrlClose,
     #[cfg(windows)]
-    logoff: signal::windows::CtrlLogoff,
-    #[cfg(windows)]
-    shutdown: signal::windows::CtrlShutdown,
+    end_session: end_session::EndSession,
 }
 
 impl Shutdown {
@@ -883,9 +920,7 @@ impl Shutdown {
             #[cfg(windows)]
             close: signal::windows::ctrl_close()?,
             #[cfg(windows)]
-            logoff: signal::windows::ctrl_logoff()?,
-            #[cfg(windows)]
-            shutdown: signal::windows::ctrl_shutdown()?,
+            end_session: end_session::EndSession::start(),
         })
     }
 
@@ -901,15 +936,282 @@ impl Shutdown {
         tokio::select! {
             r = signal::ctrl_c() => r.map(|()| "CTRL+C"),
             Some(()) = self.close.recv() => Ok("CTRL_CLOSE"),
-            Some(()) = self.logoff.recv() => Ok("CTRL_LOGOFF"),
-            Some(()) = self.shutdown.recv() => Ok("CTRL_SHUTDOWN"),
+            Some(message) = self.end_session.recv() => Ok(message),
         }
+    }
+
+    /// the service has cleaned up: on Windows, a session end held for that
+    /// goes on
+    fn done(self) {}
+}
+
+/// logoff and shutdown on Windows. A console process that loads user32 or
+/// gdi32 (mimouse does: SendInput, hooks, the tray icon) gets no
+/// CTRL_LOGOFF_EVENT or CTRL_SHUTDOWN_EVENT (SetConsoleCtrlHandler docs);
+/// it learns of them from WM_QUERYENDSESSION and WM_ENDSESSION sent to its
+/// top-level windows, which a message-only window never gets. A hidden
+/// top-level window of class `MiMouseEndSession`, on its own thread, turns
+/// WM_QUERYENDSESSION and WM_ENDSESSION with wParam TRUE into a stop. Windows
+/// may end the process once WM_ENDSESSION returns, so that waits until the
+/// service has cleaned up, at most `WAIT`
+#[cfg(windows)]
+mod end_session {
+    use std::{
+        cell::OnceCell,
+        sync::mpsc::{self, RecvTimeoutError},
+        time::Duration,
+    };
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+    use windows::{
+        Win32::{
+            Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG,
+                RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION,
+                WNDCLASSW,
+            },
+        },
+        core::w,
+    };
+
+    /// how long WM_ENDSESSION holds the session end for the cleanup
+    const WAIT: Duration = Duration::from_secs(2);
+
+    /// the window thread's side
+    struct Link {
+        stop: UnboundedSender<&'static str>,
+        /// disconnected once the service has cleaned up
+        done: mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static LINK: OnceCell<Link> = const { OnceCell::new() };
+    }
+
+    /// the service's side; dropping it lets a held session end go on
+    pub(super) struct EndSession {
+        stop: UnboundedReceiver<&'static str>,
+        _done: mpsc::Sender<()>,
+    }
+
+    impl EndSession {
+        /// starts the window thread
+        pub(super) fn start() -> Self {
+            let (stop_tx, stop) = unbounded_channel();
+            let (done_tx, done) = mpsc::channel();
+            let link = Link {
+                stop: stop_tx,
+                done,
+            };
+            if let Err(e) = std::thread::Builder::new()
+                .name("end-session".into())
+                .spawn(move || run(link))
+            {
+                log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            }
+            Self {
+                stop,
+                _done: done_tx,
+            }
+        }
+
+        /// the message that ends the session
+        pub(super) async fn recv(&mut self) -> Option<&'static str> {
+            self.stop.recv().await
+        }
+    }
+
+    fn run(link: Link) {
+        LINK.with(|l| {
+            let _ = l.set(link);
+        });
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            lpszClassName: w!("MiMouseEndSession"),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&class) } == 0 {
+            let e = std::io::Error::last_os_error();
+            log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            return;
+        }
+        // top-level (no parent) and never shown
+        if let Err(e) = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("MiMouseEndSession"),
+                w!("MiMouse"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        } {
+            log::warn!("logoff and shutdown will not stop the service cleanly: {e}");
+            return;
+        }
+        let mut msg = MSG::default();
+        // -1 is an error
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+            unsafe { DispatchMessageW(&msg) };
+        }
+    }
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_QUERYENDSESSION => {
+                stop("WM_QUERYENDSESSION", false);
+                // the session may end
+                LRESULT(1)
+            }
+            WM_ENDSESSION => {
+                // FALSE: the end was cancelled
+                if wparam.0 != 0 {
+                    stop("WM_ENDSESSION", true);
+                }
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    /// asks the service to stop; `wait`: until it has cleaned up, at most
+    /// `WAIT`
+    fn stop(message: &'static str, wait: bool) {
+        LINK.with(|link| {
+            let Some(link) = link.get() else { return };
+            // the service may have stopped already
+            let _ = link.stop.send(message);
+            if wait && matches!(link.done.recv_timeout(WAIT), Err(RecvTimeoutError::Timeout)) {
+                log::warn!("{message}: the session ends before the service cleaned up");
+            }
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Dirs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+    use tokio::task::LocalSet;
+
+    type Keys = Arc<RwLock<HashMap<String, String>>>;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mimouse-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// a service on dummy backends running the config file
+    /// `dir/config.toml` that holds `toml`, and the authorized keys in
+    /// effect; it writes nothing outside `dir`
+    async fn service(dir: &Path, toml: &str) -> (Service, Keys) {
+        let quiet = "capture_backend = \"dummy\"\nemulation_backend = \"dummy\"\nnotify_switch = false\nidle_inhibit = false\n";
+        let path = dir.join("config.toml");
+        fs::write(&path, format!("{quiet}{toml}")).unwrap();
+        let config = Config::at(&path).unwrap();
+        let cert = Certificate::generate_self_signed(["ignored".to_owned()]).unwrap();
+        let keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let (listener, _) = MiMouseListener::on_free_port(cert.clone(), keys.clone()).await;
+        let dirs = Dirs {
+            cache: dir.to_owned(),
+            config: dir.to_owned(),
+        };
+        let telemetry = Telemetry::for_test(&config, dirs);
+        let frontend = AsyncFrontendListener::detached();
+        let service =
+            Service::assemble(config, cert, frontend, telemetry, keys.clone(), listener).unwrap();
+        (service, keys)
+    }
+
+    /// `path` as an external editor leaves it, `f` applied
+    fn edit(path: &Path, f: impl FnOnce(&mut toml_edit::DocumentMut)) {
+        let mut doc: toml_edit::DocumentMut = fs::read_to_string(path).unwrap().parse().unwrap();
+        f(&mut doc);
+        fs::write(path, doc.to_string()).unwrap();
+    }
+
+    /// R-7: the save after a port change merges file edits the watcher has
+    /// not reported yet; they are applied right away, not left for a
+    /// reload that finds nothing changed
+    #[tokio::test]
+    async fn port_change_applies_the_file_edits_its_save_merged() {
+        LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("service-port-merge");
+                let path = dir.join("config.toml");
+                let (mut service, keys) = service(&dir, "port = 47301\n").await;
+                edit(&path, |doc| {
+                    doc["authorized_fingerprints"]["aa:01"] = toml_edit::value("laptop");
+                });
+                let changed = EmulationEvent::PortChanged(Ok(47302));
+                service.handle_emulation_event(changed).await;
+                let saved = fs::read_to_string(&path).unwrap();
+                assert!(saved.contains("port = 47302"), "{saved}");
+                assert!(saved.contains("aa:01"), "{saved}");
+                assert!(
+                    keys.read().expect("lock").contains_key("aa:01"),
+                    "merged key not in effect"
+                );
+                service.terminate().await;
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
+    }
+
+    /// R-9: `change-port` to the port in use saves it when the file holds
+    /// another one (here an edit awaiting a restart), so the next start
+    /// stays on it
+    #[tokio::test]
+    async fn change_port_to_the_port_in_use_is_saved() {
+        LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("service-same-port");
+                let path = dir.join("config.toml");
+                let (mut service, _) = service(&dir, "port = 47311\n").await;
+                edit(&path, |doc| doc["port"] = toml_edit::value(47312));
+                let wait = Duration::from_secs(10);
+                let change = tokio::time::timeout(wait, service.clients.changed()).await;
+                assert!(matches!(change, Ok(Change::Config)), "edit not reloaded");
+                service.handle_config_change();
+                assert_eq!(service.clients.config().awaiting_restart().len(), 1);
+                let request = FrontendRequest::ChangePort { port: 47311 };
+                let event = IpcEvent::Request(0, Request { seq: 1, request });
+                service.handle_ipc_event(event).await;
+                let replied = std::iter::from_fn(|| service.frontend.pop()).any(|(_, e)| {
+                    matches!(
+                        e,
+                        FrontendEvent::Reply {
+                            seq: 1,
+                            result: Ok(Reply::Done)
+                        }
+                    )
+                });
+                assert!(replied, "change-port failed");
+                let saved = fs::read_to_string(&path).unwrap();
+                assert!(saved.contains("port = 47311"), "{saved}");
+                assert!(service.clients.config().awaiting_restart().is_empty());
+                service.terminate().await;
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
+    }
 
     #[test]
     fn pointer_is_pushed_through_the_middle_of_the_range() {
