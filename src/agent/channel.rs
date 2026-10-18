@@ -322,6 +322,7 @@ impl Remote {
     /// closes the connection to a removed client
     pub(crate) fn forget(&self, handle: ClientHandle) {
         self.conns.borrow_mut().remove(&handle);
+        self.dialing.borrow_mut().remove(&handle);
     }
 
     /// sends `request` to the target client `handle` and waits for its answer

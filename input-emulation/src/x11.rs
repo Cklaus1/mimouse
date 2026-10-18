@@ -24,6 +24,8 @@ const MAX_CLICKS: u32 = 16;
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
+    /// the core keyboard state when the current text began
+    typing_state: u32,
 }
 
 unsafe impl Send for X11Emulation {}
@@ -38,7 +40,10 @@ impl X11Emulation {
                 display => Ok(display),
             }
         }?;
-        Ok(Self { display })
+        Ok(Self {
+            display,
+            typing_state: 0,
+        })
     }
 
     fn relative_motion(&self, dx: i32, dy: i32) {
@@ -237,13 +242,17 @@ impl Emulation for X11Emulation {
         Ok(true)
     }
 
+    fn begin_typing(&mut self) {
+        self.typing_state = self.keyboard_state();
+    }
+
     /// The key with the keysym on its first or Shift level in the first
     /// group; AltGr levels are not searched. `None` while another group is
     /// active, or Caps Lock is on for a letter (see `text::state_changes`).
     fn keystroke(&self, c: char) -> Option<Keystroke> {
         /// `ShiftMask`
         const SHIFT: u32 = 1 << 0;
-        let state = self.keyboard_state();
+        let state = self.typing_state;
         // core state: `LockMask` and the group in bits 13 and 14
         if text::state_changes(c, (state >> 13) & 0b11, state & xlib::LockMask != 0) {
             return None;

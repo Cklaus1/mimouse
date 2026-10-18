@@ -256,6 +256,7 @@ impl InputEmulation {
         if let Some(typed) = self.emulation.type_text(handle, text).await? {
             return Ok(typed);
         }
+        self.emulation.begin_typing();
         let mut unmapped = String::new();
         for c in text::chars(text) {
             match self.emulation.keystroke(c) {
@@ -594,6 +595,9 @@ trait Emulation: Send {
     ) -> Result<Option<Typed>, EmulationError> {
         Ok(None)
     }
+    /// Called once before the [`Emulation::keystroke`] lookups of a text;
+    /// typing only adds level modifiers, so state read here holds for it.
+    fn begin_typing(&mut self) {}
     /// the keys that type `c` in the target's layout, `None` if none does
     fn keystroke(&self, _c: char) -> Option<Keystroke> {
         None
