@@ -182,7 +182,7 @@ Sending needs a capture backend; receiving needs an emulation backend. Both are 
 - Linux clipboard sharing needs the `org.freedesktop.portal.RemoteDesktop` portal. GNOME and KDE have it; sway, Hyprland and X11 sessions don't, so clipboard sharing is off there.
 - The KDE, sway, Hyprland and X11 runs were nested or headless sessions on one Linux machine, each paired with a Windows 11 machine.
 
-Backends are cargo features (`Cargo.toml`), e.g. `cargo build --no-default-features --features layer_shell_capture,wlroots_emulation`.
+Backends are cargo features (`Cargo.toml`), e.g. `cargo build --no-default-features --features layer_shell_capture,wlroots_emulation`. To add support for another desktop or OS, see [docs/adding-a-backend.md](docs/adding-a-backend.md).
 
 ## Troubleshooting
 

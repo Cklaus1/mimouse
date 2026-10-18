@@ -37,6 +37,10 @@ MIMOUSE_LOG_LEVEL=debug cargo run
 - Failure-path tests check that the caller recovers on its next call.
 - Keep platform logic in pure, platform-independent functions where possible (as with the `doctor` firewall parsers and `macos_logic.rs`) and test those instead of the OS glue.
 
+## New platforms and backends
+
+Backends are compiled in; there are no runtime plugins. To support another desktop or OS, follow `docs/adding-a-backend.md`: the trait each kind of backend implements, where it is registered, how its errors are classified, and the contract suite it must pass.
+
 ## Commits and pull requests
 
 - One logical change per commit, with a short imperative subject.

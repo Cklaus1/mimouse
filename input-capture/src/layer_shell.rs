@@ -305,7 +305,11 @@ fn draw(f: &mut File, (width, height): (u32, u32)) {
 
 impl LayerShellInputCapture {
     pub fn new() -> std::result::Result<Self, LayerShellCaptureCreationError> {
-        let conn = Connection::connect_to_env()?;
+        Self::bind(Connection::connect_to_env()?)
+    }
+
+    /// a backend on `conn` (tests pass a fake compositor's)
+    fn bind(conn: Connection) -> std::result::Result<Self, LayerShellCaptureCreationError> {
         let (global_list, mut queue) = registry_queue_init::<State>(&conn)?;
 
         let qh = queue.handle();
@@ -1117,3 +1121,311 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// the globals the backend binds, and one output
+    const GLOBALS: &[(&str, u32)] = &[
+        ("wl_compositor", 5),
+        ("wl_shm", 1),
+        ("wl_seat", 7),
+        ("zxdg_output_manager_v1", 3),
+        ("zwlr_layer_shell_v1", 4),
+        ("zwp_pointer_constraints_v1", 1),
+        ("zwp_relative_pointer_manager_v1", 1),
+        ("wl_output", 4),
+    ];
+
+    /// the output's logical size; it sits at (0, 0)
+    const OUTPUT_SIZE: [u32; 2] = [1920, 1080];
+
+    /// `zwlr_layer_surface_v1.anchor` bits
+    const ANCHOR_BOTTOM: u32 = 2;
+    const ANCHOR_RIGHT: u32 = 8;
+
+    /// a Wayland message: object, opcode and the encoded arguments
+    fn message(object: u32, opcode: u16, args: &[u32]) -> Vec<u8> {
+        let size = (8 + 4 * args.len()) as u32;
+        [object, size << 16 | u32::from(opcode)]
+            .iter()
+            .chain(args)
+            .flat_map(|w| w.to_ne_bytes())
+            .collect()
+    }
+
+    /// a `wl_registry.global` event
+    fn global(registry: u32, name: u32, interface: &str, version: u32) -> Vec<u8> {
+        let mut msg = Vec::new();
+        // a string: length with the NUL, padded to 4 bytes
+        msg.extend((interface.len() as u32 + 1).to_ne_bytes());
+        msg.extend(interface.as_bytes());
+        msg.resize(msg.len() + 4 - interface.len() % 4, 0);
+        msg.extend(version.to_ne_bytes());
+        let mut header = message(registry, 0, &[name]);
+        let size = (header.len() + msg.len()) as u32;
+        header[4..8].copy_from_slice(&(size << 16).to_ne_bytes());
+        header.extend(msg);
+        header
+    }
+
+    fn word(bytes: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// a layer surface the client created and has not destroyed
+    struct LayerSurface {
+        surface: u32,
+        anchor: u32,
+        size: (u32, u32),
+    }
+
+    impl LayerSurface {
+        /// the edge its barrier is on, once anchored and sized
+        fn position(&self) -> Option<Position> {
+            let right = self.anchor & ANCHOR_RIGHT != 0;
+            let bottom = self.anchor & ANCHOR_BOTTOM != 0;
+            match self.size {
+                (1, h) if h > 1 => Some(if right {
+                    Position::Right
+                } else {
+                    Position::Left
+                }),
+                (w, 1) if w > 1 => Some(if bottom {
+                    Position::Bottom
+                } else {
+                    Position::Top
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// what the compositor knows of the client's objects
+    #[derive(Default)]
+    struct Objects {
+        /// the interface of each object whose requests matter here
+        interfaces: HashMap<u32, String>,
+        layer_surfaces: HashMap<u32, LayerSurface>,
+    }
+
+    impl Objects {
+        /// handles a request, returning the events it answers with
+        fn request(&mut self, object: u32, opcode: u32, args: &[u8]) -> Vec<u8> {
+            let arg = |i: usize| word(args, 4 * i);
+            let interface = match object {
+                1 => "wl_display",
+                _ => self.interfaces.get(&object).map_or("", String::as_str),
+            };
+            match (interface, opcode) {
+                // sync: wl_callback.done
+                ("wl_display", 0) => message(arg(0), 0, &[0]),
+                ("wl_display", 1) => {
+                    self.interfaces.insert(arg(0), "wl_registry".into());
+                    (1..)
+                        .zip(GLOBALS)
+                        .flat_map(|(name, &(interface, version))| {
+                            global(arg(0), name, interface, version)
+                        })
+                        .collect()
+                }
+                // bind: name, interface, version, new id
+                ("wl_registry", 0) => {
+                    let len = word(args, 4) as usize;
+                    let interface = String::from_utf8(args[8..8 + len - 1].to_vec()).unwrap();
+                    let id = word(args, 8 + len.next_multiple_of(4) + 4);
+                    let reply = match interface.as_str() {
+                        // capabilities: pointer and keyboard
+                        "wl_seat" => message(id, 0, &[3]),
+                        _ => vec![],
+                    };
+                    self.interfaces.insert(id, interface);
+                    reply
+                }
+                ("wl_seat", 0) => {
+                    self.interfaces.insert(arg(0), "wl_pointer".into());
+                    vec![]
+                }
+                ("wl_seat", 1) => {
+                    self.interfaces.insert(arg(0), "wl_keyboard".into());
+                    vec![]
+                }
+                // get_xdg_output: logical position and size, then wl_output.done
+                ("zxdg_output_manager_v1", 1) => {
+                    let (xdg_output, output) = (arg(0), arg(1));
+                    let mut reply = message(xdg_output, 0, &[0, 0]);
+                    reply.extend(message(xdg_output, 1, &OUTPUT_SIZE));
+                    reply.extend(message(output, 2, &[]));
+                    reply
+                }
+                // get_layer_surface: new id, surface, ..
+                ("zwlr_layer_shell_v1", 0) => {
+                    self.interfaces
+                        .insert(arg(0), "zwlr_layer_surface_v1".into());
+                    let surface = LayerSurface {
+                        surface: arg(1),
+                        anchor: 0,
+                        size: (0, 0),
+                    };
+                    self.layer_surfaces.insert(arg(0), surface);
+                    vec![]
+                }
+                ("zwlr_layer_surface_v1", 0) => {
+                    if let Some(s) = self.layer_surfaces.get_mut(&object) {
+                        s.size = (arg(0), arg(1));
+                    }
+                    vec![]
+                }
+                ("zwlr_layer_surface_v1", 1) => {
+                    if let Some(s) = self.layer_surfaces.get_mut(&object) {
+                        s.anchor = arg(0);
+                    }
+                    vec![]
+                }
+                ("zwlr_layer_surface_v1", 7) => {
+                    self.layer_surfaces.remove(&object);
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+
+        /// the object implementing `interface`
+        fn find(&self, interface: &str) -> u32 {
+            let found = self.interfaces.iter().find(|(_, i)| *i == interface);
+            *found.unwrap_or_else(|| panic!("no {interface}")).0
+        }
+    }
+
+    /// The compositor end of a fake connection: it announces `GLOBALS`
+    /// (one output, a seat with pointer and keyboard), answers
+    /// `wl_display.sync` and tracks the barrier surfaces; [`Self::report`]
+    /// sends the input a real compositor sends to them.
+    pub(crate) struct Compositor {
+        stream: Arc<Mutex<UnixStream>>,
+        objects: Arc<Mutex<Objects>>,
+        /// times the reader found nothing more to read
+        drained: Arc<AtomicUsize>,
+        serial: u32,
+    }
+
+    impl Compositor {
+        fn serve(server: UnixStream) -> Self {
+            server.set_nonblocking(true).unwrap();
+            let mut reader = server.try_clone().unwrap();
+            let compositor = Self {
+                stream: Arc::new(Mutex::new(server)),
+                objects: Arc::default(),
+                drained: Arc::default(),
+                serial: 0,
+            };
+            let (stream, objects, drained) = (
+                compositor.stream.clone(),
+                compositor.objects.clone(),
+                compositor.drained.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0; 4096];
+                // ends when the client hangs up
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(n) => buf.extend(&chunk[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            drained.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(_) => return,
+                    }
+                    while buf.len() >= 8 && buf.len() >= (word(&buf, 4) >> 16) as usize {
+                        let size = (word(&buf, 4) >> 16) as usize;
+                        let request: Vec<u8> = buf.drain(..size).collect();
+                        let (object, opcode) = (word(&request, 0), word(&request, 4) & 0xffff);
+                        let reply = objects
+                            .lock()
+                            .unwrap()
+                            .request(object, opcode, &request[8..]);
+                        if stream.lock().unwrap().write_all(&reply).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            compositor
+        }
+
+        /// waits until every request sent so far has been handled
+        fn settle(&self) {
+            let start = self.drained.load(Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.drained.load(Ordering::SeqCst) < start + 2 {
+                assert!(Instant::now() < deadline, "the fake compositor is stuck");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Makes the backend report `event` at `pos`, as a compositor does:
+        /// `Begin` is the pointer entering the barrier at `pos`, `End` it
+        /// leaving, keys and buttons come while it is there.
+        pub(crate) fn report(&mut self, pos: Position, event: CaptureEvent) {
+            self.settle();
+            let objects = self.objects.lock().unwrap();
+            // the newest: a replaced barrier's surfaces are destroyed first
+            let surface = objects
+                .layer_surfaces
+                .iter()
+                .filter(|(_, s)| s.position() == Some(pos))
+                .max_by_key(|&(&id, _)| id)
+                .unwrap_or_else(|| panic!("no barrier at {pos}"))
+                .1
+                .surface;
+            let (pointer, keyboard) = (objects.find("wl_pointer"), objects.find("wl_keyboard"));
+            drop(objects);
+            self.serial += 1;
+            let serial = self.serial;
+            let msg = match event {
+                CaptureEvent::Begin(_) => message(pointer, 0, &[serial, surface, 0, 0]),
+                CaptureEvent::End => message(pointer, 1, &[serial, surface]),
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { time, key, state })) => {
+                    message(keyboard, 3, &[serial, time, key, state.into()])
+                }
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    time,
+                    button,
+                    state,
+                })) => message(pointer, 3, &[serial, time, button, state]),
+                other => panic!("the fake compositor cannot report {other:?}"),
+            };
+            self.stream.lock().unwrap().write_all(&msg).unwrap();
+        }
+    }
+
+    /// a backend on a fake compositor that knows the output and the seat's
+    /// devices before the first barrier
+    pub(crate) fn on_fake_compositor() -> (LayerShellInputCapture, Compositor) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let compositor = Compositor::serve(server);
+        let conn = Connection::from_socket(client).unwrap();
+        let mut capture = LayerShellInputCapture::bind(conn).unwrap();
+        let inner = capture.0.get_mut();
+        // a prepared read would block the roundtrips
+        inner.state.read_guard = None;
+        // the first dispatches the output and the seat's capabilities, the
+        // second sends the pointer and keyboard requests they cause
+        for _ in 0..2 {
+            inner.queue.roundtrip(&mut inner.state).unwrap();
+        }
+        inner.prepare_read().unwrap();
+        assert_eq!(inner.state.displays().len(), 1);
+        (capture, compositor)
+    }
+}

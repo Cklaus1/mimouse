@@ -1,11 +1,11 @@
 //! Windows clipboard backend.
 //!
-//! A monitor thread receives `WM_CLIPBOARDUPDATE` and reads text
-//! (`CF_UNICODETEXT`), HTML (`HTML Format`), images (`PNG`, falling back to
-//! `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`), skipping
-//! copies marked secret and reporting an empty clipboard as a clear. A
-//! writer thread sets remote contents.
-//! Our own writes are recognized by their clipboard sequence number.
+//! A monitor thread receives `WM_CLIPBOARDUPDATE`; the session then reads
+//! text (`CF_UNICODETEXT`), HTML (`HTML Format`), images (`PNG`, falling
+//! back to `CF_BITMAP` converted to PNG) and copied files (`CF_HDROP`),
+//! skipping copies marked secret and reporting an empty clipboard as a
+//! clear, and sets remote contents. Clipboard access runs on the blocking
+//! pool. Our own writes are recognized by their clipboard sequence number.
 
 use std::{
     io::Cursor,
@@ -17,17 +17,23 @@ use std::{
 use clipboard_win::{
     Clipboard, Getter, Monitor, SysResult,
     formats::{CF_DIB, CF_HDROP, CF_UNICODETEXT, FileList, Html, RawData, Unicode},
+    monitor::Shutdown,
     options::NoClear,
     raw,
 };
 use image::ImageFormat;
+use tokio::{
+    sync::mpsc::{UnboundedSender, unbounded_channel},
+    task::spawn_blocking,
+};
 
 use super::{
-    BackendTx, ChangesTx, ClipboardData, LocalChange, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG,
-    MIME_TEXT, Offer, SetRx, StatusTx, WIN_MARKERS, files::local_files, own_seq_after_write,
-    set_channel,
+    BackendTx, ChangesTx, ClipboardData, MAX_CLIPBOARD_SIZE, MIME_HTML, MIME_PNG, MIME_TEXT, Offer,
+    SetRequest, StatusTx, WIN_MARKERS,
+    backend::{self, Backend, Context, End},
+    files::local_files,
+    own_seq_after_write,
 };
-use crate::ipc::{ClipboardState, ClipboardStatus};
 
 const OPEN_ATTEMPTS: usize = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -42,10 +48,11 @@ const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SETTLE_ROUNDS: usize = 10;
 
-/// what the monitor and the writer share; the lock serializes clipboard
-/// access between the two threads, so the monitor sees the final value of a
-/// write before deciding whether it was ours, and the writer sees a copy the
-/// monitor noticed before it overwrites the clipboard
+/// what the monitor thread and clipboard access share; the lock serializes
+/// clipboard access, so a read sees the final value of a write before
+/// deciding whether it was ours, and a write sees a copy the monitor
+/// noticed before it overwrites the clipboard (B21: the session may not
+/// have taken that notice yet)
 #[derive(Default)]
 struct Own {
     /// sequence number of the clipboard after our latest write
@@ -55,87 +62,146 @@ struct Own {
 }
 
 pub(super) fn spawn(changes: ChangesTx, status: StatusTx) -> BackendTx {
-    let (tx, rx) = set_channel();
-    let own = Arc::new(Mutex::new(Own::default()));
-    let monitor_own = own.clone();
-    thread::Builder::new()
-        .name("clipboard-monitor".into())
-        .spawn(move || {
-            // received contents are still set when monitoring fails
-            if let Err(e) = monitor(changes, &status, monitor_own) {
-                log::warn!("clipboard: {e}");
-                crate::telemetry::COUNTERS.clipboard_failures.bump();
-                status.send_replace(ClipboardStatus::disabled(format!(
-                    "{e}; local copies are not sent"
-                )));
+    backend::spawn(Windows::default(), changes, status)
+}
+
+/// kept across sessions: a restarted monitor still knows our last write
+#[derive(Default)]
+struct Windows(Arc<Mutex<Own>>);
+
+/// what the monitor thread tells the session
+enum Monitored {
+    /// monitoring; dropping the handle stops the thread
+    Started(Shutdown),
+    /// a change noticed at this time, before it settled
+    Noticed(Instant),
+    /// the change noticed last settled: read it
+    Settled,
+    Failed(String),
+}
+
+/// what the clipboard holds
+enum Read {
+    /// our write, or nothing readable
+    Skip,
+    /// contents not shared: marked secret, or no supported format
+    NotShared,
+    /// contents to share; empty if the clipboard was cleared
+    Data(ClipboardData),
+}
+
+impl Backend for Windows {
+    async fn session(&mut self, cx: &mut Context) -> Result<(), End> {
+        let (tx, mut monitored) = unbounded_channel();
+        let own = self.0.clone();
+        thread::Builder::new()
+            .name("clipboard-monitor".into())
+            .spawn(move || monitor(tx, &own))
+            .map_err(|e| End::Retry(format!("failed to start the clipboard monitor: {e}")))?;
+        // stops the monitor thread when the session ends
+        let mut _shutdown = None;
+        let mut noticed = None;
+        loop {
+            tokio::select! {
+                event = monitored.recv() => match event {
+                    Some(Monitored::Started(shutdown)) => {
+                        _shutdown = Some(shutdown);
+                        cx.enabled();
+                        if let Read::Data(data) = read_unless_ours(&self.0).await {
+                            cx.startup(data);
+                        }
+                    }
+                    Some(Monitored::Noticed(at)) => noticed = Some(cx.noticed(at)),
+                    Some(Monitored::Settled) => {
+                        let Some(noticed) = noticed.take() else { continue };
+                        match read_unless_ours(&self.0).await {
+                            Read::Skip => {}
+                            Read::NotShared => cx.not_shared(noticed),
+                            Read::Data(data) if data.is_empty() => cx.cleared(noticed),
+                            Read::Data(data) => cx.copied(noticed, data),
+                        }
+                    }
+                    Some(Monitored::Failed(e)) => return Err(End::Retry(e)),
+                    None => return Err(End::Retry("clipboard monitor ended".into())),
+                },
+                set = cx.next_set() => {
+                    let Some(set) = set else { return Ok(()) };
+                    let own = self.0.clone();
+                    if let Err(e) = spawn_blocking(move || write(&set, &own)).await {
+                        log::warn!("clipboard: failed to set clipboard: {e}");
+                    }
+                }
             }
-        })
-        .expect("spawn thread");
-    thread::Builder::new()
-        .name("clipboard-writer".into())
-        .spawn(move || writer(rx, own))
-        .expect("spawn thread");
-    tx
+        }
+    }
 }
 
 fn seq_num() -> u32 {
     raw::seq_num().map_or(0, |n| n.get())
 }
 
-/// reports clipboard changes until the receiving end is gone (Ok) or
-/// monitoring fails
-fn monitor(changes: ChangesTx, status: &StatusTx, own: Arc<Mutex<Own>>) -> Result<(), String> {
-    let mut monitor =
-        Monitor::new().map_err(|e| format!("failed to monitor the clipboard: {e}"))?;
-    status.send_replace(ClipboardStatus::new(ClipboardState::Enabled));
-    // records a change noticed at `changed` unless the clipboard holds our
-    // write; returns whether it does
-    let ours = |own: &mut Own, changed: Option<Instant>| {
-        if own.seq == seq_num() {
-            return true;
-        }
-        own.local = own.local.max(changed);
-        false
+/// watches the clipboard until the session ends (its receiver or the
+/// `Shutdown` handle dropped) or monitoring fails
+fn monitor(tx: UnboundedSender<Monitored>, own: &Mutex<Own>) {
+    let failed = |e| {
+        let _ = tx.send(Monitored::Failed(e));
     };
-    // returns false once the receiving end is gone
-    let report = |changed: Option<Instant>| {
-        let mut own = own.lock().expect("lock");
-        if ours(&mut own, changed) {
-            return true;
-        }
-        let data = read_settled();
-        drop(own);
-        match data {
-            Ok(data) => match LocalChange::read(changed, data) {
-                Some(change) => changes.send(change).is_ok(),
-                None => true,
-            },
-            Err(e) => {
-                log::warn!("clipboard: failed to read clipboard: {e}");
-                true
-            }
-        }
+    let mut monitor = match Monitor::new() {
+        Ok(monitor) => monitor,
+        Err(e) => return failed(format!("failed to monitor the clipboard: {e}")),
     };
-    if !report(None) {
-        return Ok(());
+    if tx
+        .send(Monitored::Started(monitor.shutdown_channel()))
+        .is_err()
+    {
+        return;
     }
     loop {
         match monitor.recv() {
             Ok(true) => {}
-            Ok(false) => return Ok(()),
-            Err(e) => return Err(format!("clipboard monitor failed: {e}")),
+            Ok(false) => return,
+            Err(e) => return failed(format!("clipboard monitor failed: {e}")),
         }
-        let changed = Some(Instant::now());
-        // B21: the writer must not overwrite this copy with an older update
-        // while it settles
-        ours(&mut own.lock().expect("lock"), changed);
+        let at = Instant::now();
+        {
+            let mut own = own.lock().expect("lock");
+            if own.seq == seq_num() {
+                continue;
+            }
+            // B21: a write must not overwrite this copy with an older
+            // update while it settles
+            own.local = own.local.max(Some(at));
+        }
+        if tx.send(Monitored::Noticed(at)).is_err() {
+            return;
+        }
         if let Err(e) = settle(&mut monitor) {
-            return Err(format!("clipboard monitor failed: {e}"));
+            return failed(format!("clipboard monitor failed: {e}"));
         }
-        if !report(changed) {
-            return Ok(());
+        if tx.send(Monitored::Settled).is_err() {
+            return;
         }
     }
+}
+
+/// reads the clipboard unless it holds our write
+async fn read_unless_ours(own: &Arc<Mutex<Own>>) -> Read {
+    let own = own.clone();
+    let read = spawn_blocking(move || {
+        let own = own.lock().expect("lock");
+        if own.seq == seq_num() {
+            return Ok(Read::Skip);
+        }
+        read_settled().map(|data| data.map_or(Read::NotShared, Read::Data))
+    })
+    .await;
+    let e = match read {
+        Ok(Ok(read)) => return read,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    log::warn!("clipboard: failed to read clipboard: {e}");
+    Read::Skip
 }
 
 /// wait until no clipboard update arrived for `SETTLE_DELAY` (at most
@@ -249,67 +315,66 @@ fn markers() -> Vec<(&'static str, Vec<u8>)> {
         .collect()
 }
 
-fn writer(mut rx: SetRx, own: Arc<Mutex<Own>>) {
-    while let Some(set) = rx.blocking_recv() {
-        let data = &set.data;
-        let text = data.get(MIME_TEXT).map(String::from_utf8_lossy);
-        let html = data.get(MIME_HTML).map(String::from_utf8_lossy);
-        let png = data.get(MIME_PNG);
-        let bmp = png.and_then(
-            |png| match convert(png, ImageFormat::Png, ImageFormat::Bmp) {
-                Ok(bmp) => Some(bmp),
-                Err(e) => {
-                    log::warn!("clipboard: failed to convert image: {e}");
-                    None
-                }
-            },
-        );
-        let files: Vec<&str> = data
-            .files()
-            .iter()
-            .filter_map(|f| {
-                let path = f.path.to_str();
-                if path.is_none() {
-                    log::warn!("clipboard: cannot offer {}", f.path.display());
-                }
-                path
-            })
-            .collect();
+/// puts `set` on the clipboard unless the monitor noticed a newer copy
+fn write(set: &SetRequest, own: &Mutex<Own>) {
+    let data = &set.data;
+    let text = data.get(MIME_TEXT).map(String::from_utf8_lossy);
+    let html = data.get(MIME_HTML).map(String::from_utf8_lossy);
+    let png = data.get(MIME_PNG);
+    let bmp = png.and_then(
+        |png| match convert(png, ImageFormat::Png, ImageFormat::Bmp) {
+            Ok(bmp) => Some(bmp),
+            Err(e) => {
+                log::warn!("clipboard: failed to convert image: {e}");
+                None
+            }
+        },
+    );
+    let files: Vec<&str> = data
+        .files()
+        .iter()
+        .filter_map(|f| {
+            let path = f.path.to_str();
+            if path.is_none() {
+                log::warn!("clipboard: cannot offer {}", f.path.display());
+            }
+            path
+        })
+        .collect();
 
-        let mut own = own.lock().expect("lock");
-        if set.older_than(own.local) {
-            continue;
+    let mut own = own.lock().expect("lock");
+    if set.older_than(own.local) {
+        return;
+    }
+    // whether the clipboard changed: it was opened and emptied
+    let mut wrote = false;
+    let result = (|| -> SysResult<()> {
+        let _clipboard = open()?;
+        raw::empty()?;
+        wrote = true;
+        if let Some(text) = &text {
+            raw::set_string_with(text, NoClear)?;
         }
-        // whether the clipboard changed: it was opened and emptied
-        let mut wrote = false;
-        let result = (|| -> SysResult<()> {
-            let _clipboard = open()?;
-            raw::empty()?;
-            wrote = true;
-            if let Some(text) = &text {
-                raw::set_string_with(text, NoClear)?;
-            }
-            if let Some((html, format)) = html.as_ref().zip(Html::new()) {
-                raw::set_html_with(format.code(), html, NoClear)?;
-            }
-            if let Some((png, format)) = png.zip(png_format()) {
-                raw::set_without_clear(format, png)?;
-            }
-            if let Some(bmp) = &bmp {
-                raw::set_bitmap_with(bmp, NoClear)?;
-            }
-            if !files.is_empty() {
-                raw::set_file_list_with(&files, NoClear)?;
-            }
-            Ok(())
-        })();
-        // the clipboard is closed now: this is the sequence number the
-        // monitor will see for our write; without a write it is the user's
-        own.seq = own_seq_after_write(own.seq, wrote, seq_num());
-        drop(own);
-        if let Err(e) = result {
-            log::warn!("clipboard: failed to set clipboard: {e}");
+        if let Some((html, format)) = html.as_ref().zip(Html::new()) {
+            raw::set_html_with(format.code(), html, NoClear)?;
         }
+        if let Some((png, format)) = png.zip(png_format()) {
+            raw::set_without_clear(format, png)?;
+        }
+        if let Some(bmp) = &bmp {
+            raw::set_bitmap_with(bmp, NoClear)?;
+        }
+        if !files.is_empty() {
+            raw::set_file_list_with(&files, NoClear)?;
+        }
+        Ok(())
+    })();
+    // the clipboard is closed now: this is the sequence number the
+    // monitor will see for our write; without a write it is the user's
+    own.seq = own_seq_after_write(own.seq, wrote, seq_num());
+    drop(own);
+    if let Err(e) = result {
+        log::warn!("clipboard: failed to set clipboard: {e}");
     }
 }
 
