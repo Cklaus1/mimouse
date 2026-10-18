@@ -1,5 +1,6 @@
 use crate::capture_test::TestCaptureArgs;
 use crate::emulation_test::TestEmulationArgs;
+use crate::mcp::McpArgs;
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
@@ -324,6 +325,9 @@ pub enum Command {
     TestCapture(TestCaptureArgs),
     /// MiMouse commandline interface
     Cli(CliArgs),
+    /// MCP server on stdin/stdout for AI agents (screenshots, pointer,
+    /// keys, clipboard of this machine and its peers)
+    Mcp(McpArgs),
     /// run in daemon mode
     Daemon,
 }

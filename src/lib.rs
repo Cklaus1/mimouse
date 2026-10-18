@@ -20,6 +20,7 @@ pub mod ipc;
 mod listen;
 #[cfg(target_os = "macos")]
 mod macos_permissions;
+pub mod mcp;
 mod notify;
 mod pair;
 mod proto;
