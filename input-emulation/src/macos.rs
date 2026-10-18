@@ -1,7 +1,8 @@
 use super::geometry::{Rect, entry_point};
 use super::macos_logic::{KeyAction, KeyPlanner};
 use super::normalize::Steps;
-use super::{Edge, Emulation, EmulationHandle, error::EmulationError};
+use super::text::{Piece, exact_pieces};
+use super::{Edge, Emulation, EmulationHandle, TextSupport, Typed, error::EmulationError};
 use async_trait::async_trait;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
@@ -201,6 +202,52 @@ fn key_event(event_source: CGEventSource, key: u16, down: bool, mut flags: CGEve
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {down}");
+}
+
+/// the virtual key codes of Return and Tab, the same in every layout
+const KVK_RETURN: CGKeyCode = 0x24;
+const KVK_TAB: CGKeyCode = 0x30;
+
+/// a key event carries at most this many UTF-16 units of typed text
+const MAX_EVENT_UNITS: usize = 20;
+
+/// Posts a key down and up that type `units` whatever the layout, without
+/// modifiers (held ones would turn the text into shortcuts).
+fn unicode_event(event_source: &CGEventSource, units: &[u16]) {
+    for down in [true, false] {
+        let Ok(event) = CGEvent::new_keyboard_event(event_source.clone(), 0, down) else {
+            log::warn!("unable to create key event");
+            return;
+        };
+        event.set_flags(CGEventFlags::empty());
+        event.set_string_from_utf16_unchecked(units);
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+/// global display coordinates (points), origin top left of the main
+/// display; `None` if they cannot be listed
+fn displays() -> Option<Vec<Rect>> {
+    let displays = match CGDisplay::active_displays() {
+        Ok(displays) => displays,
+        Err(e) => {
+            log::warn!("could not list displays: {e}");
+            return None;
+        }
+    };
+    let displays = displays
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Rect {
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as i32,
+                height: b.size.height.round() as i32,
+            }
+        })
+        .collect();
+    Some(displays)
 }
 
 /// flags-changed event for a modifier key: carries the modifier's own key
@@ -494,32 +541,49 @@ impl Emulation for MacOSEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        let displays = match CGDisplay::active_displays() {
-            Ok(displays) => displays,
-            Err(e) => {
-                log::warn!("could not list displays: {e}");
-                return Ok(None);
-            }
+        let Some(displays) = displays() else {
+            return Ok(None);
         };
-        let displays = displays
-            .into_iter()
-            .map(|id| {
-                // global display coordinates (points), origin top left of
-                // the main display
-                let b = CGDisplay::new(id).bounds();
-                Rect {
-                    x: b.origin.x.round() as i32,
-                    y: b.origin.y.round() as i32,
-                    width: b.size.width.round() as i32,
-                    height: b.size.height.round() as i32,
-                }
-            })
-            .collect::<Vec<_>>();
         let Some((x, y)) = entry_point(&displays, edge, fraction) else {
             return Ok(None);
         };
         let placed = self.post_motion(CGPoint::new(x as CGFloat, y as CGFloat), 0., 0.);
         Ok(placed.then_some((x, y)))
+    }
+
+    /// any text, as Unicode key events
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Exact
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        displays().filter(|displays| !displays.is_empty())
+    }
+
+    fn pointer_to(&mut self, _: EmulationHandle, x: i32, y: i32) -> Result<bool, EmulationError> {
+        Ok(self.post_motion(CGPoint::new(x as CGFloat, y as CGFloat), 0., 0.))
+    }
+
+    async fn type_text(
+        &mut self,
+        _: EmulationHandle,
+        text: &str,
+    ) -> Result<Option<Typed>, EmulationError> {
+        let (pieces, unmapped) = exact_pieces(text, MAX_EVENT_UNITS);
+        for piece in &pieces {
+            let key = match piece {
+                Piece::Units(units) => {
+                    unicode_event(&self.event_source, units);
+                    continue;
+                }
+                Piece::Return => KVK_RETURN,
+                Piece::Tab => KVK_TAB,
+            };
+            for down in [true, false] {
+                key_event(self.event_source.clone(), key, down, CGEventFlags::empty());
+            }
+        }
+        Ok(Some(Typed { unmapped }))
     }
 
     async fn create(&mut self, _handle: EmulationHandle) {}

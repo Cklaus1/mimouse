@@ -692,6 +692,7 @@ impl Service {
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::Connection { addr, fingerprint });
             }
+            EmulationEvent::PeerInput => {}
         }
     }
 
