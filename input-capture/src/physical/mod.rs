@@ -7,7 +7,7 @@
 //! unprivileged session client: it watches the session idle time and
 //! reports input that happened clearly after the last injection ("idle").
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::watch;
@@ -36,6 +36,10 @@ pub enum PhysicalError {
     #[error("physical input detection failed: {0}")]
     Failed(String),
 }
+
+/// An injection that runs longer than this (typed text) calls
+/// [`PhysicalInput::injected`] at least this often while it runs.
+pub const INJECTED_EVERY: Duration = Duration::from_millis(50);
 
 /// Watches for physical input while it lives.
 pub struct PhysicalInput {

@@ -94,7 +94,8 @@ pub enum Request {
         observe: Option<Observe>,
     },
     Screenshot(Shot),
-    /// the target's clipboard contents in `mime`, else its first format
+    /// the target's clipboard contents in `mime`, else its text, else its
+    /// first format
     ClipGet {
         #[serde(default)]
         mime: Option<String>,

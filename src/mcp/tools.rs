@@ -228,13 +228,13 @@ pub(super) fn list(max_edge: u32) -> Vec<Value> {
         ),
         tool(
             "clip_get",
-            "Reads the target's clipboard in `mime` (default text/plain; else its first format). \
+            "Reads the target's clipboard in `mime` (default: its text, else its first format). \
              Text comes back as text, images as an image, other formats as a base64 resource; the \
              first text part lists the formats on offer."
                 .into(),
             json!({
                 "target": target(),
-                "mime": {"type": "string", "default": "text/plain"}
+                "mime": {"type": "string"}
             }),
             &[],
             annotations("Read clipboard", true, false),

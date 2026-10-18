@@ -240,12 +240,31 @@ impl<S: Service> Server<S> {
         }
     }
 
-    /// the answer to one JSON-RPC message; `None` for notifications
+    /// the answer to one JSON-RPC message or batch; `None` for
+    /// notifications and batches of them
     async fn handle(&mut self, line: &[u8]) -> Option<Value> {
         let message: Value = match serde_json::from_slice(line) {
             Ok(message) => message,
             Err(e) => return Some(error(Value::Null, PARSE_ERROR, format!("parse error: {e}"))),
         };
+        let Value::Array(batch) = message else {
+            return self.message(message).await;
+        };
+        if batch.is_empty() {
+            return Some(error(
+                Value::Null,
+                INVALID_REQUEST,
+                "empty JSON-RPC batch".into(),
+            ));
+        }
+        let mut answers = Vec::new();
+        for message in batch {
+            answers.extend(self.message(message).await);
+        }
+        (!answers.is_empty()).then_some(Value::Array(answers))
+    }
+
+    async fn message(&mut self, message: Value) -> Option<Value> {
         let Value::Object(mut message) = message else {
             return Some(error(
                 Value::Null,
@@ -540,8 +559,7 @@ impl<S: Service> Server<S> {
             mime: Option<String>,
         }
         let a: A = parse(arguments)?;
-        let mime = a.mime.unwrap_or_else(|| "text/plain".into());
-        let request = Request::ClipGet { mime: Some(mime) };
+        let request = Request::ClipGet { mime: a.mime };
         let (mime, data, available) = match self.request(&a.target, request).await? {
             Response::Clip {
                 mime,

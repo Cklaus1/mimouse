@@ -120,6 +120,28 @@ impl X11Emulation {
         let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym.raw().into()) };
         u32::from(code).checked_sub(8).filter(|&code| code > 0)
     }
+
+    /// the core modifier and group state, as in key events
+    fn keyboard_state(&self) -> u32 {
+        let (mut root, mut child) = (0, 0);
+        let (mut root_x, mut root_y, mut x, mut y) = (0, 0, 0, 0);
+        let mut mask = 0;
+        // the mask is set even when the pointer is on another screen
+        unsafe {
+            xlib::XQueryPointer(
+                self.display,
+                xlib::XDefaultRootWindow(self.display),
+                &mut root,
+                &mut child,
+                &mut root_x,
+                &mut root_y,
+                &mut x,
+                &mut y,
+                &mut mask,
+            );
+        }
+        mask
+    }
 }
 
 impl Drop for X11Emulation {
@@ -216,10 +238,16 @@ impl Emulation for X11Emulation {
     }
 
     /// The key with the keysym on its first or Shift level in the first
-    /// group; AltGr levels are not searched.
+    /// group; AltGr levels are not searched. `None` while another group is
+    /// active, or Caps Lock is on for a letter (see `text::state_changes`).
     fn keystroke(&self, c: char) -> Option<Keystroke> {
         /// `ShiftMask`
         const SHIFT: u32 = 1 << 0;
+        let state = self.keyboard_state();
+        // core state: `LockMask` and the group in bits 13 and 14
+        if text::state_changes(c, (state >> 13) & 0b11, state & xlib::LockMask != 0) {
+            return None;
+        }
         let keysym = text::keysym(c)?;
         let key = self.key_for(keysym)?;
         let level = (0..2).find(|&level| {

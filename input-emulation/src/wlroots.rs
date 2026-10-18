@@ -440,6 +440,16 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
+    async fn ready(&mut self) -> Result<(), EmulationError> {
+        if self.stalled {
+            return Err(EmulationError::Stalled(RELEASE_TIMEOUT));
+        }
+        match self.last_flush_failed {
+            true => self.drain().await,
+            false => Ok(()),
+        }
+    }
+
     fn enter_at(
         &mut self,
         handle: EmulationHandle,

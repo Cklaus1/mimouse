@@ -35,22 +35,30 @@ impl Backend {
         let files: Vec<PathBuf> = (1..=displays.len())
             .map(|n| dir.path().join(format!("{n}.png")))
             .collect();
+        let _dir = ShotDir(Some(dir));
         // -D n: the n-th display of the active display list (main first)
         for (n, file) in files.iter().enumerate() {
             screencapture(n + 1, file.clone()).await?;
         }
-        blocking(move || {
-            let image = composite_files(&displays, &files);
-            // removes the PNGs
-            drop(dir);
-            image
-        })
-        .await?
+        blocking(move || composite_files(&displays, &files)).await?
     }
 
     pub(crate) async fn geometry(&self) -> Result<Geometry, ScreenError> {
         let displays = blocking(displays).await??;
         Ok(composite(&displays))
+    }
+}
+
+/// The capture's temp dir, removed on a blocking thread however the
+/// capture ends (error or cancel included): never file IO on the caller's
+/// runtime thread.
+struct ShotDir(Option<tempfile::TempDir>);
+
+impl Drop for ShotDir {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            tokio::task::spawn_blocking(move || drop(dir));
+        }
     }
 }
 

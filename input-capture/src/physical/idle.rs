@@ -22,6 +22,9 @@ pub(super) const POLL: Duration = Duration::from_millis(100);
 // which must register as new input
 const _: () = assert!(TOLERANCE.as_millis() < POLL.as_millis());
 
+// every input of a long injection lies within SLACK of a mark
+const _: () = assert!(super::INJECTED_EVERY.as_millis() < SLACK.as_millis());
+
 /// Input is reported one sample after it is seen, against the injections
 /// known by then: an injection reaches the compositor before the caller
 /// can call `injected`, and a sample taken in between must not report it.

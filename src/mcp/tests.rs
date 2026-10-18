@@ -408,6 +408,24 @@ async fn notifications_get_no_answer() {
 }
 
 #[tokio::test]
+async fn a_batch_gets_the_answers_of_its_requests() {
+    let mut s = server([]);
+    let line = br#"[{"jsonrpc":"2.0","method":"notifications/initialized"},
+        {"jsonrpc":"2.0","id":1,"method":"ping"},
+        {"jsonrpc":"2.0","id":2,"method":"nope"}, 5]"#;
+    let answer = s.handle(line).await.expect("requests are answered");
+    let answers = answer.as_array().unwrap();
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[0], json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+    assert_eq!(answers[1]["error"]["code"], METHOD_NOT_FOUND);
+    assert_eq!(answers[2]["error"]["code"], INVALID_REQUEST);
+    let notifications = br#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#;
+    assert_eq!(s.handle(notifications).await, None);
+    let empty = s.handle(b"[]").await.expect("answered");
+    assert_eq!(empty["error"]["code"], INVALID_REQUEST);
+}
+
+#[tokio::test]
 async fn a_malformed_line_is_answered_and_the_server_keeps_running() {
     let mut s = server([]);
     let input: &[u8] =

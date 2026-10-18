@@ -140,7 +140,8 @@ impl Desk for ServiceDesk {
             Some(m) => canonical(&m).to_owned(),
             None => available
                 .iter()
-                .find(|m| *m != MIME_FILES)
+                .find(|m| *m == MIME_TEXT)
+                .or_else(|| available.iter().find(|m| *m != MIME_FILES))
                 .cloned()
                 .ok_or_else(|| Refused::new(ErrorCode::Empty, "the clipboard holds only files"))?,
         };

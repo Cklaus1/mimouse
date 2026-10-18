@@ -32,8 +32,8 @@ pub enum CliError {
     #[error("the service closed the connection")]
     Closed,
     /// e.g. a service of another version that cannot decode the request
-    #[error("no reply from the service within {} s", REPLY_TIMEOUT.as_secs())]
-    Timeout,
+    #[error("no reply from the service within {} s", .0.as_secs())]
+    Timeout(Duration),
     #[error(transparent)]
     Discover(#[from] DiscoverError),
     #[error("{0} check(s) failed")]
@@ -489,7 +489,7 @@ async fn wait_for_reply(
     };
     tokio::time::timeout(limit, wait)
         .await
-        .map_err(|_| CliError::Timeout)?
+        .map_err(|_| CliError::Timeout(limit))?
 }
 
 fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
@@ -778,7 +778,7 @@ mod tests {
         // a service that never answers, e.g. one that could not decode the request
         let silent = futures::stream::pending::<Result<FrontendEvent, IpcError>>();
         let result = wait_for_reply(silent, 1, Duration::from_millis(50)).await;
-        assert!(matches!(result, Err(CliError::Timeout)));
+        assert!(matches!(result, Err(CliError::Timeout(_))));
     }
 
     #[test]

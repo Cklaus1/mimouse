@@ -13,7 +13,7 @@ use input_event::{Event, KeyboardEvent, scancode};
 
 pub use chord::{Chord, ChordMatcher};
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
-pub use physical::{PhysicalError, PhysicalInput};
+pub use physical::{INJECTED_EVERY, PhysicalError, PhysicalInput};
 
 pub mod chord;
 pub mod error;

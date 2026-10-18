@@ -46,6 +46,15 @@ pub(crate) fn keysym(c: char) -> Option<xkeysym::Keysym> {
     (keysym != xkeysym::Keysym::NoSymbol).then_some(keysym)
 }
 
+/// Whether the shared keyboard state makes a key found in the first
+/// layout group, without Caps Lock, type something other than `c`:
+/// another group is active, or Caps Lock is on and `c` has a case. Such
+/// characters are reported unmapped rather than typed wrong.
+#[cfg(any(libei, x11, test))]
+pub(crate) fn state_changes(c: char, group: u32, caps: bool) -> bool {
+    group != 0 || (caps && c.to_lowercase().ne(c.to_uppercase()))
+}
+
 /// A piece of text typed exactly (as Unicode, not through a layout).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +394,16 @@ mod tests {
         };
         assert_eq!(stroke.modifiers().collect::<Vec<_>>(), [42]);
         assert_eq!(Keystroke::default().modifiers().count(), 0);
+    }
+
+    #[test]
+    fn caps_lock_and_other_groups_unmap_what_they_change() {
+        assert!(!state_changes('a', 0, false));
+        assert!(state_changes('a', 0, true));
+        assert!(state_changes('Ä', 0, true));
+        assert!(!state_changes('1', 0, true));
+        assert!(!state_changes('\n', 0, true));
+        assert!(state_changes('1', 1, false));
     }
 
     #[cfg(any(libei, wlroots, x11, rdp))]

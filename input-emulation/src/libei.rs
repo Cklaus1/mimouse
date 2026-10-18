@@ -32,7 +32,7 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 use crate::{PermissionPending, error::EmulationError};
 
 use super::geometry::{Rect, entry_point};
-use super::text::{Keystroke, Layout};
+use super::text::{self, Keystroke, Layout};
 use super::{Edge, Emulation, EmulationHandle, TextSupport, error::LibeiEmulationCreationError};
 
 /// a device interface, with the device it belongs to
@@ -48,6 +48,8 @@ struct Devices {
     keyboard: Slot<ei::Keyboard>,
     /// the keys of the keyboard's keymap, for typing text
     layout: Slot<Layout>,
+    /// layout group and Caps Lock of the keyboard state the EIS shares
+    keyboard_state: Arc<RwLock<(u32, bool)>>,
     /// devices the EIS resumed: events to a paused device are a protocol
     /// error
     resumed: Arc<RwLock<HashSet<ei::Device>>>,
@@ -377,6 +379,10 @@ impl Emulation for LibeiEmulation {
     fn keystroke(&self, c: char) -> Option<Keystroke> {
         let keyboard = self.devices.keyboard.read().unwrap();
         self.devices.usable(&keyboard)?;
+        let (group, caps) = *self.devices.keyboard_state.read().unwrap();
+        if text::state_changes(c, group, caps) {
+            return None;
+        }
         let layout = self.devices.layout.read().unwrap();
         layout.as_ref()?.1.keystroke(c)
     }
@@ -518,6 +524,9 @@ fn handle_ei_event(event: EiEvent, devices: &Devices) -> Result<(), EmulationErr
         }
         EiEvent::KeyboardModifiers(e) => {
             log::debug!("modifiers: {e:?}");
+            /// the Lock real modifier: index 1 in every xkb keymap
+            const CAPS_LOCK: u32 = 1 << 1;
+            *devices.keyboard_state.write().unwrap() = (e.group, e.locked & CAPS_LOCK != 0);
         }
         // only for receiver context
         // EiEvent::Frame(_) => { },

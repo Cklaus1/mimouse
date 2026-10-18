@@ -292,26 +292,38 @@ impl InputEmulation {
         let mut pressed = [0; 3];
         for (slot, modifier) in stroke.modifiers().enumerate() {
             if !holds(self, modifier) {
-                self.consume(key(modifier, 1), handle).await?;
+                self.consume_typed(key(modifier, 1), handle).await?;
                 pressed[slot] = modifier;
             }
         }
         if stroke.depressed != 0 {
-            self.consume(depressed(stroke.depressed), handle).await?;
+            self.consume_typed(depressed(stroke.depressed), handle)
+                .await?;
         }
         // a held key would not type: its press is not a change
         if holds(self, stroke.key) {
-            self.consume(key(stroke.key, 0), handle).await?;
+            self.consume_typed(key(stroke.key, 0), handle).await?;
         }
-        self.consume(key(stroke.key, 1), handle).await?;
-        self.consume(key(stroke.key, 0), handle).await?;
+        self.consume_typed(key(stroke.key, 1), handle).await?;
+        self.consume_typed(key(stroke.key, 0), handle).await?;
         for &modifier in pressed.iter().rev().filter(|&&m| m != 0) {
-            self.consume(key(modifier, 0), handle).await?;
+            self.consume_typed(key(modifier, 0), handle).await?;
         }
         if stroke.depressed != 0 {
-            self.consume(depressed(0), handle).await?;
+            self.consume_typed(depressed(0), handle).await?;
         }
         Ok(())
+    }
+
+    /// [`InputEmulation::consume`] for typed text, which waits for the
+    /// backend rather than being discarded under backpressure like motion
+    async fn consume_typed(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
+        self.emulation.ready().await?;
+        self.consume(event, handle).await
     }
 
     /// Emulates `event` for `handle` (see [`Peer::plan`]); events for a
@@ -585,6 +597,11 @@ trait Emulation: Send {
     /// the keys that type `c` in the target's layout, `None` if none does
     fn keystroke(&self, _c: char) -> Option<Keystroke> {
         None
+    }
+    /// Waits until the next event would be sent rather than discarded
+    /// under backpressure.
+    async fn ready(&mut self) -> Result<(), EmulationError> {
+        Ok(())
     }
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);

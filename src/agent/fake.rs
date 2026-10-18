@@ -24,15 +24,24 @@ pub(crate) struct Shared {
     /// while set, `input` waits for it before returning
     pub(crate) gate: RefCell<Option<Rc<Notify>>>,
     pub(crate) inputs_started: Cell<usize>,
+    /// while set, `locked` waits for it before answering
+    pub(crate) lock_gate: RefCell<Option<Rc<Notify>>>,
+    pub(crate) lock_queries: Cell<usize>,
+    /// how long `type_text` takes
+    pub(crate) typing: Cell<Duration>,
+    /// injections the watch heard of
+    pub(crate) injections: Cell<usize>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct FakeDesk(pub(crate) Rc<Shared>);
 
-pub(crate) struct FakeWatch(mpsc::UnboundedReceiver<()>);
+pub(crate) struct FakeWatch(mpsc::UnboundedReceiver<()>, Rc<Shared>);
 
 impl Watch for FakeWatch {
-    fn injected(&self, _: Instant) {}
+    fn injected(&self, _: Instant) {
+        self.1.injections.set(self.1.injections.get() + 1);
+    }
     async fn next(&mut self) -> Option<()> {
         self.0.recv().await
     }
@@ -53,6 +62,7 @@ impl Desk for FakeDesk {
         Ok(())
     }
     async fn type_text(&self, _: u64, _: &str) -> Result<String, Refused> {
+        tokio::time::sleep(self.0.typing.get()).await;
         Ok(String::new())
     }
     async fn hostname(&self) -> String {
@@ -85,6 +95,11 @@ impl Desk for FakeDesk {
         })
     }
     async fn locked(&self) -> Option<bool> {
+        self.0.lock_queries.set(self.0.lock_queries.get() + 1);
+        let gate = self.0.lock_gate.borrow().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         Some(false)
     }
     async fn idle(&self) -> Option<Duration> {
@@ -102,7 +117,7 @@ impl Desk for FakeDesk {
     async fn watch(&self) -> Option<FakeWatch> {
         let (tx, rx) = mpsc::unbounded_channel();
         *self.0.person.borrow_mut() = Some(tx);
-        Some(FakeWatch(rx))
+        Some(FakeWatch(rx, self.0.clone()))
     }
 }
 

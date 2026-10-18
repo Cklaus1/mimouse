@@ -238,7 +238,14 @@ where
         };
         let response = tokio::select! {
             response = target.handle(requester, request) => response,
-            () = revoked => return EndReason::Revoked,
+            () = revoked => {
+                let _ = audit.send(Audited {
+                    requester: requester.clone(),
+                    request: audited,
+                    result: Err("revoked".into()),
+                });
+                return EndReason::Revoked;
+            }
         };
         let result = match &response {
             Response::Error { code, .. } => Err(code.to_string()),
@@ -278,9 +285,9 @@ pub(crate) struct Remote {
     tls: Rc<Tls>,
     conns: RefCell<HashMap<ClientHandle, Rc<Conn>>>,
     events: mpsc::UnboundedSender<RemoteEnded>,
-    /// one dial at a time: a second connection to a target would end the
-    /// session of the first when either closes
-    dialing: Mutex<()>,
+    /// one dial at a time per target: a second connection to a target would
+    /// end the session of the first when either closes
+    dialing: RefCell<HashMap<ClientHandle, Rc<Mutex<()>>>>,
 }
 
 struct Conn {
@@ -307,7 +314,7 @@ impl Remote {
             tls,
             conns: Default::default(),
             events,
-            dialing: Mutex::new(()),
+            dialing: RefCell::default(),
         };
         (remote, rx)
     }
@@ -411,9 +418,17 @@ impl Remote {
         handle: ClientHandle,
         dial: &Dial<T>,
     ) -> Result<Rc<Conn>, String> {
-        let _dialing = self.dialing.lock().await;
-        if let Some(conn) = self.conns.borrow().get(&handle).filter(|c| !c.closed()) {
-            return Ok(conn.clone());
+        let cached = || {
+            let conns = self.conns.borrow();
+            conns.get(&handle).filter(|c| !c.closed()).cloned()
+        };
+        if let Some(conn) = cached() {
+            return Ok(conn);
+        }
+        let lock = self.dialing.borrow_mut().entry(handle).or_default().clone();
+        let _dialing = lock.lock().await;
+        if let Some(conn) = cached() {
+            return Ok(conn);
         }
         if dial.addrs.is_empty() {
             return Err("no address known for this client".into());

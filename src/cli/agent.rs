@@ -56,6 +56,7 @@ enum Verb {
     Close,
     /// press a key chord such as `ctrl+l` or `shift+tab`
     Key {
+        #[arg(value_parser = chord)]
         chord: String,
         #[command(flatten)]
         observe: ObserveArg,
@@ -161,6 +162,11 @@ impl ObserveArg {
 /// a value the way the protocol spells it (`allow`, `right`)
 fn parse<T: DeserializeOwned>(s: &str) -> Result<T, String> {
     serde_json::from_value(Value::String(s.to_owned())).map_err(|e| e.to_string())
+}
+
+/// a key chord the protocol accepts, checked before connecting
+fn chord(s: &str) -> Result<String, String> {
+    keys::parse_chord(s).map(|_| s.to_owned())
 }
 
 fn parse_region(s: &str) -> Result<Region, String> {

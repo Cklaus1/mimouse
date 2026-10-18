@@ -12,7 +12,7 @@ use std::{
 
 use input_event::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent};
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{Notify, broadcast, mpsc, watch},
     task::{JoinHandle, spawn_blocking, spawn_local},
     time::{self, sleep_until},
 };
@@ -216,6 +216,8 @@ struct Inner<D: Desk> {
     state: RefCell<TargetState>,
     events: mpsc::UnboundedSender<TargetEvent>,
     ended: broadcast::Sender<(Requester, EndReason)>,
+    /// the idle timeout changed: supervisors compute their deadline again
+    idle_changed: Rc<Notify>,
 }
 
 pub(crate) struct Target<D: Desk>(Rc<Inner<D>>);
@@ -243,6 +245,7 @@ impl<D: Desk> Target<D> {
             }),
             events,
             ended,
+            idle_changed: Rc::default(),
         };
         (Self(Rc::new(inner)), events_rx)
     }
@@ -259,7 +262,7 @@ impl<D: Desk> Target<D> {
     /// New grants or idle timeout. A session whose requester lost a scope
     /// it had ends.
     pub(crate) fn set_policy(&self, policy: Policy) {
-        let revoked = {
+        let (revoked, idle_changed) = {
             let mut state = self.0.state.borrow_mut();
             let revoked = state.session.as_ref().and_then(|s| {
                 let before = state.policy.grants(&s.requester);
@@ -271,11 +274,15 @@ impl<D: Desk> Target<D> {
                     });
                 lost.then_some(s.id)
             });
+            let idle_changed = state.policy.idle_timeout != policy.idle_timeout;
             state.policy = policy;
-            revoked
+            (revoked, idle_changed)
         };
         if let Some(id) = revoked {
             self.end(id, EndReason::Revoked);
+        }
+        if idle_changed {
+            self.0.idle_changed.notify_waiters();
         }
     }
 
@@ -437,30 +444,16 @@ impl<D: Desk> Target<D> {
             _ => {}
         }
         let scope = request.scope().expect("actions need a grant");
-        if grants.get(scope) != Grant::Allow {
-            return Err(denied(requester, Some(scope)));
-        }
-        if request.observe().is_some() && grants.screen != Grant::Allow {
-            return Err(denied(requester, Some(Scope::Screen)));
-        }
-        if self.0.state.borrow().preempted.contains(requester) {
-            return Err(Refused::new(
-                ErrorCode::Preempted,
-                "a person used this machine and ended the session; ask the user, then send `open` to start a new one",
-            ));
-        }
-        if scope == Scope::Input && self.0.state.borrow().capturing {
-            return Err(Refused::new(
-                ErrorCode::Capturing,
-                "this machine is controlling another one; agent input is refused until control returns",
-            ));
-        }
+        self.admit(requester, &request, scope)?;
         if scope != Scope::Clipboard && self.0.desk.locked().await == Some(true) {
             return Err(Refused::new(
                 ErrorCode::Unavailable,
                 "the screen is locked; ask the user to unlock it",
             ));
         }
+        // again: the session may have been preempted, capture started or a
+        // grant taken away during the lock query
+        self.admit(requester, &request, scope)?;
         let id = self.ensure_session(requester, None)?;
         let _busy = Busy::new(self, id);
         let observe = request.observe().cloned();
@@ -468,7 +461,10 @@ impl<D: Desk> Target<D> {
         let Some(observe) = observe else {
             return Ok(response);
         };
-        let frame = self.observe(&observe).await.map_err(|e| {
+        let observed = self.observe(&observe).await;
+        // no frame of a screen the session may no longer see
+        self.alive(id)?;
+        let frame = observed.map_err(|e| {
             Refused::new(
                 e.code,
                 format!(
@@ -478,6 +474,31 @@ impl<D: Desk> Target<D> {
             )
         })?;
         Ok(response.with_frame(frame))
+    }
+
+    /// Err if `requester` may not carry out `request` now
+    fn admit(&self, requester: &Requester, request: &Request, scope: Scope) -> Result<(), Refused> {
+        let grants = self.grants(requester);
+        if grants.get(scope) != Grant::Allow {
+            return Err(denied(requester, Some(scope)));
+        }
+        if request.observe().is_some() && grants.screen != Grant::Allow {
+            return Err(denied(requester, Some(Scope::Screen)));
+        }
+        let state = self.0.state.borrow();
+        if state.preempted.contains(requester) {
+            return Err(Refused::new(
+                ErrorCode::Preempted,
+                "a person used this machine and ended the session; ask the user, then send `open` to start a new one",
+            ));
+        }
+        if scope == Scope::Input && state.capturing {
+            return Err(Refused::new(
+                ErrorCode::Capturing,
+                "this machine is controlling another one; agent input is refused until control returns",
+            ));
+        }
+        Ok(())
     }
 
     async fn act(&self, id: u64, request: Request) -> Result<Response, Refused> {
@@ -507,8 +528,17 @@ impl<D: Desk> Target<D> {
                     return Err(bad(format!("at most {MAX_TEXT} characters per request")));
                 }
                 self.alive(id)?;
-                self.injected(id);
-                let unmapped = self.0.desk.type_text(id, &text).await;
+                let typing = self.0.desk.type_text(id, &text);
+                tokio::pin!(typing);
+                // a heuristic person-input watcher takes a typing run for a
+                // person unless it hears of the injections throughout
+                let mut marks = time::interval(input_capture::INJECTED_EVERY);
+                let unmapped = loop {
+                    tokio::select! {
+                        unmapped = &mut typing => break unmapped,
+                        _ = marks.tick() => self.injected(id),
+                    }
+                };
                 self.injected(id);
                 Ok(Response::Typed {
                     unmapped: unmapped?,
@@ -568,8 +598,10 @@ impl<D: Desk> Target<D> {
                 Ok(done)
             }
             Request::Screenshot(shot) => {
-                let image = self.0.desk.capture().await?;
-                Ok(Response::Frame(self.encode(image, shot).await?))
+                let image = self.0.desk.capture().await;
+                // no frame of a screen the session may no longer see
+                self.alive(id)?;
+                Ok(Response::Frame(self.encode(image?, shot).await?))
             }
             Request::ClipGet { mime } => {
                 let clip = self.0.desk.clip_get(mime).await?;
@@ -732,13 +764,14 @@ async fn supervise<D: Desk>(
     id: u64,
     mut injected: watch::Receiver<Instant>,
 ) {
-    let mut watch = match target.upgrade() {
+    let (mut watch, idle_changed) = match target.upgrade() {
         Some(inner) => {
+            let idle_changed = inner.idle_changed.clone();
             let watch = inner.desk.watch().await;
             if watch.is_none() {
                 log::info!("agent session {id}: a person's input is not detectable here");
             }
-            watch
+            (watch, idle_changed)
         }
         None => return,
     };
@@ -781,6 +814,7 @@ async fn supervise<D: Desk>(
                 }
                 Err(_) => return,
             },
+            () = idle_changed.notified() => {}
             _ = sleep_until(deadline) => {
                 let idle = target.upgrade().is_some_and(|inner| {
                     let state = inner.state.borrow();
@@ -1062,6 +1096,33 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn capture_starting_during_the_lock_query_refuses_the_input() {
+        local(async {
+            let (target, desk, mut events) = target(allow_all());
+            let gate = Rc::new(Notify::new());
+            *desk.0.lock_gate.borrow_mut() = Some(gate.clone());
+            let request = {
+                let target = target.clone();
+                spawn_local(async move {
+                    target
+                        .handle(&Requester::Local, chord(&[Linux::KeyA]))
+                        .await
+                })
+            };
+            while desk.0.lock_queries.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+            target.set_capturing(true);
+            gate.notify_one();
+            let response = request.await.unwrap();
+            assert_eq!(error_code(&response), Some(ErrorCode::Capturing));
+            assert!(ended(&mut events).is_empty(), "no session was started");
+            assert_eq!(desk.0.inputs_started.get(), 0);
+        })
+        .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_session_without_requests_ends_after_the_idle_timeout() {
         local(async {
@@ -1074,6 +1135,43 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
             assert_eq!(ended(&mut events), [EndReason::Idle]);
             assert_eq!(*desk.0.ended.borrow(), [1]);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shorter_idle_timeout_applies_to_the_running_session() {
+        local(async {
+            let (target, _desk, mut events) = target(allow_all());
+            target
+                .handle(&Requester::Local, chord(&[Linux::KeyA]))
+                .await;
+            target.set_policy(Policy {
+                idle_timeout: Duration::from_secs(5),
+                ..policy(allow_all())
+            });
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert_eq!(ended(&mut events), [EndReason::Idle]);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_hears_of_injections_throughout_a_long_type() {
+        local(async {
+            let (target, desk, _events) = target(allow_all());
+            target
+                .handle(&Requester::Local, Request::Open { reason: None })
+                .await;
+            desk.0.typing.set(input_capture::INJECTED_EVERY * 10);
+            let before = desk.0.injections.get();
+            let typed = Request::Type {
+                text: "a".into(),
+                observe: None,
+            };
+            target.handle(&Requester::Local, typed).await;
+            // a mark per INJECTED_EVERY, none of them coalesced away
+            assert!(desk.0.injections.get() - before >= 10);
         })
         .await;
     }
