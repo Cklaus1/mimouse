@@ -50,6 +50,7 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - GNOME: stopping the service no longer hangs while the input capture dialog is waiting for approval.
 - Input the capture backend still held when control returned is no longer sent to the peer after it was released.
 - Linux: the service no longer aborts with a core dump when it stops (a portal connection dropped after the event loop had ended).
+- Two people can work on the two machines at once: moving back across the edge while another machine controls this one only gives control back to it. Before, this machine then captured its own mouse and keyboard and sent them to the other machine, so the person at it lost control and the two machines took control from each other on each crossing. Input from the other machine that arrives after it was told to leave is dropped.
 
 ### Security
 

@@ -34,6 +34,10 @@
 //!     copies of earlier reports.
 //! 11. The keys reported down and not up are handed to the caller once.
 //! 12. After `terminate` the stream ends, queued copies included.
+//! 13. While an enter-only id is returning (`set_returning`), a `Begin` at
+//!     its position is for it alone; input still reaches the steering ids.
+//!     Only enter-only ids can be returning; unmarking (or destroying) the
+//!     id makes crossings everyone's again.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -743,5 +747,35 @@ async fn destroying_an_unknown_id_does_nothing() {
             "{}",
             subject.name
         );
+    }
+}
+
+/// rule 13
+#[tokio::test]
+async fn a_crossing_back_to_the_controlling_peer_is_its_alone() {
+    for subject in SUBJECTS {
+        let mut run = subject.start();
+        run.create(1, Left, None, false).await;
+        run.create(2, Left, None, true).await;
+        // a Default id cannot be returning
+        run.capture.set_returning(1, true);
+        run.capture.set_returning(2, true);
+        // Dummy reports by itself
+        let scripted = run.report(Left, &[Begin(None), key(KeyA, 1)]);
+        let (id, event) = run.next().await;
+        assert!(
+            id == 2 && matches!(event, Begin(_)),
+            "{}: {id} {event}",
+            subject.name
+        );
+        if !scripted {
+            continue;
+        }
+        // no copy of the crossing for id 1, which still steers
+        assert_eq!(run.next().await, (1, key(KeyA, 1)), "{}", subject.name);
+        run.capture.set_returning(2, false);
+        let mark = run.mark();
+        run.report(Left, &CROSSING);
+        run.deliver(mark, CROSSING.len()).await;
     }
 }

@@ -50,7 +50,7 @@ A backend implements one trait, runs under a shared layer that keeps the cross-p
 
 Contract: `input-capture/src/contract.rs` lists the rules every backend keeps under `InputCapture` (module doc) and checks them on each `SUBJECTS` entry. The rules cover:
 
-- which ids get a crossing, input and `End`;
+- which ids get a crossing, input and `End`, and a crossing back to the controlling peer (a returning enter-only id) going to that id alone;
 - barrier ranges, and a destroyed id getting nothing more (an unknown id: nothing at all);
 - `release()` dropping queued input and the input of the ended capture;
 - focus, including `FocusByPointerPush`;

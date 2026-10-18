@@ -196,6 +196,9 @@ pub struct InputCapture {
     /// the client a requested focus goes to: the next `Begin` at its
     /// position is for it alone
     focus: Option<CaptureHandle>,
+    /// enter-only ids whose peer controls this machine: a crossing at
+    /// their position goes to them alone, it gives control back
+    returning: HashSet<CaptureHandle>,
     /// `None`: a backend injected through [`InputCapture::with_backend`]
     selected: Option<Selected>,
     /// released and no `Begin` since: input the backend still yields
@@ -243,6 +246,7 @@ impl InputCapture {
         if self.focus == Some(id) {
             self.focus = None;
         }
+        self.returning.remove(&id);
         self.retain_live_pending();
 
         log::debug!("destroying capture {id} @ {pos}");
@@ -285,6 +289,21 @@ impl InputCapture {
     /// forget a requested focus that did not start capture
     pub fn clear_focus(&mut self) {
         self.focus = None;
+    }
+
+    /// Marks the enter-only `id` as the way back to the peer that controls
+    /// this machine (or no longer): while marked, the next `Begin` at its
+    /// position is for it alone, so a normal client there is not entered.
+    pub fn set_returning(&mut self, id: CaptureHandle, returning: bool) {
+        if !returning {
+            self.returning.remove(&id);
+        } else if self
+            .id_map
+            .get(&id)
+            .is_some_and(|&(.., enter_only)| enter_only)
+        {
+            self.returning.insert(id);
+        }
     }
 
     /// Hotkeys that start capture for a client while input is local, on
@@ -379,6 +398,7 @@ impl InputCapture {
             pressed_keys: HashSet::new(),
             hotkeys: Vec::new(),
             focus: None,
+            returning: HashSet::new(),
             selected: None,
             released: false,
             terminated: false,
@@ -450,6 +470,11 @@ impl Stream for InputCapture {
                         self.focus = None;
                         return Poll::Ready(Some(Ok((id, event))));
                     }
+                }
+                // a crossing back to the controlling peer is not an entry
+                let ids = self.position_map.get(&pos).map_or(&[][..], Vec::as_slice);
+                if let Some(&id) = ids.iter().find(|id| self.returning.contains(id)) {
+                    return Poll::Ready(Some(Ok((id, event))));
                 }
             }
 

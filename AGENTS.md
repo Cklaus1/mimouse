@@ -21,7 +21,7 @@ Software KVM: one Rust binary (`mimouse`) runs the service; `mimouse cli` contro
 - `telemetry-collector/`: `schema.json` is the telemetry contract; the Worker validates against it at runtime and rejects unknown fields. Adding a field means bumping `schema_version` (`telemetry/schema.rs`), the README field list and the client's no-PII test (`telemetry::tests::no_host_names_addresses_fingerprints_or_paths_are_sent`) together.
 - `input-capture/`: OS events → `Stream<CaptureEvent>` (libei, layer-shell, windows, macos). `chord.rs`: `ChordMatcher` (exact chord only; supersets and auto-repeat never fire) for the release bind and hotkeys; `feed` returns `Fed::{Pass, Fired, Swallowed}`, and `swallow(key)` drops a fired chord's final key, auto-repeat and key-up included, until it goes up. It is the one state machine for `src/capture.rs` and the Windows/macOS local hotkeys. `InputCapture::with_backend` injects a backend (tests).
   - `Capture::focus` starts capture without a crossing; backends that can't (libei, layer-shell, x11) return `FocusByPointerPush` and `src/capture.rs` asks emulation to push the local pointer through the barrier. Edge ranges (`EdgeRange`) are applied by each backend (barrier/surface length or activation check).
-  - `InputCapture::create` takes `enter_only`: when a normal (Default) client shares the position, enter-only ids (inbound connections) do not shape the barrier and get no Input events, only Begin and End. An enter-only id alone at a position keeps the whole edge.
+  - `InputCapture::create` takes `enter_only`: when a normal (Default) client shares the position, enter-only ids (inbound connections) do not shape the barrier and get no Input events, only Begin and End. An enter-only id alone at a position keeps the whole edge. `set_returning(id, true)` marks an enter-only id whose peer controls this machine: a `Begin` at its position goes to it alone (after a pending focus), so the Default client there is not entered.
   - `InputCapture` alone owns pending-queue hygiene: `release()` drops queued Input for every id, and Input the backend yields afterwards until its next `Begin`; `terminate()` ends the stream; `destroy` of an unknown id is a no-op. Windows/macOS OS callbacks send through `event_queue` (unbounded, never blocks or panics; over the limit drops presses/motion/crossings but always queues releases, Modifiers and End). libei batches queued client updates (`apply_queued`) and restarts the session only when the client list changes (mutter AddBarrier needs INIT state); a pending permission dialog never holds up its `terminate`. GNOME 50's InputCapture portal is v1 (no restore token): mutter closes every remote session when the screen locks, so each unlock asks again.
   - `contract.rs` (tests): the rules every capture backend keeps under `InputCapture` (module doc), checked on each `SUBJECTS` entry: Dummy, layer-shell on a fake compositor (`layer_shell::tests::on_fake_compositor`), and `testing::Fake` set up as Windows, macOS and libei (queue limit, focus behaviour); add a backend there. `testing.rs`: `Recorder` (records backend calls) and `Fake`/`Script`.
   - `physical/`: `PhysicalInput` person-input detection; exact on Windows (LL hooks) and macOS (listen-only tap), an idle-time heuristic on Linux (`idle.rs`: `SLACK`/`TOLERANCE`/`POLL`). An injection that runs longer than `INJECTED_EVERY` (typed text) calls `injected` at least that often, or the heuristic takes it for a person.
@@ -37,6 +37,7 @@ Software KVM: one Rust binary (`mimouse`) runs the service; `mimouse cli` contro
 ## Invariants
 
 - A peer is either sending or receiving, never both; this prevents feedback loops and indirect control through a third machine.
+- Two people, one per machine: a crossing at the edge of a peer that controls this machine only gives control back (`Capture::set_returning`, set on its `Enter`, cleared on its `Leave` (`EmulationEvent::Left`), on the return and on disconnect). The capture task then sends that peer `Leave` and releases; it never captures this machine's own input for it. The emulation drops input from a peer it told to leave until that peer's next `Enter`, so late motion cannot cross the edge again.
 - Input: UDP/DTLS. Clipboard: TCP/TLS on the same port, same certificate, same `authorized_fingerprints`.
 - IPC (`ipc/`): newline-delimited JSON; requests carry a `seq` and get exactly one `Reply`. An undecodable request gets an error `Reply` when its `seq` can be read; otherwise the connection is closed. Each connection has a bounded outbound queue (`QUEUE_LEN`) drained by its own writer task; `AsyncFrontendListener::send` never waits and drops a connection whose queue is full (the frontend reconnects and gets the sync events). The CLI waits at most `REPLY_TIMEOUT` for a reply (`pair` and `watch` are exempt). Windows uses a per-user named pipe with an owner-only DACL, never a TCP port. State-changing requests are audited (`audit.rs`, written on its own thread; the log keeps recording when rotation fails, appending to the current `audit.jsonl`); never log typed text or clipboard contents. Never do file IO on the service's LocalSet.
 - New `FrontendEvent` fields must be `Option` with `#[serde(default)]` so older/newer CLI-service pairs still decode.
@@ -64,23 +65,23 @@ Constants stay compiled `const`: they sit on the input path or are read once, so
 
 | Constant | file:line | Value | Scale | Range | Trades off |
 |---|---|---|---|---|---|
-| `PING_INTERVAL` | src/connect.rs:493 | 500 ms | log | < `WATCHDOG_TIMEOUT`/2 (assert src/emulation.rs:334); Lan Mouse pings every 500 ms | dead-peer detection latency vs. ping traffic |
+| `PING_INTERVAL` | src/connect.rs:493 | 500 ms | log | < `WATCHDOG_TIMEOUT`/2 (assert src/emulation.rs:350); Lan Mouse pings every 500 ms | dead-peer detection latency vs. ping traffic |
 | `MAX_MISSED_PINGS` | src/connect.rs:494 | 8 (= 4 s) | linear | unknown; 4 s rides out loss bursts (lan-mouse#307) | loss tolerance vs. time until a dead peer is released |
 | `DEFAULT_CONNECTION_TIMEOUT` | src/connect.rs:44 | 5 s | log | < `HANDSHAKE_TIMEOUT` (comment src/listen.rs:45) | slow links vs. reconnect start |
 | `Backoff::MIN` / `MAX` | src/connect.rs:216-217 | 1 s → 30 s, doubling | log | MIN <= MAX (assert src/connect.rs:230) | reconnect / emulation-retry speed vs. retry load |
-| `WATCHDOG_TIMEOUT` | src/emulation.rs:331 | 3 s | log | > 2 × `PING_INTERVAL` (assert src/emulation.rs:334) | keys held after a peer vanishes vs. releasing on short loss |
-| `WATCHDOG_TICK` | src/emulation.rs:333 | 500 ms | log | < `WATCHDOG_TIMEOUT` (assert src/emulation.rs:338) | release precision (max hold = timeout + tick) vs. wakeups |
-| `REJECTION_REPEAT_WINDOW` | src/emulation.rs:365 | 2 s | log | unknown | log noise vs. reporting repeated refusals |
-| `MAX_RECENT_REJECTIONS` | src/emulation.rs:368 | 64 | log | unknown | memory vs. dedup of refused fingerprints |
-| `ENTER_REPEAT_WINDOW` | src/emulation.rs:893 | 1 s | log | unknown | merging `Enter` repeats into one crossing vs. missing a real re-entry |
+| `WATCHDOG_TIMEOUT` | src/emulation.rs:347 | 3 s | log | > 2 × `PING_INTERVAL` (assert src/emulation.rs:350) | keys held after a peer vanishes vs. releasing on short loss |
+| `WATCHDOG_TICK` | src/emulation.rs:349 | 500 ms | log | < `WATCHDOG_TIMEOUT` (assert src/emulation.rs:354) | release precision (max hold = timeout + tick) vs. wakeups |
+| `REJECTION_REPEAT_WINDOW` | src/emulation.rs:381 | 2 s | log | unknown | log noise vs. reporting repeated refusals |
+| `MAX_RECENT_REJECTIONS` | src/emulation.rs:384 | 64 | log | unknown | memory vs. dedup of refused fingerprints |
+| `ENTER_REPEAT_WINDOW` | src/emulation.rs:909 | 1 s | log | unknown | merging `Enter` repeats into one crossing vs. missing a real re-entry |
 | `PEER_INPUT_EVERY` | src/emulation.rs:73 | 100 ms | log | unknown | agent preemption latency vs. events per peer input |
 | `HANDSHAKE_TIMEOUT` (DTLS) | src/listen.rs:46 | 10 s | log | > client `DEFAULT_CONNECTION_TIMEOUT` 5 s; < `UDP_IDLE_TIMEOUT` | stalled handshake slots vs. slow peers |
 | `PEER_IDLE_TIMEOUT` | src/listen.rs:48 | 10 s | log | > peer ping interval 500 ms; < `UDP_IDLE_TIMEOUT` | resources of silent peers vs. dropping live ones |
 | `UDP_IDLE_TIMEOUT` | src/listen.rs:52 | 30 s | log | > both DTLS timeouts (DTLS reader spin) | memory for idle remotes |
-| `FOCUS_TIMEOUT` | src/capture.rs:765 | 1 s | log | < `REPLY_TIMEOUT` (comment src/cli.rs:57) | `cli focus` failure latency vs. slow capture start |
-| `CtrlDoubleTap::MAX_HOLD` | src/capture.rs:869 | 300 ms | log | unknown | tap detection vs. ordinary Ctrl use |
-| `CtrlDoubleTap::MAX_GAP` | src/capture.rs:871 | 400 ms | log | unknown | same |
-| send-failure log debounce `DUR` | src/capture.rs:555 | 500 ms | log | unknown | log noise |
+| `FOCUS_TIMEOUT` | src/capture.rs:805 | 1 s | log | < `REPLY_TIMEOUT` (comment src/cli.rs:57) | `cli focus` failure latency vs. slow capture start |
+| `CtrlDoubleTap::MAX_HOLD` | src/capture.rs:909 | 300 ms | log | unknown | tap detection vs. ordinary Ctrl use |
+| `CtrlDoubleTap::MAX_GAP` | src/capture.rs:911 | 400 ms | log | unknown | same |
+| send-failure log debounce `DUR` | src/capture.rs:595 | 500 ms | log | unknown | log noise |
 | `REPLY_TIMEOUT` | src/cli.rs:58 | 5 s | log | > `FOCUS_TIMEOUT` | CLI hang vs. slow service |
 | `COUNT_TIMEOUT` | src/cli.rs:272 | 500 ms | log | unknown | `doctor`/`discover` start delay vs. counting the command |
 | `GRACE` | src/approval.rs:25 | 2 s | log | unknown; a portal restoring a saved grant answers within it | false "waiting for approval" reports vs. late ones |
@@ -133,7 +134,7 @@ Constants stay compiled `const`: they sit on the input path or are read once, so
 | `REFUSED_WARN_INTERVAL` (Windows) | input-emulation/src/windows.rs:248 | 10 s | log | unknown | log noise |
 | `STARTUP_TIMEOUT` (wlroots) | input-emulation/src/wlroots.rs:50 | 5 s | log | unknown | |
 | `RELEASE_TIMEOUT` (wlroots) | input-emulation/src/wlroots.rs:56 | 1 s | log | unknown; bounds shutdown, which awaits the emulation task | a slow compositor's dropped release vs. a stalled backend restart |
-| `WAIT` (Windows end session) | src/service.rs:1176 | 2 s | log | unknown; Windows may end the process once WM_ENDSESSION returns | cleanup (key-ups to the peer) at logoff/shutdown vs. holding up the session end |
+| `WAIT` (Windows end session) | src/service.rs:1183 | 2 s | log | unknown; Windows may end the process once WM_ENDSESSION returns | cleanup (key-ups to the peer) at logoff/shutdown vs. holding up the session end |
 | `MAX_CLICKS` (X11 scroll) | input-emulation/src/x11.rs:23 | 16 per event | log | unknown | hostile values vs. fast scrolling |
 | `MAX_FRAME` (agent) | src/agent/proto.rs:25 | 64 MiB | log | > base64 `MAX_CLIPBOARD_SIZE` + 4 KiB (assert src/agent/proto.rs:27) | screenshots and clipboard blobs vs. memory per frame |
 | `Observe::DEFAULT_SETTLE_MS` / `DEFAULT_TIMEOUT_MS` / `MAX_TIMEOUT_MS` | src/agent/proto.rs:250-253 | 300 / 3000 / 30000 ms | log | `MAX_TIMEOUT_MS` is part of `IPC_REPLY_TIMEOUT` | screen settle wait vs. observe latency |

@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    collections::HashSet,
     time::{Duration, Instant},
 };
 
@@ -81,7 +82,8 @@ pub(crate) enum CaptureType {
     Default,
     /// A capture only interested in [`CaptureEvent::Begin`] events.
     /// The capture is released immediately, if there is no
-    /// Default capture at the same position.
+    /// Default capture at the same position or its peer controls this
+    /// machine (see [`Capture::set_returning`]).
     EnterOnly,
 }
 
@@ -101,6 +103,9 @@ enum CaptureRequest {
     Focus(CaptureHandle),
     /// set the hotkeys
     SetHotkeys(Hotkeys),
+    /// the peer of an enter-only capture controls this machine (or no
+    /// longer does)
+    Returning(CaptureHandle, bool),
 }
 
 impl Capture {
@@ -141,6 +146,7 @@ impl Capture {
             hotkeys: Hotkeys::default(),
             pending_focus: None,
             release_bind,
+            returning: Default::default(),
             ctrl_taps: Default::default(),
             enter_at: None,
             state: Default::default(),
@@ -215,6 +221,16 @@ impl Capture {
             .send(CaptureRequest::SetHotkeys(hotkeys))
             .expect("channel closed");
     }
+
+    /// `returning`: the peer behind the enter-only capture `handle`
+    /// controls this machine. Until it stops, a crossing at that edge only
+    /// gives control back to it; it does not enter the client there, which
+    /// would take the input of whoever is using this machine.
+    pub(crate) fn set_returning(&self, handle: CaptureHandle, returning: bool) {
+        self.request_tx
+            .send(CaptureRequest::Returning(handle, returning))
+            .expect("channel closed");
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -253,6 +269,8 @@ struct CaptureTask {
     hotkey_watch: HotkeyWatch,
     /// a focus waiting for its `Begin`
     pending_focus: Option<PendingFocus>,
+    /// enter-only captures whose peer controls this machine
+    returning: HashSet<CaptureHandle>,
     ctrl_taps: CtrlDoubleTap,
     /// where the cursor crossed into the active client, if the backend knows
     enter_at: Option<u16>,
@@ -273,6 +291,16 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        self.returning.remove(&handle);
+    }
+
+    fn set_returning(&mut self, handle: CaptureHandle, returning: bool) {
+        let enter_only = self.get_capture(handle).map(|(_, t)| t) == Some(CaptureType::EnterOnly);
+        if returning && enter_only {
+            self.returning.insert(handle);
+        } else {
+            self.returning.remove(&handle);
+        }
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
@@ -303,6 +331,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => self.release_bind = bind,
                         CaptureRequest::SetHotkeys(hotkeys) => self.hotkeys = hotkeys,
                         CaptureRequest::Focus(h) => self.focus_done(h, Err("input capture is disabled".into())),
+                        CaptureRequest::Returning(h, r) => self.set_returning(h, r),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -360,6 +389,9 @@ impl CaptureTask {
                 r = capture.create(handle, pos, range, enter_only) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
+        }
+        for &handle in &self.returning {
+            capture.set_returning(handle, true);
         }
         Ok(())
     }
@@ -433,6 +465,10 @@ impl CaptureTask {
                         self.apply_hotkeys(capture).await?;
                     }
                     CaptureRequest::Focus(h) => self.focus(capture, h).await?,
+                    CaptureRequest::Returning(h, r) => {
+                        self.set_returning(h, r);
+                        capture.set_returning(h, r);
+                    }
                 },
                 _ = sleep_until(focus_deadline.unwrap_or_else(tokio::time::Instant::now)),
                     if focus_deadline.is_some() => self.focus_timed_out(capture),
@@ -489,9 +525,13 @@ impl CaptureTask {
 
         // enter only capture (for incoming connections)
         if capture_type == CaptureType::EnterOnly {
-            // if there is no active outgoing connection at the current capture,
-            // we release the capture
-            if !self.is_default_capture_at(pos) {
+            if self.returning.remove(&handle) {
+                // the service tells the peer to leave (`CaptureBegin`)
+                log::info!("releasing capture: giving control back to the controlling peer");
+                capture.set_returning(handle, false);
+                capture.release().await?;
+            } else if !self.is_default_capture_at(pos) {
+                // no active outgoing connection at this position
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -1366,6 +1406,7 @@ mod tests {
                 keys: vec![],
                 double_tap_ctrl: false,
             },
+            returning: Default::default(),
             ctrl_taps: Default::default(),
             enter_at: None,
             state: Default::default(),
@@ -1479,6 +1520,42 @@ mod tests {
                     focus_results(&mut events),
                     [Err("capture for client 1 did not start".to_string())]
                 );
+            })
+            .await;
+    }
+
+    /// a crossing back to the peer controlling this machine gives control
+    /// back once (the backend's release fails here, which shows it was
+    /// attempted) and enters no client
+    #[tokio::test]
+    async fn crossing_back_to_the_controlling_peer_only_releases() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let Harness {
+                    mut task,
+                    mut capture,
+                    mut events,
+                    ..
+                } = harness().await;
+                task.add_capture(2, Position::Left, CaptureType::EnterOnly, None);
+                capture
+                    .create(2, Position::Left, None, true)
+                    .await
+                    .expect("create");
+                task.set_returning(2, true);
+                capture.set_returning(2, true);
+                let begin = (2, CaptureEvent::Begin(None));
+                let r = task.handle_capture_event(&mut capture, begin).await;
+                assert!(r.is_err(), "not released");
+                assert_eq!(task.active_client, None);
+                assert!(matches!(
+                    events.recv().now_or_never().flatten(),
+                    Some(ICaptureEvent::CaptureBegin(2))
+                ));
+                // the peer was told to leave: a crossing beside client 1
+                // is client 1's again
+                let r = task.handle_capture_event(&mut capture, begin).await;
+                assert!(r.is_ok(), "{r:?}");
             })
             .await;
     }
