@@ -43,6 +43,8 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Malformed datagrams, DTLS certificate chains and IPC requests are rejected instead of panicking. Event streams of a destroyed capture are dropped. Windows drops input that `SendInput` refuses instead of retrying it forever.
 - Clipboard: updates arrive in order, the newest wins, and file names are de-duplicated after Windows sanitizing.
 
+- GNOME: clipboard sharing no longer stops for good when the portal refuses a new session for a while (mutter: `Session creation inhibited`); it retries every 10 s. Only a denied dialog still needs a service restart.
+- Windows: clipboard monitoring that fails is restarted every 10 s instead of leaving local copies unshared until the service restarts.
 ### Security
 
 - The certificate key `mimouse.pem` is owner-only (0600, or an owner-only DACL on Windows), and looser permissions are repaired at startup.

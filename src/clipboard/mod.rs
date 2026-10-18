@@ -18,6 +18,7 @@
 //! The receiving peer must have authorized the sender's certificate
 //! fingerprint; the sender accepts the receiver its client is pinned to.
 
+mod backend;
 pub(crate) mod files;
 mod transport;
 mod wire;
@@ -413,6 +414,7 @@ type StatusTx = watch::Sender<ClipboardStatus>;
 
 // no backend reports changes on macOS yet
 #[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Debug, PartialEq)]
 enum LocalChange {
     /// the clipboard changed at the given time (when the backend noticed
     /// it, before reading it): the contents to send (empty for a clear),
@@ -421,21 +423,6 @@ enum LocalChange {
     Changed(Instant, Option<Arc<ClipboardData>>),
     /// the contents when the backend started; not sent
     Startup(Arc<ClipboardData>),
-}
-
-impl LocalChange {
-    /// what to report for contents read at startup (`changed` is `None`) or
-    /// after a change noticed at `changed` (`data` as for `Changed`): the
-    /// contents at startup are not sent, and a clipboard empty at startup
-    /// was not cleared by anyone
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    fn read(changed: Option<Instant>, data: Option<ClipboardData>) -> Option<Self> {
-        let data = data.map(Arc::new);
-        match changed {
-            Some(at) => Some(Self::Changed(at, data)),
-            None => data.filter(|data| !data.is_empty()).map(Self::Startup),
-        }
-    }
 }
 
 /// contents to set locally, and when the connection that brought them was
@@ -476,8 +463,6 @@ fn set_channel() -> (BackendTx, SetRx) {
 impl SetRx {
     /// the backend noticed a local change at `at` (before reading it):
     /// updates accepted before are older and not set
-    // the Windows writer checks under its clipboard lock instead
-    #[cfg_attr(windows, allow(dead_code))]
     fn noticed(&mut self, at: Instant) {
         self.local = self.local.max(Some(at));
     }
@@ -497,9 +482,24 @@ impl SetRx {
         }
     }
 
-    #[cfg(windows)]
-    fn blocking_recv(&mut self) -> Option<SetRequest> {
-        futures::executor::block_on(self.recv())
+    /// waits `delay`, keeping contents received meanwhile for `recv`;
+    /// false once the clipboard task is gone
+    async fn keep_for(&mut self, delay: std::time::Duration) -> bool {
+        let mut sleep = std::pin::pin!(tokio::time::sleep(delay));
+        let mut received = false;
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                changed = self.rx.changed() => match changed {
+                    Ok(()) => received = true,
+                    Err(_) => return false,
+                },
+            }
+        }
+        if received {
+            self.rx.mark_changed();
+        }
+        true
     }
 }
 
@@ -971,30 +971,6 @@ mod tests {
         assert_eq!(set.data, text("newer"));
     }
 
-    /// B21: the backend noticed a copy the task has not heard of yet; an
-    /// update accepted before it is not set, one accepted after it is
-    #[test]
-    fn backend_does_not_set_an_update_older_than_its_copy() {
-        let (backend, mut set) = set_channel();
-        let accepted = Instant::now();
-        let copied = accepted + std::time::Duration::from_millis(1);
-        set.noticed(copied);
-
-        let older = SetRequest {
-            data: text("slow"),
-            accepted,
-        };
-        backend.send_replace(Some(older));
-        assert_eq!(set.recv().now_or_never(), None, "older update set");
-
-        let newer = SetRequest {
-            data: text("newer"),
-            accepted: copied,
-        };
-        backend.send_replace(Some(newer.clone()));
-        assert_eq!(set.recv().now_or_never(), Some(Some(newer)));
-    }
-
     /// C6: of the updates received before the backend reads, only the
     /// latest is set; the backend ending is still noticed
     #[tokio::test]
@@ -1054,16 +1030,11 @@ mod tests {
                 let mut task = task();
                 let handle = task.client_manager.add_client();
                 task.client_manager.activate_client(handle);
-                assert!(LocalChange::read(None, None).is_none());
-                assert!(LocalChange::read(None, Some(Default::default())).is_none());
-
-                let startup = LocalChange::read(None, Some((*text("old")).clone()));
-                task.local_changed(startup.expect("seed"));
+                task.local_changed(LocalChange::Startup(text("old")));
                 task.update_if_stale(handle);
                 assert!(task.senders.is_empty(), "startup contents sent");
 
-                let again = LocalChange::read(Some(Instant::now()), Some((*text("old")).clone()));
-                task.local_changed(again.expect("change"));
+                task.local_changed(LocalChange::Changed(Instant::now(), Some(text("old"))));
                 assert!(task.senders.contains_key(&handle), "copy not sent");
             })
             .await;
