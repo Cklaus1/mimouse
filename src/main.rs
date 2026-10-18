@@ -79,8 +79,11 @@ where
         .enable_time()
         .build()?;
 
-    // run async event loop
-    Ok(runtime.block_on(LocalSet::new().run_until(f))?)
+    // run async event loop; tasks still on the LocalSet are dropped with it,
+    // and some drops (zbus) spawn onto the runtime, so drop it inside it
+    let _context = runtime.enter();
+    let local = LocalSet::new();
+    Ok(runtime.block_on(local.run_until(f))?)
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {

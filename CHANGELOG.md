@@ -49,6 +49,7 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - GNOME (Wayland): with no `emulation_backend` configured, emulation no longer falls back to X11 on Xwayland when the portal refuses it (e.g. while the screen is locked). GNOME's Xwayland asked to share the desktop again and again for it; emulation now retries libei until the desktop accepts.
 - GNOME: stopping the service no longer hangs while the input capture dialog is waiting for approval.
 - Input the capture backend still held when control returned is no longer sent to the peer after it was released.
+- Linux: the service no longer aborts with a core dump when it stops (a portal connection dropped after the event loop had ended).
 
 ### Security
 
