@@ -49,14 +49,17 @@ Status (2026-10-18, `main` b39f6d8): P0 done; nothing of P1/P2 is implemented. R
 ### P1 (requires A1, A3)
 
 **C1 Agent channel.** [REVISED 2026-10-18: own ALPN instead of generalizing the clipboard frames.] A sibling of `pair::is_pairing` in `transport::listen` routes ALPN `mimouse-agent/1` to an agent handler with its own `ServerConfig`, served also with clipboard off and from `listen_only`. One TLS connection per session; versioned typed request/response frames (`len u32 | version u8 | type u8 | body`): `Hello` (capabilities, K1), `Session{open,close}`, `Key`, `Text`, `PointerTo`, `PointerMove`, `Button`, `Scroll`, `Screenshot`, `Geometry`, `ClipGet`, `ClipSet`, `UiTree` (P2). Fingerprint re-checked like clipboard (`Policy::check` every `REVOCATION_CHECK`); counts against `MAX_CONNECTIONS`. Clipboard (no ALPN) and pairing frames stay byte-identical.
+[REVISED 2026-10-18 build: frames are one JSON object each (`len u32 BE | JSON`), requests tagged `op`, responses tagged `result`, binary as base64 (`src/agent/proto.rs`); simpler than per-type binary frames for 33 % on images. The version travels in `Hello`. `Geometry` folds into `Hello`; `Session{open,close}` = `open`/`close`; `UiTree` stays P2. Actions open a session implicitly; `open` only adds a reason.]
 Accept: existing clipboard and pairing smoke pass unchanged; an unknown request type returns an error frame, not a dropped connection; revoking the requester's fingerprint ends its session within 1 s.
 
 **A2 Grants and preemption** (ships with C1 + A5). Per-peer grants on the target, `[agent]` table keyed by fingerprint plus `[agent.self]`: `input`, `screen`, `clipboard` = `"deny" | "ask" | "allow"` (default `deny`, D6; `ask` = K4 prompt). Validated in `ConfigToml::validate`, live-reloaded. A session ends (handle destroyed, keys released, `preempted` to the requester) on physical input on the target, `release_bind`, Ctrl double-tap, capture starting (D11), or `agent_idle_timeout` (default 30 s).
-- Windows: agent `SendInput` tagged `dwExtraInfo = AGENT_TAG`; the LL hooks treat untagged `LLMHF_INJECTED`/`LLKHF_INJECTED` events from other software as non-physical and tagged ones as the agent's, everything else as physical.
-- Linux, macOS: S1.
+[REVISED 2026-10-18 build: `ask` deferred with K4; grants are `deny|allow`. Config shape: `[agent] idle_timeout`, `[agent.self]`, `[agent.peers."<fingerprint>"]`. A peer needs both `authorized_fingerprints` and a grant.]
+- Windows: a dedicated LL hook thread while sessions exist; events without `LLMHF_INJECTED`/`LLKHF_INJECTED` are physical. [REVISED 2026-10-18 build: no `AGENT_TAG` needed: all injected input is non-physical, and an agent racing another injector is not a person.]
+- macOS: listen-only event tap, physical = source state `HIDSystemState` (unverified on hardware).
+- Linux: heuristic (S1 outcome): the session idle time (Mutter `IdleMonitor`) falling below the time since the agent's last injection minus a slack means a person. Masked while the agent injects continuously; `release_bind`/Ctrl double-tap and peer KVM input still preempt.
 Accept: a request without the grant is rejected by the target and nothing is injected; with a session streaming motion, physical mouse movement on the target ends it within 100 ms; `cli focus` on the target ends its agent session.
 
-**A5 Session.** `cli session open <target>` / `close`. Opening sends `Hello`, validates grants on the target, allocates an emulation handle from `next_id` keyed by session (not address) and starts A2 monitoring and the K7 inhibit. An agent session never moves the person's control: it is not a crossing and does not call `Focus`. [REVISED: reconciles opportunities.md:3; `cli focus` is the human switch, sessions are separate.]
+**A5 Session.** `cli agent open [-t target] [--reason r]` / `close`. [REVISED 2026-10-18 build: CLI is `mimouse cli agent <verb> [-t target]`, default target `self`; actions open a session implicitly.] Opening sends `Hello`, validates grants on the target, allocates an emulation handle from `next_id` keyed by session (not address) and starts A2 monitoring and the K7 inhibit. An agent session never moves the person's control: it is not a crossing and does not call `Focus`. [REVISED: reconciles opportunities.md:3; `cli focus` is the human switch, sessions are separate.] [REVISED 2026-10-18 build: K7 inhibit deferred with K7; the target shows a notice at session start and end (D8).]
 Accept: `watch` shows `agent_session started/ended/preempted` on both ends; closing releases everything the session held.
 
 **A6 Input.** `cli key <chord>`, `cli move <dx> <dy>`, `cli click [button] [--double]`, `cli scroll <dy>`, injected by the target's emulation backend under the session's handle (so `normalize` tracks and releases held input).
@@ -69,16 +72,16 @@ Accept: `grüße ✓` arrives exactly on Windows; on GNOME, characters in the ac
 Accept: text and PNG round-trip byte-identical between two machines and on `self`; a secret-marked local copy reads as `not_shared`.
 
 **V1 Screenshot + geometry.** `cli screenshot <target> [--monitor n] [--region x,y,w,h] [--max-edge px] [--format png|jpeg] -o file` returns the image plus geometry (monitors, origin, physical size, scale, applied downscale factor).
-- Windows: GDI BitBlt per monitor from a per-monitor-DPI-aware-v2 thread (S3).
-- GNOME: ScreenCast source on the libei emulation's RemoteDesktop session (one consent, `remote-desktop.token` reused), one PipeWire frame (D7). Adds `libpipewire-0.3` to the rpm requires.
-- wlroots: `wlr-screencopy`. X11: `XGetImage`. macOS: ScreenCaptureKit (Screen Recording permission, asked only by `macos_permissions`).
+- Windows: GDI BitBlt of the virtual screen from a per-monitor-DPI-aware-v2 thread (S3).
+- Linux: [REVISED 2026-10-18 build, D7] the xdg-desktop-portal Screenshot API (`interactive=false`), silent for an unsandboxed caller on GNOME 50 (S2), also KDE, wlroots (xdpw) and X11 desktops with a portal. No PipeWire, no `wlr-screencopy`/`XGetImage`.
+- macOS: `/usr/sbin/screencapture -x` (Screen Recording permission, asked only by `macos_permissions`; not hardware-verified).
 - Locked or secure desktop: returns `unavailable` with the state, never a stale frame.
 Accept: on megapc (mixed-DPI 4880×2560 virtual desktop) a screenshot's pixel at a known window corner matches `Geometry`; `screen = deny` returns an error and captures nothing.
 
 **V2 Absolute pointer.** [REVISED: the per-backend absolute code exists for `enter_at`; V2 generalizes it.] `cli pointer-to <target> <x> <y>` in V1 coordinates. New `Emulation::pointer_to(handle, x, y)` sharing each backend's `enter_at` path: libei `PointerAbsolute` (regions give the logical scale), wlroots `motion_absolute`, X11 XTest, Windows `SendInput` absolute normalized to the virtual desk (tagged, A2) instead of `SetCursorPos`, macOS CG. `xdp` fallback: `unsupported` in K1.
 Accept: `pointer-to` the centre of a button found in a V1 screenshot, then `click`, activates that button on Windows and GNOME (D4).
 
-**A9 MCP server.** `mimouse mcp` over stdio, forwarding to the local service over IPC (D5, D9). Tools: `list_targets` (K1), `session_open`, `session_close`, `screenshot` (image content block, downscaled to `--max-edge`, default 1568 px, coordinates mapped back), `pointer_to`, `click`, `key`, `type`, `scroll`, `clip_get`, `clip_set`, `request_human` (K6), `ui_tree` (P2). Action tools take `observe` (K2). Tool annotations: `readOnlyHint` on `list_targets`/`screenshot`/`clip_get`, `destructiveHint` on input tools. No HTTP transport.
+**A9 MCP server.** `mimouse mcp` over stdio, forwarding to the local service over IPC (D5, D9). Tools: `list_targets` (K1), `session_open`, `session_close`, `screenshot` (image content block, downscaled to `--max-edge`, default 1568 px, coordinates mapped back), `pointer_to`, `click`, `key`, `type`, `scroll`, `clip_get`, `clip_set`. Action tools take `observe` (K2). Tool annotations: `readOnlyHint` on `list_targets`/`screenshot`/`clip_get`, `destructiveHint` on input tools. No HTTP transport. [REVISED 2026-10-18 build: `request_human` deferred with K6, `ui_tree` with P2.]
 Accept: an MCP client completes "screenshot → pointer_to → click → screenshot" on a peer; `deny`, `preempted` and `unavailable` surface as tool errors with a reason the model can act on.
 
 **K1 Capabilities and state.** `Hello`/`cli targets --json`/`list_targets` return per target: OS, desktop, backends, monitors, grants for this requester, capabilities (screen, absolute pointer, exact text, clipboard, UI tree) and state (locked, secure desktop, display off, capturing, person active in the last N s, session held by another requester). Agents pick a strategy instead of discovering failures one call at a time.
@@ -91,18 +94,23 @@ Accept: `click --observe` returns a frame showing the click's effect on a menu t
 Accept: a 4880×2560 megapc frame arrives at ≤1568 px wide with factor 3.11; a click at the downscaled centre of a button lands on it.
 
 **K4 Person in the loop on the target.** Grant value `ask`: `session open` shows a notice on the target ("<requester> wants input/screen for <reason>") and waits up to 60 s for the person to accept with `release_bind` or `mimouse cli agent accept`; no answer = deny. While a session is open the target shows an indicator (D8) and `mimouse cli agent off` refuses all agent sessions until `agent on`.
+[REVISED 2026-10-18 build: deferred (user's build order); not in this build.]
 Accept: with `input = "ask"`, an unattended target denies after 60 s and injects nothing; `agent off` ends an open session within 100 ms.
 
 **K5 Time-boxed grants.** `mimouse cli agent grant <peer|self> <input|screen|clipboard> [--for 30m]` writes the grant through `Config::save` with an expiry; expired grants read as `deny` and the expiry is audited.
+[REVISED 2026-10-18 build: deferred.]
 Accept: a 1-minute grant stops accepting requests after 60 s without a restart.
 
 **K6 Handoff to a person.** `request_human(reason)` shows a notice on the target (CAPTCHA, 2FA, payment) and returns when the person signals done (`cli agent resume` or `release_bind` twice) or after a timeout; after `preempted`, the requester gets `resumable` once the target has seen no physical input for `agent_resume_idle` (default 10 s).
+[REVISED 2026-10-18 build: deferred.]
 Accept: an MCP `request_human` call blocks until `cli agent resume` on the target, then the next action succeeds without reopening the session.
 
 **K7 Keep the target usable.** An open session holds the target's idle inhibit (`inhibit.rs`) so the screen doesn't lock mid-task; released with the session (`RELEASE_DELAY`).
+[REVISED 2026-10-18 build: deferred.]
 Accept: a 20-minute session on a target with a 5-minute lock timeout stays unlocked; the inhibit is gone 5 s after close.
 
 **K8 Agent telemetry.** Counters only, in `telemetry::COUNTERS`: sessions, actions by type, preemptions, denials, handoffs; schema bump per the telemetry rules. Never targets, text, coordinates or images.
+[REVISED 2026-10-18 build: deferred.]
 Accept: the no-PII test covers the new fields.
 
 ### P2
@@ -124,10 +132,10 @@ Accept: the no-PII test covers the new fields.
 
 ## Spikes
 
-- **S1** Physical vs synthetic input on the target for Linux (GNOME/libei, wlroots, X11) and macOS (`CGEventSourceStateID`, event source user data). Output: a mechanism per OS, or A2 preemption on that OS degraded to `release_bind` + idle timeout + K4 indicator.
-- **S2** GNOME Screenshot portal for an unsandboxed daemon: does `interactive=false` work without a per-call dialog. Decides the D7 fallback.
+- **S1** Physical vs synthetic input on the target for Linux (GNOME/libei, wlroots, X11) and macOS (`CGEventSourceStateID`, event source user data). Output: a mechanism per OS, or A2 preemption on that OS degraded to `release_bind` + idle timeout + K4 indicator. [REVISED 2026-10-18 build: Linux uses the idle-time heuristic in A2 (no per-event source exists for EI/portal input); macOS the source state id.]
+- **S2** GNOME Screenshot portal for an unsandboxed daemon: does `interactive=false` work without a per-call dialog. Decides the D7 fallback. [RESOLVED 2026-10-18 on gpumaster, GNOME 50: silent; first call 6.1 s, then 0.5 s; the portal writes `~/Pictures/Screenshot*.png` (whole desktop), which the caller reads and deletes.]
 - **S3** Windows mixed DPI: BitBlt, `SendInput` absolute and `EnumDisplayMonitors` agree on megapc's virtual desktop from a per-monitor-DPI-aware-v2 thread.
-- **S4** GNOME: a ScreenCast source selected on the libei emulation's RemoteDesktop session keeps `connect_to_eis` working and restores without a dialog from `remote-desktop.token`.
+- **S4** [DROPPED 2026-10-18: D7 uses the Screenshot portal.] GNOME: a ScreenCast source selected on the libei emulation's RemoteDesktop session keeps `connect_to_eis` working and restores without a dialog from `remote-desktop.token`.
 
 ## Decisions
 
@@ -139,8 +147,8 @@ Accept: the no-PII test covers the new fields.
 | D4 | Absolute pointer | approximate via relative moves; real absolute via OS APIs | Real absolute, generalizing `enter_at` (V2) | engineering |
 | D5 | MCP implementation | hand-rolled over `serde_json`; SDK crate (`rmcp`) | Hand-rolled: ~14 tools, stdio only, no new dependency; revisit if MCP features beyond tools (resources, elicitation) are needed | engineering |
 | D6 | Default grants | `deny`; `allow` | **Decided:** `deny` for every grant, opt-in per peer and `self` | decided |
-| D7 | GNOME screen capture | ScreenCast + PipeWire on the emulation RemoteDesktop session; Screenshot portal | ScreenCast (S4): repeated silent frames under one consent. [REVISED: no longer needed for V2, libei already places absolutely; Screenshot portal is viable if S2 shows no per-call dialog and avoids the PipeWire dependency] | engineering |
-| D8 | Visible indicator while an agent session is open | none (audit only); notice per session; persistent indicator | Notice at session start and end on every OS (`notify.rs` exists: Linux notification, Windows tray balloon, macOS), plus the Windows tray icon tooltip while open | needs-human |
+| D7 | GNOME screen capture | ScreenCast + PipeWire on the emulation RemoteDesktop session; Screenshot portal | **Decided 2026-10-18:** Screenshot portal on all Linux desktops (S2 silent; no PipeWire dependency; ~0.5 s per frame is enough for agent steps) | decided |
+| D8 | Visible indicator while an agent session is open | none (audit only); notice per session; persistent indicator | **Decided 2026-10-18 (user):** a notice when a session starts and ends, on every OS (`notify.rs`); no tray tooltip | decided |
 | D9 | Agent interface | MCP only; CLI only; HTTP/REST API; gRPC/JSON-RPC SDK; layered | **Layered:** typed IPC requests are the API; `cli --json` and `mimouse mcp` (stdio) are thin adapters; action names match computer-use tools. No HTTP (a local port is reachable by browsers and other users, the reason A1 removed TCP 5252) and no gRPC (no agent host speaks it, adds protobuf/HTTP2) | engineering |
 | D10 | Coordinate space | logical px; physical px; per-request space | Target screenshot pixels (physical); target converts; adapters undo their downscale | engineering |
 | D11 | Agent input while the target is sending | allow; refuse | Refuse, and end the session when capture starts (sending-or-receiving invariant) | engineering |
