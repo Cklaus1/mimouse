@@ -29,6 +29,9 @@ once_cell = "1.19.0"
 async-trait = "0.1.81"
 tokio-util = "0.7.11"
 
+[dev-dependencies]
+# paused clock (`start_paused`) for timing tests
+tokio = { version = "1.32.0", features = ["test-util"] }
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 wayland-client = { version = "0.31.1", optional = true }

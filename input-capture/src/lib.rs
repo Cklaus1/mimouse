@@ -37,6 +37,11 @@ mod dummy;
 #[cfg(any(libei, layer_shell, windows, target_os = "macos", test))]
 mod geometry;
 
+#[cfg(test)]
+mod contract;
+#[cfg(test)]
+mod testing;
+
 pub type CaptureHandle = u64;
 
 /// `dwExtraInfo` of the zero-length mouse move that mimouse injects on
@@ -741,181 +746,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use input_event::PointerEvent;
-
     use super::*;
-
-    /// what the test backend saw and will report
-    #[derive(Default)]
-    struct Shared {
-        events: VecDeque<(Position, CaptureEvent)>,
-        barriers: HashMap<Position, Option<EdgeRange>>,
-    }
-
-    struct TestCapture(Arc<Mutex<Shared>>);
-
-    #[async_trait]
-    impl Capture for TestCapture {
-        async fn create(
-            &mut self,
-            pos: Position,
-            range: Option<EdgeRange>,
-        ) -> Result<(), CaptureError> {
-            self.0.lock().unwrap().barriers.insert(pos, range);
-            Ok(())
-        }
-
-        async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-            self.0.lock().unwrap().barriers.remove(&pos);
-            Ok(())
-        }
-
-        async fn release(&mut self) -> Result<(), CaptureError> {
-            Ok(())
-        }
-
-        async fn focus(&mut self, _: Position, _: Option<EdgeRange>) -> Result<(), CaptureError> {
-            Ok(())
-        }
-
-        async fn set_hotkeys(&mut self, _: Vec<(Chord, Position)>) -> Result<(), CaptureError> {
-            Ok(())
-        }
-
-        async fn terminate(&mut self) -> Result<(), CaptureError> {
-            Ok(())
-        }
-    }
-
-    impl Stream for TestCapture {
-        type Item = Result<(Position, CaptureEvent), CaptureError>;
-
-        fn poll_next(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.0.lock().unwrap().events.pop_front().map(Ok))
-        }
-    }
-
-    fn input_capture() -> (InputCapture, Arc<Mutex<Shared>>) {
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let capture = InputCapture::with_backend(Box::new(TestCapture(shared.clone())));
-        (capture, shared)
-    }
-
-    const MOTION: CaptureEvent = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
-        time: 0,
-        dx: 1.,
-        dy: 1.,
-    }));
-
-    #[tokio::test]
-    async fn destroyed_id_never_yields_queued_event() {
-        let (mut capture, shared) = input_capture();
-        capture
-            .create(0, Position::Left, None, false)
-            .await
-            .unwrap();
-        capture
-            .create(1, Position::Left, None, false)
-            .await
-            .unwrap();
-        shared
-            .lock()
-            .unwrap()
-            .events
-            .push_back((Position::Left, MOTION));
-
-        // one id gets the event now, the other's copy is queued
-        let (first, _) = capture.next().await.unwrap().unwrap();
-        let other = 1 - first;
-        capture.destroy(other).await.unwrap();
-
-        let mut yielded = Vec::new();
-        while let Some(event) = capture.next().await {
-            yielded.push(event.unwrap().0);
-        }
-        assert!(!yielded.contains(&other), "{yielded:?}");
-
-        // the caller recovers: the next event reaches the live id
-        shared
-            .lock()
-            .unwrap()
-            .events
-            .push_back((Position::Left, MOTION));
-        assert_eq!(capture.next().await.unwrap().unwrap(), (first, MOTION));
-    }
-
-    #[tokio::test]
-    async fn enter_only_keeps_default_range_and_input() {
-        let (mut capture, shared) = input_capture();
-        let range = EdgeRange::new(0, 40);
-        capture
-            .create(0, Position::Left, range, false)
-            .await
-            .unwrap();
-        capture.create(1, Position::Left, None, true).await.unwrap();
-        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], range);
-
-        // the crossing reaches both, the input only the Default id
-        let begin = CaptureEvent::Begin(None);
-        shared
-            .lock()
-            .unwrap()
-            .events
-            .extend([(Position::Left, begin), (Position::Left, MOTION)]);
-        let mut yielded = Vec::new();
-        while let Some(event) = capture.next().await {
-            yielded.push(event.unwrap());
-        }
-        assert_eq!(yielded, [(0, begin), (1, begin), (0, MOTION)]);
-
-        // the Default id gone, the enter-only id gets the whole edge back
-        capture.destroy(0).await.unwrap();
-        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], None);
-    }
-
-    #[tokio::test]
-    async fn enter_only_alone_keeps_whole_edge() {
-        let (mut capture, shared) = input_capture();
-        capture.create(1, Position::Left, None, true).await.unwrap();
-        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], None);
-        shared
-            .lock()
-            .unwrap()
-            .events
-            .push_back((Position::Left, MOTION));
-        assert_eq!(capture.next().await.unwrap().unwrap(), (1, MOTION));
-
-        // a Default id joining narrows it to its range
-        let range = EdgeRange::new(0, 40);
-        capture
-            .create(0, Position::Left, range, false)
-            .await
-            .unwrap();
-        assert_eq!(shared.lock().unwrap().barriers[&Position::Left], range);
-    }
-
-    #[tokio::test]
-    async fn release_drops_queued_input() {
-        let (mut capture, shared) = input_capture();
-        // two enter-only ids: both get the input, one copy is queued
-        capture.create(0, Position::Left, None, true).await.unwrap();
-        capture.create(1, Position::Left, None, true).await.unwrap();
-        shared
-            .lock()
-            .unwrap()
-            .events
-            .push_back((Position::Left, MOTION));
-        capture.next().await.unwrap().unwrap();
-
-        // input of the released capture never reaches the caller after it
-        capture.release().await.unwrap();
-        assert_eq!(capture.next().await.map(Result::unwrap), None);
-    }
 
     /// T5: a configured backend is reported as configured and never
     /// replaced; without one, the first auto backend that works is
