@@ -1,4 +1,5 @@
-//! Where the pointer appears when a remote cursor enters this desktop.
+//! Where the pointer appears when a remote cursor enters this desktop, and
+//! where an agent's desktop pixels are in the backend's units.
 
 use std::fmt::{self, Display};
 
@@ -24,14 +25,14 @@ impl Display for Edge {
 }
 
 /// A display in desktop coordinates, in the unit the backend positions the
-/// pointer with (physical pixels on Windows, logical pixels on Wayland and
-/// macOS).
+/// pointer with (physical pixels on Windows, logical pixels on Wayland,
+/// points on macOS).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Rect {
-    pub(crate) x: i32,
-    pub(crate) y: i32,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// Distance kept from the entered edge: the local capture for the side the
@@ -99,6 +100,45 @@ pub(crate) fn entry_point(displays: &[Rect], edge: Edge, fraction: u16) -> Optio
         Edge::Left | Edge::Right => (across, along),
         Edge::Top | Edge::Bottom => (along, across),
     })
+}
+
+/// The bounding box of the displays with an area, `None` without one.
+pub(crate) fn bounds(displays: &[Rect]) -> Option<Rect> {
+    let displays = || displays.iter().filter(|d| d.width > 0 && d.height > 0);
+    let left = displays().map(|d| d.x).min()?;
+    let top = displays().map(|d| d.y).min()?;
+    let right = displays().map(|d| d.x + d.width).max()?;
+    let bottom = displays().map(|d| d.y + d.height).max()?;
+    Some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+/// The point at `(x, y)` of a desktop `size` (W, H) pixels large, mapped
+/// uniformly onto the bounding box B of `displays`:
+/// `B.x + x * B.width / W`, `B.y + y * B.height / H`, clamped inside B.
+/// `None` without a display with an area or for an empty desktop.
+pub(crate) fn desktop_to_backend(
+    displays: &[Rect],
+    x: i32,
+    y: i32,
+    size: (u32, u32),
+) -> Option<(i32, i32)> {
+    let (w, h) = size;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let b = bounds(displays)?;
+    let map = |at: i32, len: u32, start: i32, extent: i32| {
+        let offset = (i64::from(at) * i64::from(extent)).div_euclid(i64::from(len));
+        let offset = offset.clamp(0, i64::from(extent) - 1);
+        // within 0..extent, so in i32 range
+        start + offset as i32
+    };
+    Some((map(x, w, b.x, b.width), map(y, h, b.y, b.height)))
 }
 
 #[cfg(test)]
@@ -183,6 +223,68 @@ mod tests {
         assert_eq!(
             entry_point(&[rect(5, 0, 1, 100)], Edge::Left, u16::MAX),
             Some((5, 99))
+        );
+    }
+
+    #[test]
+    fn equal_sizes_map_to_the_shifted_identity() {
+        // Windows: physical pixels both ways, virtual screen left of and
+        // above 0
+        let d = [rect(-1280, -200, 1280, 1024), rect(0, 0, 1920, 1080)];
+        let size = (3200, 1280);
+        assert_eq!(desktop_to_backend(&d, 0, 0, size), Some((-1280, -200)));
+        assert_eq!(desktop_to_backend(&d, 1280, 200, size), Some((0, 0)));
+        assert_eq!(desktop_to_backend(&d, 3199, 1279, size), Some((1919, 1079)));
+    }
+
+    #[test]
+    fn scaled_desktops_map_uniformly() {
+        // macOS retina: a 2x screenshot of a desktop measured in points
+        let d = [rect(0, 0, 1440, 900)];
+        assert_eq!(
+            desktop_to_backend(&d, 2879, 1799, (2880, 1800)),
+            Some((1439, 899))
+        );
+        assert_eq!(
+            desktop_to_backend(&d, 1440, 900, (2880, 1800)),
+            Some((720, 450))
+        );
+        assert_eq!(desktop_to_backend(&d, 3, 3, (2880, 1800)), Some((1, 1)));
+        // GNOME: logical layout at 1.5x, origin of the second monitor
+        let d = [rect(0, 0, 1280, 720), rect(1280, 0, 1280, 720)];
+        assert_eq!(
+            desktop_to_backend(&d, 1920, 0, (3840, 1080)),
+            Some((1280, 0))
+        );
+    }
+
+    #[test]
+    fn points_outside_the_desktop_clamp_into_the_box() {
+        let d = [rect(100, 50, 800, 600)];
+        let size = (800, 600);
+        assert_eq!(desktop_to_backend(&d, -5, -1, size), Some((100, 50)));
+        assert_eq!(desktop_to_backend(&d, 800, 600, size), Some((899, 649)));
+        assert_eq!(
+            desktop_to_backend(&d, i32::MAX, i32::MIN, size),
+            Some((899, 50))
+        );
+        // a gap between monitors is inside the box: not moved onto one
+        let d = [rect(0, 0, 100, 100), rect(200, 0, 100, 100)];
+        assert_eq!(desktop_to_backend(&d, 150, 50, (300, 100)), Some((150, 50)));
+    }
+
+    #[test]
+    fn empty_inputs_map_nowhere() {
+        let d = [rect(0, 0, 1920, 1080)];
+        assert_eq!(desktop_to_backend(&d, 0, 0, (0, 1080)), None);
+        assert_eq!(desktop_to_backend(&d, 0, 0, (1920, 0)), None);
+        assert_eq!(desktop_to_backend(&[], 0, 0, (1920, 1080)), None);
+        // displays without an area do not count
+        let d = [rect(-500, 0, 0, 0), rect(0, 0, 10, 10)];
+        assert_eq!(bounds(&d), Some(rect(0, 0, 10, 10)));
+        assert_eq!(
+            desktop_to_backend(&[rect(0, 0, 0, 1080)], 0, 0, (1, 1)),
+            None
         );
     }
 }

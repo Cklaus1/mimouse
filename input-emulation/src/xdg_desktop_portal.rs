@@ -18,7 +18,8 @@ use input_event::{
 
 use crate::{PermissionPending, error::EmulationError};
 
-use super::{Edge, Emulation, EmulationHandle, error::XdpEmulationCreationError};
+use super::error::XdpEmulationCreationError;
+use super::{Edge, Emulation, EmulationHandle, TextSupport, Typed, text};
 
 pub(crate) struct DesktopPortalEmulation {
     proxy: RemoteDesktop,
@@ -176,6 +177,36 @@ impl Emulation for DesktopPortalEmulation {
             );
         }
         Ok(None)
+    }
+
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Layout
+    }
+
+    /// Presses and releases each character's keysym; the compositor picks
+    /// the key and level. A keysym its layout lacks is dropped by the
+    /// compositor unseen, so only characters without a keysym count as
+    /// unmapped.
+    async fn type_text(
+        &mut self,
+        _client: EmulationHandle,
+        text: &str,
+    ) -> Result<Option<Typed>, EmulationError> {
+        let mut unmapped = String::new();
+        for c in text::chars(text) {
+            let Some(keysym) = text::keysym(c) else {
+                unmapped.push(c);
+                continue;
+            };
+            // keysyms fit in 29 bits
+            let keysym = keysym.raw() as i32;
+            for state in [KeyState::Pressed, KeyState::Released] {
+                self.proxy
+                    .notify_keyboard_keysym(&self.session, keysym, state, Default::default())
+                    .await?;
+            }
+        }
+        Ok(Some(Typed { unmapped }))
     }
 
     async fn create(&mut self, _client: EmulationHandle) {}

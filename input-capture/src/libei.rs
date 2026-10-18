@@ -436,7 +436,11 @@ async fn do_capture(
             // create session
             let mut session = match session.take() {
                 Some(s) => s,
-                None => create_session(input_capture, &permission_pending).await?,
+                // a pending permission dialog must not hold up terminate
+                None => tokio::select! {
+                    s = create_session(input_capture, &permission_pending) => s?,
+                    _ = cancellation_token.cancelled() => break Ok(()),
+                },
             };
 
             let capture_session = do_capture_session(
@@ -756,12 +760,18 @@ impl MiMouseInputCapture for LibeiInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
-        let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
-        let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
-        } else {
-            Ok(())
+        // the task may wait to hand over an event (`End` at cancellation):
+        // discard events until it ends; a result it already ended with went
+        // out through the stream
+        let res = loop {
+            if self.capture_task.is_finished() {
+                break Ok(());
+            }
+            tokio::select! {
+                r = &mut self.capture_task => break r.expect("libei task panic"),
+                Some(_) = self.event_rx.recv() => {}
+            }
         };
         self.terminated = true;
         log::debug!("done!");

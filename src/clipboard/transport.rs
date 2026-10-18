@@ -11,8 +11,9 @@
 //! removed from `authorized_fingerprints` is closed without an ack, as is
 //! every update once the local clipboard backend has ended.
 //!
-//! Pairing connections (`crate::pair`) arrive on the same listener and are
-//! told apart by their ALPN protocol before the handshake completes.
+//! Pairing (`crate::pair`) and agent (`crate::agent`) connections arrive on
+//! the same listener and are told apart by their ALPN protocol before the
+//! handshake completes.
 
 use std::{
     cell::RefCell,
@@ -43,12 +44,13 @@ use super::{
     wire,
 };
 use crate::{
+    agent,
     crypto::{self, peers::Policy},
     pair,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// slowest link a large transfer is given time for, in bytes per second
 const MIN_TRANSFER_RATE: u64 = 1024 * 1024;
@@ -64,7 +66,18 @@ const MAX_TRANSFERS: usize = 4;
 /// order, and it cannot take every slot of `MAX_TRANSFERS`
 const MAX_PEER_TRANSFERS: usize = 1;
 /// how often an open connection checks that its peer is still authorized
-const REVOCATION_CHECK: Duration = Duration::from_millis(500);
+pub(crate) const REVOCATION_CHECK: Duration = Duration::from_millis(500);
+
+/// a connection whose TLS handshake has not completed yet, the address it
+/// came from, and its slot among the listener's connections
+pub(crate) type Incoming = (StartHandshake<TcpStream>, SocketAddr, OwnedSemaphorePermit);
+
+/// where the listener hands connections that are not clipboard updates
+#[derive(Clone)]
+pub(crate) struct Routes {
+    pub(crate) pair: mpsc::UnboundedSender<Incoming>,
+    pub(crate) agent: mpsc::UnboundedSender<Incoming>,
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -217,16 +230,16 @@ async fn send_to(
     Ok(())
 }
 
-/// Accept TLS connections on `port`: pairing requests (by ALPN) go to
-/// `pair_tx`, clipboard updates to `tx` (received files, at most
+/// Accept TLS connections on `port`: pairing and agent connections (by
+/// ALPN) go to `routes`, clipboard updates to `tx` (received files, at most
 /// `max_file_size` bytes in total, are stored first); without `tx`
-/// (clipboard sharing off) only pairing is served.
+/// (clipboard sharing off) only pairing and agents are served.
 pub(crate) fn listen(
     port: u16,
     tls: Rc<Tls>,
     max_file_size: u64,
     tx: Option<mpsc::UnboundedSender<Received>>,
-    pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+    routes: Routes,
 ) -> JoinHandle<()> {
     let inbound = tx.map(|tx| {
         let store = FileStore::new();
@@ -249,7 +262,7 @@ pub(crate) fn listen(
         };
         match &inbound {
             Some(_) => log::info!("clipboard: listening on tcp {addr}"),
-            None => log::info!("listening on tcp {addr} for pairing"),
+            None => log::info!("listening on tcp {addr} for pairing and agents"),
         }
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         accept_loop(
@@ -260,7 +273,7 @@ pub(crate) fn listen(
                     return log::debug!("tcp {peer}: {MAX_CONNECTIONS} connections open, closing");
                 };
                 let inbound = inbound.clone();
-                let pair_tx = pair_tx.clone();
+                let routes = routes.clone();
                 spawn_local(async move {
                     let start = match client_hello(stream).await {
                         Ok(start) => start,
@@ -268,7 +281,11 @@ pub(crate) fn listen(
                         Err(e) => return log::debug!("tcp {peer}: {e}"),
                     };
                     if pair::is_pairing(&start) {
-                        let _ = pair_tx.send((start, peer, permit));
+                        let _ = routes.pair.send((start, peer, permit));
+                        return;
+                    }
+                    if agent::is_agent(&start) {
+                        let _ = routes.agent.send((start, peer, permit));
                         return;
                     }
                     let Some(inbound) = inbound else {
@@ -512,8 +529,11 @@ mod tests {
         let cert = certificate();
         let tls = Rc::new(Tls::new(&cert, keys.clone()).unwrap());
         let (tx, rx) = mpsc::unbounded_channel();
-        let (pair_tx, _) = mpsc::unbounded_channel();
-        let task = listen(port, tls, 0, Some(tx), pair_tx);
+        let routes = Routes {
+            pair: mpsc::unbounded_channel().0,
+            agent: mpsc::unbounded_channel().0,
+        };
+        let task = listen(port, tls, 0, Some(tx), routes);
         // the listener binds on its first poll
         tokio::task::yield_now().await;
         (

@@ -22,6 +22,17 @@ clipboard = true
 # (GNOME/other: session inhibit, Windows: SetThreadExecutionState + keepalive, macOS: IOPM assertion)
 # idle_inhibit = true
 
+# AI agents (`mimouse mcp`, `mimouse cli agent`): what they may do on THIS
+# machine. Everything is denied unless allowed here; `mimouse cli agent grant`
+# edits these tables. Scopes: input, screen, clipboard = "allow" | "deny".
+# [agent]
+# idle_timeout = 30 # seconds without a request before a session ends
+# [agent.self]       # agents running on this machine
+# input = "allow"
+# screen = "allow"
+# [agent.peers."bc:05:ab:..."] # agents on a peer, by its certificate fingerprint
+# screen = "allow"
+
 # peers allowed to connect: fingerprint = name
 [authorized_fingerprints]
 "bc:05:ab:7a:a4:de:88:8c:2f:92:ac:bc:b8:49:b8:24:0d:44:b3:e6:a4:ef:d7:0b:6c:69:6d:77:53:0b:14:80" = "iridium"

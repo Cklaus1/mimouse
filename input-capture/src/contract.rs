@@ -15,9 +15,10 @@
 //!    (an enter-only id alone keeps the whole edge); the backend hears of a
 //!    barrier only when it changes and loses it with its last id.
 //! 3. A destroyed id gets nothing more, copies queued before included.
+//!    Destroying an unknown id does nothing.
 //! 4. `release()` drops the input queued for every id and releases the
-//!    backend. Input the backend itself still holds from before (an OS
-//!    queue, a compositor socket) is yielded after it.
+//!    backend. Input the backend still yields from the ended capture (an
+//!    OS queue, a compositor socket) is dropped until the next `Begin`.
 //! 5. A report at a position without ids is skipped; the next one arrives.
 //! 6. A focus starts capture as if the cursor crossed within the id's own
 //!    range; the next `Begin` at its position is for that id alone, once.
@@ -32,9 +33,7 @@
 //! 10. A backend error or the end of its stream comes after the queued
 //!     copies of earlier reports.
 //! 11. The keys reported down and not up are handed to the caller once.
-//!
-//! Not part of it: `terminate` only reaches the backend; the stream may go
-//! on (Dummy's and the OS backends' do), the caller drops the capture.
+//! 12. After `terminate` the stream ends, queued copies included.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -246,18 +245,22 @@ impl Run {
     }
 
     /// Yields until the reports since `mark`, at least `reports` of them,
-    /// reached their ids, checking each reached exactly those (rule 1).
+    /// reached their ids, checking each reached exactly those (rules 1, 4).
     async fn deliver(&mut self, mark: usize, reports: usize) -> Vec<(CaptureHandle, CaptureEvent)> {
         let mut yielded = Vec::new();
         loop {
-            let reported = self.reports_since(mark);
-            let expected = delivered(&reported, &self.ids);
+            let calls = self.since(mark).to_vec();
+            let reported = calls
+                .iter()
+                .filter(|c| matches!(c, Call::Report(..)))
+                .count();
+            let expected = delivered(&calls, &self.ids);
             assert!(
                 expected.starts_with(&yielded),
-                "{}: yielded {yielded:?} for {reported:?}",
+                "{}: yielded {yielded:?} for {calls:?}",
                 self.name
             );
-            if reported.len() >= reports && yielded.len() == expected.len() {
+            if reported >= reports && yielded.len() == expected.len() {
                 return yielded;
             }
             yielded.push(self.next().await);
@@ -265,16 +268,31 @@ impl Run {
     }
 }
 
-/// What the caller gets for `reports` while `ids` (id, position,
-/// enter-only; in creation order) live: a crossing or end reaches every id
-/// at its position, input the ids steering there, that is enter-only ids
-/// only while no Default id is there.
+/// What the caller gets for the reports among `calls` while `ids` (id,
+/// position, enter-only; in creation order) live: a crossing or end reaches
+/// every id at its position, input the ids steering there, that is
+/// enter-only ids only while no Default id is there; input reported after a
+/// release and before the next crossing reaches nobody.
 fn delivered(
-    reports: &[(Position, CaptureEvent)],
+    calls: &[Call],
     ids: &[(CaptureHandle, Position, bool)],
 ) -> Vec<(CaptureHandle, CaptureEvent)> {
     let mut delivered = Vec::new();
-    for &(pos, event) in reports {
+    let mut released = false;
+    for call in calls {
+        let (pos, event) = match *call {
+            Call::Report(pos, event) => (pos, event),
+            Call::Release => {
+                released = true;
+                continue;
+            }
+            _ => continue,
+        };
+        match event {
+            Begin(_) => released = false,
+            Input(_) if released => continue,
+            _ => {}
+        }
         let here = ids.iter().filter(|&&(_, p, _)| p == pos);
         let shared = here.clone().any(|&(.., enter_only)| !enter_only);
         for &(id, _, enter_only) in here {
@@ -401,7 +419,7 @@ async fn a_destroyed_id_gets_nothing_more() {
 
 /// rule 4
 #[tokio::test]
-async fn release_drops_queued_input_of_every_id() {
+async fn release_drops_the_input_of_the_ended_capture() {
     for subject in SUBJECTS {
         let mut run = subject.start();
         run.create(1, Left, None, false).await;
@@ -414,9 +432,29 @@ async fn release_drops_queued_input_of_every_id() {
         let mark = run.mark();
         run.capture.release().await.unwrap();
         assert_eq!(run.since(mark), [Call::Release], "{}", subject.name);
-        // what follows comes from reports after the release
-        run.report(Left, &[Begin(None), key(KeyA, 0)]);
-        run.deliver(mark, 2).await;
+        // the backend still holds input of the ended capture
+        let reports = [key(KeyA, 0), Begin(None), key(KeyB, 1)];
+        if !run.report(Left, &reports) {
+            // Dummy's motion goes on without a new crossing
+            let none = timeout(Duration::from_millis(100), run.capture.next()).await;
+            assert!(none.is_err(), "{}: {none:?}", subject.name);
+            continue;
+        }
+        let mut yielded = Vec::new();
+        for _ in 0..4 {
+            // layer-shell reports where the pointer entered
+            yielded.push(match run.next().await {
+                (id, Begin(_)) => (id, Begin(None)),
+                next => next,
+            });
+        }
+        let expected = [
+            (1, Begin(None)),
+            (2, Begin(None)),
+            (1, key(KeyB, 1)),
+            (2, key(KeyB, 1)),
+        ];
+        assert_eq!(yielded, expected, "{}", subject.name);
     }
 }
 
@@ -664,5 +702,46 @@ async fn keys_left_down_are_handed_over_once() {
         assert_eq!(pressed, HashSet::from([KeyA]), "{}", subject.name);
         let pressed = run.capture.take_pressed_keys();
         assert!(pressed.is_empty(), "{}: {pressed:?}", subject.name);
+    }
+}
+
+/// rule 12
+#[tokio::test]
+async fn terminate_ends_the_stream() {
+    for subject in SUBJECTS {
+        let mut run = subject.start();
+        run.create(1, Left, None, false).await;
+        run.create(2, Left, None, false).await;
+        // Dummy reports by itself
+        run.report(Left, &[Begin(None), key(KeyA, 1)]);
+        // id 2's copy is queued
+        assert_eq!(run.next().await.0, 1, "{}", subject.name);
+        let mark = run.mark();
+        run.capture.terminate().await.unwrap();
+        assert_eq!(run.since(mark), [Call::Terminate], "{}", subject.name);
+        let next = timeout(Duration::from_secs(5), run.capture.next()).await;
+        assert!(matches!(next, Ok(None)), "{}: {next:?}", subject.name);
+    }
+}
+
+/// rule 3
+#[tokio::test]
+async fn destroying_an_unknown_id_does_nothing() {
+    for subject in SUBJECTS {
+        let mut run = subject.start();
+        run.create(1, Left, None, false).await;
+        let mark = run.mark();
+        run.destroy(2).await;
+        run.destroy(2).await;
+        let calls = run.since(mark);
+        assert!(calls.is_empty(), "{}: {calls:?}", subject.name);
+        run.destroy(1).await;
+        run.destroy(1).await;
+        assert_eq!(
+            run.barriers_since(mark),
+            [Call::Destroy(Left)],
+            "{}",
+            subject.name
+        );
     }
 }

@@ -138,6 +138,11 @@ impl Peer {
     pub(crate) fn held(&self) -> (usize, usize) {
         (self.keys.len(), self.buttons.len())
     }
+
+    /// whether `key` is held
+    pub(crate) fn holds(&self, key: u32) -> bool {
+        self.keys.contains(&key)
+    }
 }
 
 /// Whether a press (`pressed`) or release changes the state of `code` in

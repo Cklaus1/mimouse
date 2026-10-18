@@ -6,13 +6,19 @@ use input_event::Event;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::normalize::Steps;
-use crate::{Backend, Edge, Emulation, EmulationError, EmulationHandle, InputEmulation, Selected};
+use crate::text::Keystroke;
+use crate::{
+    Backend, Edge, Emulation, EmulationError, EmulationHandle, InputEmulation, Rect, Selected,
+    TextSupport, Typed,
+};
 
 /// One call the layer made on the backend.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Call {
     Consume(EmulationHandle, Event),
     EnterAt(EmulationHandle),
+    PointerTo(EmulationHandle, i32, i32),
+    TypeText(EmulationHandle, String),
     Create(EmulationHandle),
     Destroy(EmulationHandle),
     Terminate,
@@ -89,6 +95,37 @@ impl Emulation for Recorder {
         self.backend.enter_at(handle, edge, fraction)
     }
 
+    fn text_support(&self) -> TextSupport {
+        self.backend.text_support()
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        self.backend.desktop()
+    }
+
+    fn pointer_to(
+        &mut self,
+        handle: EmulationHandle,
+        x: i32,
+        y: i32,
+    ) -> Result<bool, EmulationError> {
+        self.record(Call::PointerTo(handle, x, y));
+        self.backend.pointer_to(handle, x, y)
+    }
+
+    async fn type_text(
+        &mut self,
+        handle: EmulationHandle,
+        text: &str,
+    ) -> Result<Option<Typed>, EmulationError> {
+        self.record(Call::TypeText(handle, text.to_owned()));
+        self.backend.type_text(handle, text).await
+    }
+
+    fn keystroke(&self, c: char) -> Option<Keystroke> {
+        self.backend.keystroke(c)
+    }
+
     async fn create(&mut self, handle: EmulationHandle) {
         self.record(Call::Create(handle));
         self.backend.create(handle).await
@@ -105,8 +142,23 @@ impl Emulation for Recorder {
     }
 }
 
-/// A backend with the given `steps` that places the pointer at (0, 0) if
-/// `places_pointer`.
+/// the display of a [`Fake`] that places the pointer
+pub(crate) const FAKE_DISPLAY: Rect = Rect {
+    x: -100,
+    y: 0,
+    width: 1000,
+    height: 500,
+};
+
+pub(crate) const KEY_LEFTSHIFT: u32 = 42;
+pub(crate) const KEY_RIGHTALT: u32 = 100;
+pub(crate) const KEY_A: u32 = 30;
+pub(crate) const KEY_E: u32 = 18;
+
+/// A backend with the given `steps` that places the pointer (at (0, 0)
+/// where a cursor enters, anywhere on [`FAKE_DISPLAY`]) if
+/// `places_pointer`. Its layout types `a`, `A` (Shift) and `€` (Shift and
+/// AltGr, as an unusual layout).
 pub(crate) struct Fake {
     pub(crate) steps: Steps,
     pub(crate) places_pointer: bool,
@@ -140,6 +192,32 @@ impl Emulation for Fake {
         _: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
         Ok(self.places_pointer.then_some((0, 0)))
+    }
+
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Layout
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        self.places_pointer.then(|| vec![FAKE_DISPLAY])
+    }
+
+    fn pointer_to(&mut self, _: EmulationHandle, _: i32, _: i32) -> Result<bool, EmulationError> {
+        Ok(self.places_pointer)
+    }
+
+    fn keystroke(&self, c: char) -> Option<Keystroke> {
+        let (modifiers, key, depressed) = match c {
+            'a' => ([0, 0, 0], KEY_A, 0),
+            'A' => ([KEY_LEFTSHIFT, 0, 0], KEY_A, 1),
+            '€' => ([KEY_LEFTSHIFT, KEY_RIGHTALT, 0], KEY_E, 0x81),
+            _ => return None,
+        };
+        Some(Keystroke {
+            modifiers,
+            key,
+            depressed,
+        })
     }
 
     async fn create(&mut self, _: EmulationHandle) {}

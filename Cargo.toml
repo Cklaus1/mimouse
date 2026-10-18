@@ -1,5 +1,5 @@
 [workspace]
-members = ["input-capture", "input-emulation", "input-event"]
+members = ["desktop", "input-capture", "input-emulation", "input-event"]
 
 [package]
 name = "mimouse"
@@ -24,6 +24,7 @@ winresource = { version = "0.1.34", default-features = false }
 input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
+desktop = { path = "desktop", version = "0.4.0" }
 shadow-rs = { version = "1.2.0", default-features = false }
 
 hickory-resolver = "0.25.2"
@@ -68,6 +69,7 @@ rustls-native-certs = "0.8.5"
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
 num_enum = "0.7.2"
 paste = "1.0"
+base64 = "0.22"
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 ashpd = { version = "0.13.9", default-features = false, features = [

@@ -1,0 +1,40 @@
+[package]
+name = "desktop"
+description = "screenshots and desktop state for mimouse agents"
+version = "0.4.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Cklaus1/mimouse"
+publish = false
+
+[dependencies]
+log = "0.4.22"
+thiserror = "2.0.0"
+tokio = { version = "1.32.0", features = ["rt", "sync", "time", "macros"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
+ashpd = { version = "0.13.9", default-features = false, features = [
+    "screenshot",
+    "tokio",
+] }
+
+[target.'cfg(target_os="macos")'.dependencies]
+core-graphics = { version = "0.25.0", features = ["highsierra"] }
+core-foundation = "0.10.0"
+tempfile = "3.8"
+tokio = { version = "1.32.0", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.32.0", features = ["test-util"] }

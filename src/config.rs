@@ -1,5 +1,6 @@
 use crate::capture_test::TestCaptureArgs;
 use crate::emulation_test::TestEmulationArgs;
+use crate::mcp::McpArgs;
 use clap::{Parser, Subcommand, ValueEnum};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use tokio::task::JoinHandle;
 use toml;
 use toml_edit::{self, DocumentMut};
 
+use crate::agent::proto::{Grant, Grants};
 use crate::cli::CliArgs;
 use crate::ipc::{ConfigReport, ConfigValue, DEFAULT_PORT, Position, RestartPending, Source};
 use input_capture::Chord;
@@ -23,6 +25,7 @@ use input_event::scancode::{
     self,
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
 };
+use std::time::Duration;
 
 use shadow_rs::shadow;
 
@@ -30,6 +33,9 @@ shadow!(build);
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "mimouse.pem";
+/// `agent.idle_timeout` default and upper bound, seconds
+const DEFAULT_AGENT_IDLE_TIMEOUT: u64 = 30;
+const MAX_AGENT_IDLE_TIMEOUT: u64 = 24 * 60 * 60;
 
 fn default_path() -> Result<PathBuf, VarError> {
     #[cfg(unix)]
@@ -65,6 +71,62 @@ struct ConfigToml {
     local_hotkey: Option<Vec<scancode::Linux>>,
     telemetry: Option<bool>,
     telemetry_endpoint: Option<String>,
+    agent: Option<TomlAgent>,
+}
+
+/// `[agent]`: what agents may do on this machine (spec A2). Every scope is
+/// denied unless granted here.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+struct TomlAgent {
+    /// seconds without a request before a session ends
+    idle_timeout: Option<u64>,
+    /// agents on this machine (`[agent.self]`)
+    #[serde(rename = "self")]
+    local: Option<AgentGrants>,
+    /// peers by certificate fingerprint (`[agent.peers."<fingerprint>"]`);
+    /// a peer also needs an entry in `authorized_fingerprints`
+    peers: Option<BTreeMap<String, AgentGrants>>,
+}
+
+/// grants of one requester; unset scopes are denied
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentGrants {
+    pub input: Option<Grant>,
+    pub screen: Option<Grant>,
+    pub clipboard: Option<Grant>,
+}
+
+impl AgentGrants {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// in effect: unset = deny
+    pub fn grants(&self) -> Grants {
+        Grants {
+            input: self.input.unwrap_or_default(),
+            screen: self.screen.unwrap_or_default(),
+            clipboard: self.clipboard.unwrap_or_default(),
+        }
+    }
+}
+
+/// who an agent request comes from
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Requester {
+    /// an agent on this machine (over IPC)
+    Local,
+    /// a peer, by certificate fingerprint
+    Peer(String),
+}
+
+impl std::fmt::Display for Requester {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Requester::Local => f.write_str("self"),
+            Requester::Peer(fingerprint) => f.write_str(fingerprint),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -100,6 +162,11 @@ impl ConfigToml {
         }
         if self.max_file_size == Some(0) {
             return Err(ConfigError::MaxFileSize);
+        }
+        if let Some(timeout) = self.agent.as_ref().and_then(|a| a.idle_timeout) {
+            if !(1..=MAX_AGENT_IDLE_TIMEOUT).contains(&timeout) {
+                return Err(ConfigError::AgentIdleTimeout(timeout));
+            }
         }
         // empty: the built-in endpoint
         if let Some(url) = self.telemetry_endpoint.as_deref().filter(|u| !u.is_empty()) {
@@ -159,6 +226,17 @@ impl ConfigToml {
             })
             .filter(|c| !c.is_empty());
         self.authorized_fingerprints = self.authorized_fingerprints.filter(|k| !k.is_empty());
+        self.agent = self.agent.and_then(|mut agent| {
+            agent.local = agent.local.filter(|g| !g.is_empty());
+            agent.peers = agent
+                .peers
+                .map(|mut peers| {
+                    peers.retain(|_, g| !g.is_empty());
+                    peers
+                })
+                .filter(|p| !p.is_empty());
+            (agent != TomlAgent::default()).then_some(agent)
+        });
         self
     }
 
@@ -247,6 +325,9 @@ pub enum Command {
     TestCapture(TestCaptureArgs),
     /// MiMouse commandline interface
     Cli(CliArgs),
+    /// MCP server on stdin/stdout for AI agents (screenshots, pointer,
+    /// keys, clipboard of this machine and its peers)
+    Mcp(McpArgs),
     /// run in daemon mode
     Daemon,
 }
@@ -499,6 +580,8 @@ pub enum ConfigError {
     },
     #[error("`max_file_size` = 0: need at least 1 (bytes of copied files sent at once)")]
     MaxFileSize,
+    #[error("`agent.idle_timeout` = {0}: need 1..={MAX_AGENT_IDLE_TIMEOUT} (seconds)")]
+    AgentIdleTimeout(u64),
     #[error("`telemetry_endpoint`: {0}")]
     TelemetryEndpoint(String),
     #[error("{} is invalid, fix it first (`mimouse cli doctor` shows the last good copy): {error}", path.display())]
@@ -707,6 +790,47 @@ impl Config {
         self.config_toml.idle_inhibit.unwrap_or(true)
     }
 
+    /// what `requester` may do here; unset scopes are denied. A peer also
+    /// needs its fingerprint authorized, which the caller checks
+    pub fn agent_grants(&self, requester: &Requester) -> Grants {
+        let agent = self.config_toml.agent.as_ref();
+        let grants = match requester {
+            Requester::Local => agent.and_then(|a| a.local),
+            Requester::Peer(fingerprint) => agent
+                .and_then(|a| a.peers.as_ref())
+                .and_then(|p| p.get(fingerprint))
+                .copied(),
+        };
+        grants.unwrap_or_default().grants()
+    }
+
+    /// how long a session may go without a request (default 30 s)
+    pub fn agent_idle_timeout(&self) -> Duration {
+        let secs = self.config_toml.agent.as_ref().and_then(|a| a.idle_timeout);
+        Duration::from_secs(secs.unwrap_or(DEFAULT_AGENT_IDLE_TIMEOUT))
+    }
+
+    /// `[agent]` as the agent layer applies it
+    pub(crate) fn agent_policy(&self) -> crate::agent::Policy {
+        let peers = self
+            .config_toml
+            .agent
+            .as_ref()
+            .and_then(|a| a.peers.as_ref())
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|(fingerprint, grants)| (fingerprint.clone(), grants.grants()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::agent::Policy {
+            local: self.agent_grants(&Requester::Local),
+            peers,
+            idle_timeout: self.agent_idle_timeout(),
+        }
+    }
+
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
@@ -844,6 +968,12 @@ impl Config {
                 source(None::<()>, &file.telemetry_endpoint),
                 false,
             ),
+            entry(
+                "agent",
+                json(&file.agent),
+                source(None::<()>, &file.agent),
+                false,
+            ),
         ];
         ConfigReport {
             path: self.config_path.clone(),
@@ -958,6 +1088,39 @@ impl Config {
             self.config_toml.telemetry = previous;
         }
         result
+    }
+
+    /// saves `requester`'s grants (unset scopes of `grants` keep their
+    /// value) like `save` saves the clients; a failed save leaves the
+    /// config in effect unchanged. Returns the requester's grants and
+    /// whether the runtime has to reload
+    pub async fn save_agent_grants(
+        &mut self,
+        requester: &Requester,
+        grants: AgentGrants,
+        clients: Vec<ConfigClient>,
+        authorized: HashMap<String, String>,
+    ) -> Result<(Grants, bool), ConfigError> {
+        let previous = self.config_toml.agent.clone();
+        let agent = self.config_toml.agent.get_or_insert_with(Default::default);
+        let entry = match requester {
+            Requester::Local => agent.local.get_or_insert_with(Default::default),
+            Requester::Peer(fingerprint) => agent
+                .peers
+                .get_or_insert_with(Default::default)
+                .entry(fingerprint.clone())
+                .or_default(),
+        };
+        entry.input = grants.input.or(entry.input);
+        entry.screen = grants.screen.or(entry.screen);
+        entry.clipboard = grants.clipboard.or(entry.clipboard);
+        match self.save(clients, authorized).await {
+            Ok(reload) => Ok((self.agent_grants(requester), reload)),
+            Err(e) => {
+                self.config_toml.agent = previous;
+                Err(e)
+            }
+        }
     }
 
     /// writes the config with the runtime's `clients` and `authorized` keys
@@ -1341,10 +1504,29 @@ fn merge_table(dst: &mut toml_edit::Table, old: &toml_edit::Table, new: &toml_ed
             }
             (Some(d), n) => *d = n.clone(),
             (None, n) => {
-                dst.insert(&k, n.clone());
+                dst.insert(&k, standard(n.clone()));
             }
         }
     }
+}
+
+/// `item` with its inline tables turned into `[tables]`, as a person would
+/// write a new section (`[agent.self]` rather than `agent = { self = .. }`);
+/// a table holding only tables gets no header of its own
+fn standard(item: toml_edit::Item) -> toml_edit::Item {
+    let mut table = match item {
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => t.into_table(),
+        toml_edit::Item::Table(t) => t,
+        item => return item,
+    };
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+    for k in keys {
+        let item = table.remove(&k).expect("listed");
+        table.insert(&k, standard(item));
+    }
+    let only_tables = !table.is_empty() && table.iter().all(|(_, v)| v.is_table());
+    table.set_implicit(only_tables);
+    toml_edit::Item::Table(table)
 }
 
 /// serialize into a standalone table
@@ -2199,7 +2381,7 @@ future_client_key = "kept"
         assert_eq!(key("max_file_size"), (max, Source::Default, true));
         assert_eq!(key("idle_inhibit"), (json(true), Source::Default, false));
         assert_eq!(key("local_hotkey"), (json(()), Source::Default, false));
-        assert_eq!(report.keys.len(), 15, "every key of the file is reported");
+        assert_eq!(report.keys.len(), 16, "every key of the file is reported");
         assert_eq!(report.awaiting_restart, []);
 
         // without flags: the file, where it sets the key
@@ -2210,5 +2392,64 @@ future_client_key = "kept"
         assert_eq!(source("cert_path"), Source::File);
         assert_eq!(source("emulation_backend"), Source::Default);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_grants_default_to_deny_and_save_merges_per_scope() {
+        let dir = temp_dir("agent-grants");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let text = "# mine\n[agent]\nidle_timeout = 10 # short\n\n[agent.peers.\"aa:bb\"]\nscreen = \"allow\"\n";
+        fs::write(&path, text).unwrap();
+        let mut config = Config::at(&path).unwrap();
+        let peer = Requester::Peer("aa:bb".into());
+        let deny = Grants::default();
+        assert_eq!(config.agent_grants(&Requester::Local), deny);
+        assert_eq!(config.agent_grants(&Requester::Peer("cc:dd".into())), deny);
+        assert_eq!(config.agent_grants(&peer).screen, Grant::Allow);
+        assert_eq!(config.agent_grants(&peer).input, Grant::Deny);
+        assert_eq!(config.agent_idle_timeout(), Duration::from_secs(10));
+
+        let input = AgentGrants {
+            input: Some(Grant::Allow),
+            ..Default::default()
+        };
+        let (grants, _) = config
+            .save_agent_grants(&peer, input, vec![], HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!((grants.input, grants.screen), (Grant::Allow, Grant::Allow));
+        let local = AgentGrants {
+            clipboard: Some(Grant::Allow),
+            ..Default::default()
+        };
+        config
+            .save_agent_grants(&Requester::Local, local, vec![], HashMap::new())
+            .await
+            .unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# mine") && out.contains("# short"), "{out}");
+        let reread = Config::at(&path).unwrap();
+        assert_eq!(reread.agent_grants(&peer), grants);
+        assert_eq!(
+            reread.agent_grants(&Requester::Local).clipboard,
+            Grant::Allow
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn agent_idle_timeout_and_grant_values_are_validated() {
+        for (text, ok) in [
+            ("[agent]\nidle_timeout = 0\n", false),
+            ("[agent]\nidle_timeout = 86401\n", false),
+            ("[agent]\nidle_timeout = 86400\n", true),
+            ("[agent.self]\ninput = \"ask\"\n", false),
+            ("[agent.self]\ninput = \"allow\"\n", true),
+        ] {
+            let parsed = toml::from_str::<ConfigToml>(text)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()));
+            assert_eq!(parsed.is_ok(), ok, "{text}: {parsed:?}");
+        }
     }
 }

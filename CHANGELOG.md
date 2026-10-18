@@ -27,6 +27,7 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - `audit.jsonl`: every state-changing CLI or IPC request is logged, rotated at 10 MiB.
 - Config validation: invalid ranges, duplicate or conflicting hotkeys, `port = 0`, `max_file_size = 0` and a non-HTTPS `telemetry_endpoint` are rejected and the error names the client. An invalid file is never overwritten. MiMouse keeps running on `config.toml.last-good`.
 - Config write-backs edit `config.toml` in place, keeping comments, key order and unknown keys. A save merges with changes made to the file in the meantime.
+- Agent control: AI agents take screenshots and drive the pointer, keys, typed text and clipboard of this machine or a client, through `mimouse mcp` (MCP over stdio) or `mimouse cli agent`. Denied unless granted per requester and scope (`mimouse cli agent grant`, `[agent]` in `config.toml`); one session per machine, announced when it starts and ends, ended at once when a person uses the machine, and every request is audited. *MiMouse peers.*
 - Opt-in telemetry, off by default: `mimouse cli telemetry on|off|status|show`. See the README for what is sent.
 - Packages: `.deb` and `.rpm` (with a systemd user unit and a firewalld service), a Windows `.exe` with version information, and Scoop, winget and Homebrew manifests.
 - `docs/adding-a-backend.md`: how to add a capture, emulation or clipboard backend, with the contract suite each kind must pass.
@@ -45,6 +46,10 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Clipboard: updates arrive in order, the newest wins, and file names are de-duplicated after Windows sanitizing.
 - GNOME: clipboard sharing no longer stops for good when the portal refuses a new session for a while (mutter: `Session creation inhibited`); it retries every 10 s. Only a denied dialog still needs a service restart.
 - Windows: clipboard monitoring that fails is restarted every 10 s instead of leaving local copies unshared until the service restarts.
+- GNOME (Wayland): with no `emulation_backend` configured, emulation no longer falls back to X11 on Xwayland when the portal refuses it (e.g. while the screen is locked). GNOME's Xwayland asked to share the desktop again and again for it; emulation now retries libei until the desktop accepts.
+- GNOME: stopping the service no longer hangs while the input capture dialog is waiting for approval.
+- Input the capture backend still held when control returned is no longer sent to the peer after it was released.
+- Linux: the service no longer aborts with a core dump when it stops (a portal connection dropped after the event loop had ended).
 
 ### Security
 

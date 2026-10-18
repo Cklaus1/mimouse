@@ -33,7 +33,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     future::Future,
     hash::{Hash, Hasher},
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     rc::Rc,
     sync::{Arc, RwLock},
     time::Instant,
@@ -41,14 +41,17 @@ use std::{
 
 use crate::ipc::{ClientHandle, ClipboardDirection, ClipboardState, ClipboardStatus};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::{JoinHandle, spawn_local},
 };
 use webrtc_dtls::crypto::Certificate;
 
-use crate::{client::ClientManager, pair};
+use crate::client::ClientManager;
 use files::FileRef;
 use transport::TransportError;
+pub(crate) use transport::{
+    CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, Incoming, REVOCATION_CHECK, Routes,
+};
 
 // mime types and accessors below are used by the platform backends only;
 // macOS has no clipboard backend yet
@@ -274,6 +277,55 @@ enum Request {
     ClientEntered(ClientHandle),
     ClientRemoved(ClientHandle),
     PortChanged(u16),
+    /// an agent reads the clipboard: its contents, `None` when empty
+    AgentGet(oneshot::Sender<Result<Option<Arc<ClipboardData>>, String>>),
+    /// an agent replaces the local clipboard
+    AgentSet(Arc<ClipboardData>, oneshot::Sender<Result<(), String>>),
+}
+
+const BACKEND_ENDED: &str = "the clipboard backend ended";
+
+/// agent access to the local clipboard (`crate::agent`); Err: why the
+/// clipboard is unavailable
+#[derive(Clone)]
+pub(crate) struct AgentClipboard {
+    /// weak: the clipboard task ends once [`Clipboard`] drops its sender
+    requests: Option<mpsc::WeakUnboundedSender<Request>>,
+    status: watch::Receiver<ClipboardStatus>,
+}
+
+impl AgentClipboard {
+    const ENDED: &str = "the clipboard service ended";
+
+    /// a clipboard backend runs or is starting
+    pub(crate) fn available(&self) -> bool {
+        matches!(
+            self.status.borrow().status,
+            ClipboardState::Starting | ClipboardState::AwaitingApproval | ClipboardState::Enabled
+        )
+    }
+
+    pub(crate) async fn get(&self) -> Result<Option<Arc<ClipboardData>>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Request::AgentGet(tx))?;
+        rx.await.map_err(|_| Self::ENDED.to_owned())?
+    }
+
+    pub(crate) async fn set(&self, data: ClipboardData) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Request::AgentSet(Arc::new(data), tx))?;
+        rx.await.map_err(|_| Self::ENDED.to_owned())?
+    }
+
+    fn send(&self, request: Request) -> Result<(), String> {
+        let tx = self
+            .requests
+            .as_ref()
+            .ok_or("clipboard sharing is unavailable")?
+            .upgrade()
+            .ok_or(Self::ENDED)?;
+        tx.send(request).map_err(|_| Self::ENDED.to_owned())
+    }
 }
 
 pub(crate) struct Clipboard {
@@ -284,8 +336,9 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
-    /// Clipboard sharing over TLS. The TLS listener also serves pairing
-    /// requests (to `pair_tx`), so it runs even with sharing disabled.
+    /// Clipboard sharing over TLS. The TLS listener also serves pairing and
+    /// agent connections (to `routes`), so it runs even with sharing
+    /// disabled.
     pub(crate) fn new(
         enabled: bool,
         port: u16,
@@ -293,12 +346,12 @@ impl Clipboard {
         cert: &Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         client_manager: ClientManager,
-        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+        routes: Routes,
     ) -> Self {
         let tls = match transport::Tls::new(cert, authorized_keys) {
             Ok(tls) => Rc::new(tls),
             Err(e) => {
-                log::warn!("clipboard sharing and pairing unavailable: {e}");
+                log::warn!("clipboard sharing, pairing and agents unavailable: {e}");
                 return Self {
                     request_tx: None,
                     event_rx: None,
@@ -314,7 +367,13 @@ impl Clipboard {
                 request_tx: Some(request_tx),
                 event_rx: None,
                 status: watch::channel(ClipboardStatus::new(ClipboardState::Off)).1,
-                task: Some(spawn_local(listen_only(port, tls, pair_tx, request_rx))),
+                task: Some(spawn_local(listen_only(
+                    port,
+                    tls,
+                    routes,
+                    request_rx,
+                    "clipboard sharing is off on this machine (`clipboard = true` turns it on)",
+                ))),
             };
         }
         let (delivered_tx, delivered_rx) = mpsc::unbounded_channel();
@@ -332,7 +391,7 @@ impl Clipboard {
             delivered_tx,
             event_tx,
         };
-        let task = spawn_local(task.run(port, request_rx, delivered_rx, pair_tx, status_tx));
+        let task = spawn_local(task.run(port, request_rx, delivered_rx, routes, status_tx));
         Self {
             request_tx: Some(request_tx),
             event_rx: Some(event_rx),
@@ -391,6 +450,17 @@ impl Clipboard {
     pub(crate) fn port_changed(&self, port: u16) {
         if let Some(tx) = &self.request_tx {
             let _ = tx.send(Request::PortChanged(port));
+        }
+    }
+
+    /// what agents use to read and set the local clipboard
+    pub(crate) fn agent(&self) -> AgentClipboard {
+        AgentClipboard {
+            requests: self
+                .request_tx
+                .as_ref()
+                .map(mpsc::UnboundedSender::downgrade),
+            status: self.status.clone(),
         }
     }
 
@@ -549,15 +619,17 @@ struct ClipboardTask {
     event_tx: mpsc::UnboundedSender<Transfer>,
 }
 
-/// serve only pairing on the TLS port, following port changes
+/// serve only pairing and agents on the TLS port, following port changes;
+/// agent clipboard requests are refused with `off`
 async fn listen_only(
     mut port: u16,
     tls: Rc<transport::Tls>,
-    pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+    routes: Routes,
     mut requests: mpsc::UnboundedReceiver<Request>,
+    off: &'static str,
 ) {
     // no clipboard receiver: files are never accepted, so no size limit applies
-    let listen = |port| transport::listen(port, tls.clone(), 0, None, pair_tx.clone());
+    let listen = |port| transport::listen(port, tls.clone(), 0, None, routes.clone());
     let mut listener = listen(port);
     while let Some(request) = requests.recv().await {
         match request {
@@ -565,6 +637,12 @@ async fn listen_only(
                 port = p;
                 listener.abort();
                 listener = listen(port);
+            }
+            Request::AgentGet(tx) => {
+                let _ = tx.send(Err(off.to_owned()));
+            }
+            Request::AgentSet(_, tx) => {
+                let _ = tx.send(Err(off.to_owned()));
             }
             Request::PortChanged(_) | Request::ClientEntered(_) | Request::ClientRemoved(_) => {}
         }
@@ -578,13 +656,20 @@ impl ClipboardTask {
         mut port: u16,
         mut requests: mpsc::UnboundedReceiver<Request>,
         mut delivered_rx: mpsc::UnboundedReceiver<Delivered>,
-        pair_tx: mpsc::UnboundedSender<pair::Incoming>,
+        routes: Routes,
         status: StatusTx,
     ) {
         let (local_tx, mut local_rx) = mpsc::unbounded_channel();
         let Some(backend) = spawn_backend(local_tx, status) else {
             log::warn!("clipboard sharing is not supported on this platform");
-            return listen_only(port, self.tls, pair_tx, requests).await;
+            return listen_only(
+                port,
+                self.tls,
+                routes,
+                requests,
+                "this machine has no clipboard backend",
+            )
+            .await;
         };
         let (received_tx, received_rx) = mpsc::unbounded_channel();
         // dropped once the backend ended: received updates are then refused
@@ -599,7 +684,7 @@ impl ClipboardTask {
                 tls.clone(),
                 max_file_size,
                 Some(received_tx.clone()),
-                pair_tx.clone(),
+                routes.clone(),
             )
         };
         let mut listener = listen(port);
@@ -616,6 +701,27 @@ impl ClipboardTask {
                         listener = listen(port);
                     }
                     Some(Request::PortChanged(_)) => {}
+                    Some(Request::AgentGet(tx)) => {
+                        let current = match received_rx {
+                            None => Err(BACKEND_ENDED.to_owned()),
+                            Some(_) => Ok(self
+                                .current
+                                .as_ref()
+                                .filter(|s| !s.data.is_empty())
+                                .map(|s| s.data.clone())),
+                        };
+                        let _ = tx.send(current);
+                    }
+                    Some(Request::AgentSet(data, tx)) => {
+                        let set = match received_rx {
+                            None => Err(BACKEND_ENDED.to_owned()),
+                            Some(_) => {
+                                self.agent_set(data, &backend);
+                                Ok(())
+                            }
+                        };
+                        let _ = tx.send(set);
+                    }
                 },
                 Some(change) = local_rx.recv() => self.local_changed(change),
                 Some(received) = async {
@@ -739,6 +845,15 @@ impl ClipboardTask {
         let _ = backend.send(Some(SetRequest { data, accepted }));
     }
 
+    /// an agent's contents for the local clipboard; like a received
+    /// update, peers get it when the cursor enters them
+    fn agent_set(&mut self, data: Arc<ClipboardData>, backend: &BackendTx) {
+        self.current = Some(Snapshot::new(data.clone()));
+        self.seeded = false;
+        let accepted = Instant::now();
+        let _ = backend.send(Some(SetRequest { data, accepted }));
+    }
+
     /// send the current clipboard to `handle` unless it already has it
     fn update_if_stale(&mut self, handle: ClientHandle) {
         let Some(Snapshot { digest, .. }) = &self.current else {
@@ -798,7 +913,7 @@ async fn client_sender(
         let snapshot = rx.borrow_and_update().clone();
         if let Some(snapshot) = snapshot {
             let Snapshot { digest, data, .. } = &snapshot;
-            match client_addrs(&client_manager, handle) {
+            match client_manager.addrs(handle) {
                 None => return, /* client removed */
                 Some(addrs) if addrs.is_empty() => {
                     log::debug!("clipboard: no address known for client {handle}")
@@ -837,22 +952,6 @@ async fn client_sender(
             return;
         }
     }
-}
-
-/// candidate addresses of a client, the currently active one first
-fn client_addrs(client_manager: &ClientManager, handle: ClientHandle) -> Option<Vec<SocketAddr>> {
-    let (config, state) = client_manager.get_state(handle)?;
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    if let Some(addr) = state.active_addr {
-        addrs.push(SocketAddr::new(addr.ip(), config.port));
-    }
-    for ip in state.ips {
-        let addr = SocketAddr::new(ip, config.port);
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
-    Some(addrs)
 }
 
 #[cfg(test)]
