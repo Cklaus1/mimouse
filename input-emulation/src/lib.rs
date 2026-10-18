@@ -72,6 +72,10 @@ pub struct Typed {
     pub unmapped: String,
 }
 
+/// The longest [`InputEmulation::type_text`] waits between the events of
+/// one text (Windows paces Unicode packets), on top of sending them.
+pub const MAX_TYPE_PACING: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]

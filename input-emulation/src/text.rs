@@ -47,7 +47,7 @@ pub(crate) fn keysym(c: char) -> Option<xkeysym::Keysym> {
 }
 
 /// A piece of text typed exactly (as Unicode, not through a layout).
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Piece {
     /// UTF-16 units of whole characters
@@ -61,7 +61,7 @@ pub(crate) enum Piece {
 /// The pieces that type `text`, each at most `max_units` UTF-16 units
 /// (at least one character), and the characters that are not typed:
 /// control characters other than newline and tab.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn exact_pieces(text: &str, max_units: usize) -> (Vec<Piece>, String) {
     let mut pieces = Vec::new();
     let mut unmapped = String::new();
@@ -91,6 +91,50 @@ pub(crate) fn exact_pieces(text: &str, max_units: usize) -> (Vec<Piece>, String)
         pieces.push(Piece::Units(units));
     }
     (pieces, unmapped)
+}
+
+/// A step of typing on Windows.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WinStep {
+    /// a key of the foreground keyboard layout: virtual key and the
+    /// `VkKeyScan` modifier bits held around it (1 Shift, 2 Ctrl, 4 Alt)
+    Key(u16, u8),
+    /// the UTF-16 units of one character outside the layout (`VK_PACKET`)
+    Packet(Vec<u16>),
+}
+
+/// The steps that type `text` on Windows and the characters not typed
+/// (control characters other than newline and tab). `key` finds the layout
+/// key that types a character exactly. Layout keys come first because
+/// WinUI applications (Windows 11 Notepad) that fall behind take every
+/// queued `VK_PACKET` for the last one injected.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_steps(
+    text: &str,
+    mut key: impl FnMut(char) -> Option<(u16, u8)>,
+) -> (Vec<WinStep>, String) {
+    /// `VK_RETURN`, `VK_TAB`
+    const RETURN: u16 = 0x0d;
+    const TAB: u16 = 0x09;
+    let mut steps = Vec::new();
+    let mut unmapped = String::new();
+    for c in chars(text) {
+        let step = match c {
+            '\n' => WinStep::Key(RETURN, 0),
+            '\t' => WinStep::Key(TAB, 0),
+            c if c.is_control() => {
+                unmapped.push(c);
+                continue;
+            }
+            c => match key(c) {
+                Some((vk, modifiers)) => WinStep::Key(vk, modifiers),
+                None => WinStep::Packet(c.encode_utf16(&mut [0; 2]).to_vec()),
+            },
+        };
+        steps.push(step);
+    }
+    (steps, unmapped)
 }
 
 #[cfg(test)]
@@ -124,6 +168,32 @@ mod exact_tests {
         let (pieces, _) = exact_pieces("abc", 1);
         assert_eq!(pieces, [units("a"), units("b"), units("c")]);
         assert_eq!(exact_pieces("", 20), (vec![], String::new()));
+    }
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::{WinStep, windows_steps};
+
+    #[test]
+    fn layout_keys_first_packets_for_the_rest_and_controls_are_not_typed() {
+        // a layout with 'a' and 'A' (Shift) only
+        let key = |c| match c {
+            'a' => Some((0x41, 0)),
+            'A' => Some((0x41, 1)),
+            _ => None,
+        };
+        let (steps, unmapped) = windows_steps("aA✓\r\n\t😀\u{7}", key);
+        let expected = [
+            WinStep::Key(0x41, 0),
+            WinStep::Key(0x41, 1),
+            WinStep::Packet(vec![0x2713]),
+            WinStep::Key(0x0d, 0),
+            WinStep::Key(0x09, 0),
+            WinStep::Packet("😀".encode_utf16().collect()),
+        ];
+        assert_eq!(steps, expected);
+        assert_eq!(unmapped, "\u{7}");
     }
 }
 

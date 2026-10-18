@@ -42,6 +42,7 @@ use crate::{
 pub(crate) const MIN_CONNECTION_IDLE: Duration = Duration::from_secs(60);
 /// how long a requester waits for an answer, beyond an observe timeout
 pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+const _: () = assert!(input_emulation::MAX_TYPE_PACING.as_millis() < ANSWER_TIMEOUT.as_millis());
 /// how long a requester tries to connect, all of a client's addresses
 /// together
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
