@@ -7,6 +7,7 @@ use mimouse::{
     config::{self, Command, Config, ConfigError},
     emulation_test,
     ipc::{IpcError, IpcListenerCreationError},
+    mcp::{self, McpError},
     service::{Service, ServiceError},
 };
 use std::{future::Future, io, process};
@@ -29,6 +30,8 @@ enum MiMouseError {
     Emulation(#[from] InputEmulationError),
     #[error(transparent)]
     Cli(#[from] CliError),
+    #[error(transparent)]
+    Mcp(#[from] McpError),
 }
 
 fn main() {
@@ -51,6 +54,7 @@ fn run() -> Result<(), MiMouseError> {
         Some(Command::TestEmulation(args)) => run_async(emulation_test::run(config, args)),
         Some(Command::TestCapture(args)) => run_async(capture_test::run(config, args)),
         Some(Command::Cli(cli_args)) => run_async(cli::run(cli_args, config)),
+        Some(Command::Mcp(args)) => run_async(mcp::run(args)),
         // `mimouse` and `mimouse daemon` both run the service
         Some(Command::Daemon) | None => match run_async(run_service(config)) {
             Err(MiMouseError::Service(ServiceError::IpcListen(
