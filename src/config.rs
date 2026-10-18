@@ -810,6 +810,27 @@ impl Config {
         Duration::from_secs(secs.unwrap_or(DEFAULT_AGENT_IDLE_TIMEOUT))
     }
 
+    /// `[agent]` as the agent layer applies it
+    pub(crate) fn agent_policy(&self) -> crate::agent::Policy {
+        let peers = self
+            .config_toml
+            .agent
+            .as_ref()
+            .and_then(|a| a.peers.as_ref())
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|(fingerprint, grants)| (fingerprint.clone(), grants.grants()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::agent::Policy {
+            local: self.agent_grants(&Requester::Local),
+            peers,
+            idle_timeout: self.agent_idle_timeout(),
+        }
+    }
+
     /// path to certificate
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
@@ -1483,10 +1504,29 @@ fn merge_table(dst: &mut toml_edit::Table, old: &toml_edit::Table, new: &toml_ed
             }
             (Some(d), n) => *d = n.clone(),
             (None, n) => {
-                dst.insert(&k, n.clone());
+                dst.insert(&k, standard(n.clone()));
             }
         }
     }
+}
+
+/// `item` with its inline tables turned into `[tables]`, as a person would
+/// write a new section (`[agent.self]` rather than `agent = { self = .. }`);
+/// a table holding only tables gets no header of its own
+fn standard(item: toml_edit::Item) -> toml_edit::Item {
+    let mut table = match item {
+        toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => t.into_table(),
+        toml_edit::Item::Table(t) => t,
+        item => return item,
+    };
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+    for k in keys {
+        let item = table.remove(&k).expect("listed");
+        table.insert(&k, standard(item));
+    }
+    let only_tables = !table.is_empty() && table.iter().all(|(_, v)| v.is_table());
+    table.set_implicit(only_tables);
+    toml_edit::Item::Table(table)
 }
 
 /// serialize into a standalone table
@@ -2341,7 +2381,7 @@ future_client_key = "kept"
         assert_eq!(key("max_file_size"), (max, Source::Default, true));
         assert_eq!(key("idle_inhibit"), (json(true), Source::Default, false));
         assert_eq!(key("local_hotkey"), (json(()), Source::Default, false));
-        assert_eq!(report.keys.len(), 15, "every key of the file is reported");
+        assert_eq!(report.keys.len(), 16, "every key of the file is reported");
         assert_eq!(report.awaiting_restart, []);
 
         // without flags: the file, where it sets the key
@@ -2390,7 +2430,10 @@ future_client_key = "kept"
         assert!(out.contains("# mine") && out.contains("# short"), "{out}");
         let reread = Config::at(&path).unwrap();
         assert_eq!(reread.agent_grants(&peer), grants);
-        assert_eq!(reread.agent_grants(&Requester::Local).clipboard, Grant::Allow);
+        assert_eq!(
+            reread.agent_grants(&Requester::Local).clipboard,
+            Grant::Allow
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

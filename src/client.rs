@@ -142,6 +142,23 @@ impl ClientManager {
         self.read(handle, |c, s| (c.clone(), s.clone()))
     }
 
+    /// where the client's TCP services (clipboard, agent) are reached: the
+    /// address of its live connection first, then its other IPs
+    pub(crate) fn addrs(&self, handle: ClientHandle) -> Option<Vec<SocketAddr>> {
+        let (config, state) = self.get_state(handle)?;
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        if let Some(addr) = state.active_addr {
+            addrs.push(SocketAddr::new(addr.ip(), config.port));
+        }
+        for ip in state.ips {
+            let addr = SocketAddr::new(ip, config.port);
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+        Some(addrs)
+    }
+
     /// get the current config & state of all clients, in config order
     pub fn get_client_states(&self) -> Vec<(ClientHandle, ClientConfig, ClientState)> {
         self.clients.borrow().clients.clone()

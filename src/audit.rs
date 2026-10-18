@@ -52,7 +52,23 @@ impl AuditLog {
         request: &FrontendRequest,
         result: &Result<(), String>,
     ) {
-        let line = line(requester, request, result);
+        self.send(line(requester, request, result));
+    }
+
+    /// record an agent request a peer with certificate `fingerprint` sent
+    /// to this machine; `request` is already redacted (`proto::Request::audit`)
+    pub(crate) fn record_agent(
+        &self,
+        fingerprint: &str,
+        request: Value,
+        result: &Result<(), String>,
+    ) {
+        let requester = json!({ "agent_peer": fingerprint });
+        let details = json!({ "target": "self", "request": request });
+        self.send(entry(requester, json!("agent"), details, result));
+    }
+
+    fn send(&self, line: String) {
         if let Some(lines) = &self.lines {
             // the writer only stops once `lines` is dropped
             let _ = lines.send(line);
@@ -81,6 +97,10 @@ fn line(requester: &Peer, request: &FrontendRequest, result: &Result<(), String>
         .as_object_mut()
         .and_then(|o| o.remove("action"))
         .unwrap_or(Value::Null);
+    entry(json!(requester), action, details, result)
+}
+
+fn entry(requester: Value, action: Value, details: Value, result: &Result<(), String>) -> String {
     let mut record = json!({
         "ts": jiff::Timestamp::now().to_string(),
         "requester": requester,

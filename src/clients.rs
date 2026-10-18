@@ -21,10 +21,13 @@ use std::{
 use crate::{
     capture::Hotkeys,
     client::{Barrier, ClientManager, match_clients},
-    config::{Config, ConfigClient},
+    config::{AgentGrants, Config, ConfigClient, Requester},
     connect::Connector,
     dns::{DnsEvent, DnsRequester},
-    ipc::{ClientConfig, ClientHandle, ClientInfo, ClientState, FrontendEvent, Reply},
+    ipc::{
+        AgentGrantInfo, AgentTarget, ClientConfig, ClientHandle, ClientInfo, ClientState,
+        FrontendEvent, Reply,
+    },
     pair,
     service::FrontendQueue,
 };
@@ -103,6 +106,12 @@ impl Clients {
 
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// the client list shared with connections (agent requests dial and
+    /// pin through it)
+    pub(crate) fn manager(&self) -> &ClientManager {
+        &self.manager
     }
 
     /// waits until the config file changed or a certificate was pinned
@@ -281,6 +290,97 @@ impl Clients {
                 format!("failed to write config: {e}")
             })?;
         Ok(())
+    }
+
+    /// Saves what `requester` may do here (unset scopes keep their value)
+    /// and returns its grants now in effect. A requester names `self`, an
+    /// authorized fingerprint, or an authorized key's description.
+    pub(crate) async fn set_agent_grant(
+        &mut self,
+        requester: &str,
+        grants: AgentGrants,
+    ) -> Result<AgentGrantInfo, String> {
+        let requester = self.agent_requester(requester)?;
+        let clients = self.running().into_iter().map(|(_, c)| c).collect();
+        let keys = self.authorized_keys();
+        let (grants, reload) = self
+            .config
+            .save_agent_grants(&requester, grants, clients, keys)
+            .await
+            .map_err(|e| {
+                log::warn!("failed to write config: {e}");
+                format!("failed to write config: {e}")
+            })?;
+        self.reload |= reload;
+        Ok(AgentGrantInfo {
+            requester: requester.to_string(),
+            grants,
+        })
+    }
+
+    fn agent_requester(&self, name: &str) -> Result<Requester, String> {
+        if name == "self" {
+            return Ok(Requester::Local);
+        }
+        let keys = self.authorized_keys.read().expect("lock");
+        if keys.contains_key(name) {
+            return Ok(Requester::Peer(name.to_owned()));
+        }
+        let mut named = keys.iter().filter(|(_, d)| *d == name);
+        match (named.next(), named.next()) {
+            (Some((fingerprint, _)), None) => Ok(Requester::Peer(fingerprint.clone())),
+            (Some(_), Some(_)) => Err(format!(
+                "several authorized keys are named {name}; give the fingerprint"
+            )),
+            (None, _) => Err(format!(
+                "{name} is neither `self` nor an authorized key (`mimouse cli authorize-key` or pair first)"
+            )),
+        }
+    }
+
+    /// The machine an agent request goes to: `None` for this one, else the
+    /// client named by id or host name.
+    pub(crate) fn agent_target(&self, target: &str) -> Result<Option<ClientHandle>, String> {
+        if target == "self" {
+            return Ok(None);
+        }
+        let infos = self.infos();
+        if let Ok(id) = target.parse::<ClientHandle>() {
+            if infos.iter().any(|i| i.id == id) {
+                return Ok(Some(id));
+            }
+        }
+        let mut named = infos
+            .iter()
+            .filter(|i| i.config.hostname.as_deref() == Some(target));
+        match (named.next(), named.next()) {
+            (Some(info), None) => Ok(Some(info.id)),
+            (Some(_), Some(_)) => Err(format!("several clients are named {target}; give the id")),
+            (None, _) => Err(format!(
+                "no target {target}: use `self`, a client id or host name (`mimouse cli agent targets`)"
+            )),
+        }
+    }
+
+    /// the machines agent requests can go to: this one, then the clients
+    pub(crate) fn agent_targets(&self, local_name: String) -> Vec<AgentTarget> {
+        let local = AgentTarget {
+            target: "self".into(),
+            name: local_name,
+            fingerprint: None,
+        };
+        let clients = self.infos().into_iter().map(|i| AgentTarget {
+            target: i.id.to_string(),
+            name: i.config.hostname.unwrap_or_else(|| {
+                i.state
+                    .ips
+                    .iter()
+                    .next()
+                    .map_or_else(String::new, ToString::to_string)
+            }),
+            fingerprint: i.config.fingerprint,
+        });
+        std::iter::once(local).chain(clients).collect()
     }
 
     /// saves fingerprints pinned on first use

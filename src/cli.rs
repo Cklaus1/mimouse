@@ -1,3 +1,5 @@
+mod agent;
+
 use clap::{Args, Parser, Subcommand};
 use futures::{Stream, StreamExt};
 use std::{io::BufRead, net::IpAddr, time::Duration};
@@ -9,10 +11,10 @@ use crate::{
     discover::{self, DiscoverError},
     doctor,
     ipc::{
-        AsyncFrontendEventReader, AsyncFrontendRequestWriter, BackendInUse, ClientHandle,
-        ClientInfo, ClipboardDirection, ClipboardStatus, ConfigReport, ConnectionError,
-        DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply, Status,
-        TelemetryCrash, TelemetryShow, TelemetryStatus, connect_async,
+        AgentSessionState, AsyncFrontendEventReader, AsyncFrontendRequestWriter, BackendInUse,
+        ClientHandle, ClientInfo, ClipboardDirection, ClipboardStatus, ConfigReport,
+        ConnectionError, DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, Reply,
+        Status, TelemetryCrash, TelemetryShow, TelemetryStatus, connect_async,
     },
     telemetry,
 };
@@ -173,6 +175,9 @@ enum CliSubcommand {
         #[command(subcommand)]
         action: TelemetryAction,
     },
+    /// act on a machine as an AI agent would: screenshots, input, clipboard
+    /// (`mimouse mcp` exposes the same to agents)
+    Agent(agent::AgentArgs),
 }
 
 #[derive(Clone, Copy, Subcommand, Debug, PartialEq, Eq)]
@@ -214,6 +219,7 @@ async fn run_command(args: CliArgs, config: Config) -> Result<(), CliError> {
     let (rx, mut tx) = connect_async(Some(Duration::from_millis(500))).await?;
     let request = match args.command {
         CliSubcommand::Watch => return watch(rx, args.json).await,
+        CliSubcommand::Agent(agent) => return agent::run(agent, rx, tx, args.json).await,
         CliSubcommand::Pair(Pair {
             confirm: Some(code),
             ..
@@ -332,7 +338,8 @@ fn request(cmd: CliSubcommand) -> FrontendRequest {
         CliSubcommand::Watch
         | CliSubcommand::Discover { .. }
         | CliSubcommand::Doctor
-        | CliSubcommand::Pair(_) => {
+        | CliSubcommand::Pair(_)
+        | CliSubcommand::Agent(_) => {
             unreachable!("handled in `run`")
         }
     }
@@ -727,6 +734,26 @@ fn print_event(event: &FrontendEvent) {
             not_saved: Some(e),
         } => println!("paired with {peer} ({fingerprint}): client {id}; not saved: {e}"),
         FrontendEvent::PairFailed { reason } => println!("pairing failed: {reason}"),
+        FrontendEvent::AgentSession {
+            target,
+            requester,
+            state,
+            reason,
+            purpose,
+        } => {
+            let place = match target.as_str() {
+                "self" => format!("agent session of {requester}"),
+                id => format!("agent session on client {id}"),
+            };
+            match (state, reason, purpose) {
+                (AgentSessionState::Started, _, Some(purpose)) => {
+                    println!("{place} started: {purpose}")
+                }
+                (AgentSessionState::Started, _, None) => println!("{place} started"),
+                (AgentSessionState::Ended, Some(reason), _) => println!("{place} ended: {reason}"),
+                (AgentSessionState::Ended, None, _) => println!("{place} ended"),
+            }
+        }
     }
 }
 

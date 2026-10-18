@@ -55,10 +55,7 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 const _: () = assert!(FRAME_TIMEOUT.as_nanos() < CONFIRM_TIMEOUT.as_nanos());
 const _: () = assert!(CONFIRM_TIMEOUT.as_nanos() <= MAX_WINDOW.as_nanos());
 
-/// a pairing connection whose TLS handshake has not completed yet, the
-/// address it came from, and its slot among the TCP listener's connections;
-/// sent by the TCP listener
-pub(crate) type Incoming = (StartHandshake<TcpStream>, SocketAddr, OwnedSemaphorePermit);
+use crate::clipboard::Incoming;
 
 /// whether a TLS client asks for a pairing connection
 pub(crate) fn is_pairing(start: &StartHandshake<TcpStream>) -> bool {
@@ -583,7 +580,7 @@ fn peer_fingerprint(certs: Option<&[CertificateDer<'static>]>) -> Result<String,
 }
 
 /// this machine's name as the peer should know it
-async fn local_name() -> String {
+pub(crate) async fn local_name() -> String {
     #[cfg(windows)]
     let name = std::env::var("COMPUTERNAME").ok();
     #[cfg(target_os = "linux")]

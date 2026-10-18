@@ -128,13 +128,32 @@ Set `clipboard = true` on both machines. Text, HTML and images are sent to all a
 - What the clipboard holds when the service starts (Windows) or when clipboard access is granted (GNOME) is not sent; copying it again sends it.
 - `mimouse cli list` (and `--json`, field `clipboard`) and `mimouse cli doctor` show the clipboard sharing state: off, starting, awaiting approval (GNOME's remote desktop / clipboard dialog is open; copies received meanwhile are applied once it is approved), enabled, or disabled with the reason (dialog denied: restart the service to ask again). While clipboard sharing is disabled because its backend ended, received copies are refused, so the sending machine logs `peer did not acknowledge the update`.
 
+### Agent control
+
+An AI agent can look at and drive this machine or a client through MiMouse: screenshots, pointer, clicks, keys, typed text and the clipboard. Everything is denied until you grant it, per requester and scope:
+
+```sh
+mimouse cli agent grant self --input allow --screen allow   # agents on this machine
+mimouse cli agent grant gpumaster --screen allow            # a peer, by authorized key name or fingerprint
+```
+
+Grants are saved under `[agent]` in `config.toml` on the machine being controlled, and apply at once; taking one away ends a running session. A peer needs to be in `authorized_fingerprints` too (pairing does that).
+
+- **MCP:** `claude mcp add mimouse -- mimouse mcp` (or any MCP client running `mimouse mcp` over stdio). Tools: `list_targets`, `session_open`, `session_close`, `screenshot`, `pointer_to`, `click`, `key`, `type`, `scroll`, `clip_get`, `clip_set`; each takes `target` (`self`, a client id or host name, default `self`). Actions can return a screenshot taken once the screen has settled.
+- **CLI:** `mimouse cli agent [-t <target>] <verb>`: `targets`, `grant`, `hello`, `open --reason`, `close`, `key ctrl+l`, `type <text>`, `pointer-to <x> <y>`, `pointer-move`, `click`, `button`, `scroll`, `screenshot -o shot.png`, `clip-get`, `clip-set`. Actions take `--observe <file>` to save the settled screen afterwards. `--json` prints the protocol's answer.
+- **Coordinates:** the protocol and the CLI use desktop pixels, the pixels of a full-resolution screenshot (physical pixels on Windows); a scaled-down screenshot reports its `scale` and origin. MCP tools take pixels of the last screenshot by default and convert them (`coords = "desktop"` for desktop pixels).
+- **Sessions:** one agent at a time per machine; the first action starts a session, and the machine shows a notice when one starts (with the agent's reason) and ends. A session ends on `close`, after `[agent] idle_timeout` seconds without a request (default 30), when the agent's connection closes, when the grant is taken away, and when this machine starts controlling another (agent input is refused while it does).
+- **You win:** touching the keyboard or mouse, or controlling the machine from a peer, ends the session and releases every key and button the agent held. The agent is refused until it opens a new session, so it should ask you first. Windows and macOS tell your input from injected input exactly; Linux infers it from the session idle time, so input you make within a moment of the agent's may go unnoticed.
+- **Platforms:** screenshots through the xdg-desktop-portal Screenshot interface (Linux; GNOME may ask once), `screencapture` (macOS, needs Screen Recording permission) and GDI (Windows). Typed text: Windows and macOS type any Unicode text; libei and the other Linux backends type what the keyboard layout produces and report the rest as `unmapped`.
+- Requests run over TLS on the MiMouse TCP port with the same certificate and trust as the clipboard, even with `clipboard = false`. Each request is written to `audit.jsonl` (peers' requests on the target, with `agent_peer`); typed text and clipboard contents are never logged, only their sizes.
+
 ## Config
 
 `config.toml` is described in the example [config.toml](config.toml). Linux/macOS: `~/.config/mimouse/config.toml`; Windows: `%LOCALAPPDATA%\mimouse\config.toml`; `--config <path>` picks another file.
 
 **Precedence:** a command line flag (`--port`, `--capture-backend`, `--emulation-backend`, `--cert-path`) beats `config.toml`, which beats the built-in default. Every other key comes from the file, else the default. `MIMOUSE_LOG_LEVEL` only sets logging.
 
-**Reload:** the service watches the file. Edits to clients, `release_bind`, `release_double_tap_ctrl`, `hotkey` and `local_hotkey`, `notify_switch`, `idle_inhibit`, `authorized_fingerprints`, `telemetry` and `telemetry_endpoint` apply at once. `clipboard`, `max_file_size`, `capture_backend`, `emulation_backend`, `cert_path` and the file's `port` take effect at the next start; `mimouse cli change-port <port>` is live and saves the new port to config.toml (a `--port` flag still overrides it at startup). When an edit changes a restart-only key, the service logs one warning per reload naming the keys that wait for a restart.
+**Reload:** the service watches the file. Edits to clients, `release_bind`, `release_double_tap_ctrl`, `hotkey` and `local_hotkey`, `notify_switch`, `idle_inhibit`, `authorized_fingerprints`, `[agent]`, `telemetry` and `telemetry_endpoint` apply at once. `clipboard`, `max_file_size`, `capture_backend`, `emulation_backend`, `cert_path` and the file's `port` take effect at the next start; `mimouse cli change-port <port>` is live and saves the new port to config.toml (a `--port` flag still overrides it at startup). When an edit changes a restart-only key, the service logs one warning per reload naming the keys that wait for a restart.
 
 `mimouse cli config [--json]` prints each key's value in effect, where it comes from (`flag`, `file`, `default`, or `cli` for a port set by `change-port`) and the keys changed in the file that wait for a restart. `mimouse cli list` and `mimouse cli doctor` show the capture and emulation backend in use and whether it was configured or picked automatically, e.g. `capture: enabled (input-capture-portal, auto)`.
 
@@ -154,10 +173,10 @@ An invalid file is reported at startup, on reload and by `mimouse cli doctor`, a
 ## CLI
 
 Talks to the running service; `mimouse cli help` lists commands:
-`list`, `watch`, `config`, `discover`, `doctor`, `pair`, `focus`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `set-enter-hook`, `change-port`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`, `telemetry`.
+`list`, `watch`, `config`, `discover`, `doctor`, `pair`, `focus`, `add-client`, `remove-client`, `activate`, `deactivate`, `set-host`, `set-port`, `set-position`, `set-ips`, `set-enter-hook`, `change-port`, `authorize-key`, `remove-authorized-key`, `enable-capture`, `enable-emulation`, `save-config`, `telemetry`, `agent` (see [Agent control](#agent-control)).
 
 - Commands wait for the service and save `config.toml` on success.
-- Exit codes: 0 success, 1 other error (including no reply from the service within 5 s, e.g. a CLI/service version mismatch), 2 invalid arguments, 3 the service is not running (could not connect), 4 the service rejected the request or it failed (including a failed pairing), 5 `doctor` found failing checks.
+- Exit codes: 0 success, 1 other error (including no reply from the service within 5 s, 75 s for `agent` requests, e.g. a CLI/service version mismatch), 2 invalid arguments, 3 the service is not running (could not connect), 4 the service rejected the request or it failed (including a failed pairing), 5 `doctor` found failing checks.
 - `--json`: one JSON value per result; every error also prints one JSON object `{"error": "<message>"}` on stdout. `list --json` includes `capture` and `emulation`: `enabled`, `disabled` or `awaiting_approval` (a portal dialog is waiting). `watch --json` prints the current state, then streams events (clients, connections, clipboard transfers without contents, unauthorized attempts) as JSON lines; schema: `FrontendEvent` in `src/ipc/mod.rs`.
 - Control channel: Unix socket in `$XDG_RUNTIME_DIR` (Linux) or `~/Library/Caches` (macOS); on Windows the named pipe `\\.\pipe\mimouse-<user SID>`, accessible only to the current user, local only. The CLI refuses a pipe owned by anyone else.
 - Audit log: every state-changing request is appended to `audit.jsonl` next to `config.toml` (time, requesting pid/user/exe, action, details, result); rotated at 10 MiB, 3 old files kept. `list` and `watch` are not logged.

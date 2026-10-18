@@ -27,6 +27,7 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - `audit.jsonl`: every state-changing CLI or IPC request is logged, rotated at 10 MiB.
 - Config validation: invalid ranges, duplicate or conflicting hotkeys, `port = 0`, `max_file_size = 0` and a non-HTTPS `telemetry_endpoint` are rejected and the error names the client. An invalid file is never overwritten. MiMouse keeps running on `config.toml.last-good`.
 - Config write-backs edit `config.toml` in place, keeping comments, key order and unknown keys. A save merges with changes made to the file in the meantime.
+- Agent control: AI agents take screenshots and drive the pointer, keys, typed text and clipboard of this machine or a client, through `mimouse mcp` (MCP over stdio) or `mimouse cli agent`. Denied unless granted per requester and scope (`mimouse cli agent grant`, `[agent]` in `config.toml`); one session per machine, announced when it starts and ends, ended at once when a person uses the machine, and every request is audited. *MiMouse peers.*
 - Opt-in telemetry, off by default: `mimouse cli telemetry on|off|status|show`. See the README for what is sent.
 - Packages: `.deb` and `.rpm` (with a systemd user unit and a firewalld service), a Windows `.exe` with version information, and Scoop, winget and Homebrew manifests.
 - `docs/adding-a-backend.md`: how to add a capture, emulation or clipboard backend, with the contract suite each kind must pass.

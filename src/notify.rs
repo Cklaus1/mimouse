@@ -1,5 +1,6 @@
-//! Desktop notifications: which machine has control, approval waits of the
-//! desktop portals and connection attempts from unknown certificates.
+//! Desktop notifications: which machine has control, agent sessions,
+//! approval waits of the desktop portals and connection attempts from
+//! unknown certificates.
 //!
 //! Notices are handed to a platform worker (a local task on Linux, a thread
 //! on Windows and macOS) so the service loop never waits for the desktop.
@@ -15,6 +16,8 @@ const APP_NAME: &str = "MiMouse";
 const UNAUTHORIZED_INTERVAL: Duration = Duration::from_secs(60);
 /// the same approval wait is announced at most once per interval
 const APPROVAL_INTERVAL: Duration = Duration::from_secs(300);
+/// longest agent purpose shown, in characters
+const MAX_PURPOSE: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Notice {
@@ -79,6 +82,20 @@ impl Notifier {
     fn unauthorized_notice(&mut self, fingerprint: &str, now: Instant) -> Option<Notice> {
         let held_back = self.unauthorized.allow(now)?;
         Some(unauthorized_notice(fingerprint, held_back))
+    }
+
+    /// An agent session started (D8: always announced): `who` holds it,
+    /// `purpose` is what the agent said it is doing.
+    pub(crate) fn agent_started(&mut self, who: &str, purpose: Option<&str>) {
+        self.backend.show(agent_started_notice(who, purpose));
+    }
+
+    /// the agent session of `who` ended for `reason`
+    pub(crate) fn agent_ended(&mut self, who: &str, reason: &str) {
+        self.backend.show(Notice {
+            summary: format!("Agent control by {who} ended"),
+            body: format!("reason: {reason}"),
+        });
     }
 }
 
@@ -169,6 +186,25 @@ fn approval_notice(what: &str) -> Notice {
     Notice {
         summary: "MiMouse is waiting for approval".into(),
         body: format!("Allow {what} in the system dialog."),
+    }
+}
+
+/// The notice for a started agent session. The purpose comes from the
+/// agent: control characters are dropped and it is cut at `MAX_PURPOSE`.
+fn agent_started_notice(who: &str, purpose: Option<&str>) -> Notice {
+    let purpose: String = purpose
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PURPOSE)
+        .collect();
+    let mut body = String::from("It can use this machine within its grants.");
+    if !purpose.trim().is_empty() {
+        body = format!("{}\n{body}", purpose.trim());
+    }
+    Notice {
+        summary: format!("Agent control by {who} started"),
+        body,
     }
 }
 
@@ -560,6 +596,18 @@ mod tests {
             "Controlling megapc"
         );
         assert_eq!(switch_text(None, "gpumaster"), "Back on gpumaster");
+    }
+
+    #[test]
+    fn agent_purpose_is_cleaned_and_cut() {
+        let long = "x".repeat(MAX_PURPOSE + 50);
+        let notice = agent_started_notice("laptop", Some(&long));
+        assert_eq!(notice.body.lines().next().unwrap().len(), MAX_PURPOSE);
+        // a peer cannot forge extra notice lines
+        let notice = agent_started_notice("laptop", Some("fix\nthe\u{1b}[2Jbuild"));
+        assert_eq!(notice.body.lines().next(), Some("fixthe[2Jbuild"));
+        let notice = agent_started_notice("laptop", Some("  "));
+        assert_eq!(notice.body.lines().count(), 1);
     }
 
     #[test]

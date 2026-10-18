@@ -113,7 +113,6 @@ impl EmulationAgent {
     }
 
     /// emulates `event` for `session`
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
     pub(crate) async fn agent_event(
         &self,
         session: AgentSession,
@@ -125,7 +124,6 @@ impl EmulationAgent {
 
     /// Moves the pointer to `(x, y)` of a `size` screenshot of the whole
     /// desktop; [`AgentError::Unsupported`] if the backend cannot place it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
     pub(crate) async fn agent_pointer_to(
         &self,
         session: AgentSession,
@@ -138,7 +136,6 @@ impl EmulationAgent {
     }
 
     /// types `text` for `session`; the characters it could not type
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
     pub(crate) async fn agent_type(
         &self,
         session: AgentSession,
@@ -149,7 +146,6 @@ impl EmulationAgent {
     }
 
     /// ends `session`, releasing what it holds
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
     pub(crate) fn agent_end(&self, session: AgentSession) {
         let _ = self
             .request_tx
@@ -157,7 +153,6 @@ impl EmulationAgent {
     }
 
     /// the active backend, `None` while emulation is off
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
     pub(crate) async fn agent_info(&self) -> Option<AgentEmulation> {
         self.request(AgentRequest::Info).await.ok().flatten()
     }
@@ -198,7 +193,6 @@ impl Emulation {
     }
 
     /// a handle for agent sessions, usable while the emulation runs
-    #[expect(dead_code, reason = "called by the agent layer")]
     pub(crate) fn agent(&self) -> EmulationAgent {
         self.agent.clone()
     }
@@ -407,7 +401,6 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
-    #[cfg_attr(not(test), expect(dead_code, reason = "sent by the agent layer"))]
     Agent(AgentRequest),
 }
 

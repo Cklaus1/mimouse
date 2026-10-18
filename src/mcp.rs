@@ -23,7 +23,7 @@ use tokio::{
 
 use crate::{
     agent::{
-        keys,
+        IPC_REPLY_TIMEOUT, keys,
         proto::{Blob, Button, ErrorCode, Format, Frame, Observe, Region, Request, Response, Shot},
     },
     ipc::{
@@ -52,9 +52,6 @@ const INVALID_PARAMS: i64 = -32602;
 
 /// how long the service gets to connect
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-/// Agent requests may wait for the screen to settle (`Observe`) and cross
-/// the network to a peer.
-const REPLY_TIMEOUT: Duration = Duration::from_millis(Observe::MAX_TIMEOUT_MS as u64 + 30_000);
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
 pub struct McpArgs {
@@ -163,12 +160,12 @@ impl IpcService {
             }
             Err("the MiMouse service closed the connection".to_owned())
         };
-        tokio::time::timeout(REPLY_TIMEOUT, wait)
+        tokio::time::timeout(IPC_REPLY_TIMEOUT, wait)
             .await
             .map_err(|_| {
                 format!(
                     "the MiMouse service did not answer within {} s",
-                    REPLY_TIMEOUT.as_secs()
+                    IPC_REPLY_TIMEOUT.as_secs()
                 )
             })?
     }

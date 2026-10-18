@@ -1,17 +1,21 @@
 use crate::ipc::{
-    AsyncFrontendListener, BackendInUse, ClientHandle, ConnId, FrontendEvent, FrontendRequest,
-    IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
+    AgentSessionState, AsyncFrontendListener, BackendInUse, ClientHandle, ConnId, FrontendEvent,
+    FrontendRequest, IpcEvent, IpcListenerCreationError, Peer, Position, Reply, Request, Status,
 };
 use crate::{
+    agent::{
+        Agent, AgentEvent, Dial, RemoteEnded, ServiceDesk, TargetEvent,
+        proto::{self, ErrorCode},
+    },
     approval::reported_status,
     audit::AuditLog,
     capture::{Capture, CaptureType, Hotkeys, ICaptureEvent},
     client::{Barrier, ClientManager},
     clients::{Change, Clients, Sinks},
-    clipboard::{Clipboard, ClipboardEvent},
-    config::Config,
+    clipboard::{Clipboard, ClipboardEvent, Routes},
+    config::{AgentGrants, Config, Requester},
     connect::MiMouseConnection,
-    crypto,
+    crypto::{self, peers::Policy},
     dns::DnsResolver,
     emulation::{Emulation, EmulationEvent},
     inhibit::IdleInhibit,
@@ -34,7 +38,12 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{
+    process::Command,
+    signal,
+    sync::{Notify, mpsc},
+    task::spawn_local,
+};
 use webrtc_dtls::crypto::Certificate;
 
 #[derive(Debug, Error)]
@@ -101,6 +110,21 @@ pub struct Service {
     pairing: Pairing,
     /// opt-in usage statistics
     telemetry: Telemetry,
+    /// agent control: this machine as a target, and requests to clients
+    agent: Agent<ServiceDesk>,
+    /// `Agent` IPC requests are answered by tasks of their own, which send
+    /// the answer here for the audit log and the reply
+    agent_reply_tx: mpsc::UnboundedSender<AgentReply>,
+    agent_reply_rx: mpsc::UnboundedReceiver<AgentReply>,
+}
+
+/// a target's answer to an `Agent` IPC request
+struct AgentReply {
+    conn: ConnId,
+    seq: u64,
+    peer: Peer,
+    request: FrontendRequest,
+    response: proto::Response,
 }
 
 #[derive(Debug)]
@@ -137,10 +161,12 @@ impl FrontendQueue {
     }
 }
 
-/// client changes take effect in input capture and the clipboard
+/// client changes take effect in input capture, the clipboard and the
+/// agent's connections
 struct Live<'a> {
     capture: &'a Capture,
     clipboard: &'a Clipboard,
+    agent: &'a Agent<ServiceDesk>,
 }
 
 impl Sinks for Live<'_> {
@@ -159,6 +185,9 @@ impl Sinks for Live<'_> {
 
     fn client_removed(&self, handle: ClientHandle) {
         self.clipboard.client_removed(handle);
+        if let Some(remote) = self.agent.remote() {
+            remote.forget(handle);
+        }
     }
 }
 
@@ -216,6 +245,7 @@ impl Service {
         let emulation = Emulation::new(emulation_backend, listener);
 
         let (pairing, pair_tx) = Pairing::new(&cert).map_err(io::Error::other)?;
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let clipboard = Clipboard::new(
             config.clipboard(),
             config.port(),
@@ -223,8 +253,19 @@ impl Service {
             &cert,
             authorized_keys.clone(),
             client_manager.clone(),
-            pair_tx,
+            Routes {
+                pair: pair_tx,
+                agent: agent_tx,
+            },
         );
+        let agent = Agent::new(
+            ServiceDesk::new(emulation.agent(), clipboard.agent()),
+            config.agent_policy(),
+            &cert,
+            authorized_keys.clone(),
+            agent_rx,
+        );
+        let (agent_reply_tx, agent_reply_rx) = mpsc::unbounded_channel();
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -268,6 +309,9 @@ impl Service {
             inhibit,
             pairing,
             telemetry,
+            agent,
+            agent_reply_tx,
+            agent_reply_rx,
         };
         Ok(service)
     }
@@ -277,6 +321,7 @@ impl Service {
         self.clients.start(&Live {
             capture: &self.capture,
             clipboard: &self.clipboard,
+            agent: &self.agent,
         });
 
         loop {
@@ -288,6 +333,8 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.clients.resolved(event),
                 event = self.pairing.event() => self.handle_pair_event(event).await,
+                event = self.agent.event() => self.handle_agent_event(event),
+                Some(reply) = self.agent_reply_rx.recv() => self.agent_replied(reply),
                 change = self.clients.changed() => match change {
                     Change::Config => self.handle_config_change(),
                     Change::Pinned => self.save_pins().await,
@@ -305,10 +352,11 @@ impl Service {
         Ok(())
     }
 
-    /// ends capture (held keys released), emulation, the clipboard and the
-    /// resolver, and saves the telemetry counters
+    /// ends agent sessions, capture (held keys released), emulation, the
+    /// clipboard and the resolver, and saves the telemetry counters
     async fn terminate(&mut self) {
         log::info!("terminating service ...");
+        self.agent.target().shutdown();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -349,6 +397,11 @@ impl Service {
                         return;
                     }
                 }
+                if let FrontendRequest::Agent { .. } = request {
+                    // answered once the target did it
+                    self.agent_request(conn, seq, peer, request);
+                    return;
+                }
                 if let FrontendRequest::Focus { id } = request {
                     match self.focus_error(id) {
                         // answered once capture started, or failed to
@@ -388,6 +441,7 @@ impl Service {
         let fx = Live {
             capture: &self.capture,
             clipboard: &self.clipboard,
+            agent: &self.agent,
         };
         let clients = &mut self.clients;
         let reply = match request.clone() {
@@ -513,10 +567,27 @@ impl Service {
             FrontendRequest::TelemetryShow => Reply::TelemetryShow(self.telemetry.show()),
             // counted in `handle_ipc_event`
             FrontendRequest::CountCommand { .. } => Reply::Done,
-            FrontendRequest::Agent { .. }
-            | FrontendRequest::AgentTargets
-            | FrontendRequest::AgentGrant { .. } => {
-                return Err("agent control is being built".into());
+            // agent requests are handled in `handle_ipc_event`
+            FrontendRequest::Agent { .. } => Reply::Done,
+            FrontendRequest::AgentTargets => {
+                Reply::AgentTargets(clients.agent_targets(pair::local_name().await))
+            }
+            FrontendRequest::AgentGrant {
+                requester,
+                input,
+                screen,
+                clipboard,
+            } => {
+                let grants = AgentGrants {
+                    input,
+                    screen,
+                    clipboard,
+                };
+                let info = clients.set_agent_grant(&requester, grants).await?;
+                self.agent
+                    .target()
+                    .set_policy(clients.config().agent_policy());
+                Reply::AgentGrant(info)
             }
         };
         Ok(reply)
@@ -544,11 +615,13 @@ impl Service {
         self.clients.reload(&Live {
             capture: &self.capture,
             clipboard: &self.clipboard,
+            agent: &self.agent,
         });
         let config = self.clients.config();
         self.capture.set_release_bind(config.release_bind());
         self.notifier.set_switch_enabled(config.notify_switch());
         self.inhibit.set_enabled(config.idle_inhibit());
+        self.agent.target().set_policy(config.agent_policy());
         self.telemetry.configure(Settings::of(config));
         telemetry::COUNTERS.set_peers(config.clients().len());
         let pending = config.awaiting_restart();
@@ -603,6 +676,7 @@ impl Service {
                 let fx = Live {
                     capture: &self.capture,
                     clipboard: &self.clipboard,
+                    agent: &self.agent,
                 };
                 self.clients.paired(&fx, trusted).await
             }
@@ -692,7 +766,7 @@ impl Service {
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::Connection { addr, fingerprint });
             }
-            EmulationEvent::PeerInput => {}
+            EmulationEvent::PeerInput => self.agent.target().person_input(),
         }
     }
 
@@ -797,6 +871,8 @@ impl Service {
     /// a peer took control from `addr`: place (or move) the barrier that
     /// gives it back
     fn entered(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
+        // a person at a peer moved into this machine
+        self.agent.target().person_input();
         let known = self.incoming.get(&addr);
         if known.is_some_and(|i| i.pos == pos && i.fingerprint == fingerprint) {
             return;
@@ -837,6 +913,122 @@ impl Service {
         });
         self.notifier.switched(host.as_deref());
         self.inhibit.set(to.is_some());
+        self.agent.target().set_capturing(to.is_some());
+    }
+
+    /// carries out an `Agent` IPC request in a task of its own; the answer
+    /// comes back through `agent_reply_rx`
+    fn agent_request(&self, conn: ConnId, seq: u64, peer: Peer, request: FrontendRequest) {
+        let FrontendRequest::Agent {
+            target,
+            request: action,
+        } = &request
+        else {
+            return;
+        };
+        let resolved = self.clients.agent_target(target);
+        let action = action.clone();
+        let local = self.agent.target().clone();
+        let remote = self.agent.remote();
+        let manager = self.clients.manager().clone();
+        let tx = self.agent_reply_tx.clone();
+        spawn_local(async move {
+            let response = match resolved {
+                Err(e) => proto::Response::error(ErrorCode::UnknownTarget, e),
+                Ok(None) => local.handle(&Requester::Local, action).await,
+                Ok(Some(handle)) => match remote {
+                    None => proto::Response::error(
+                        ErrorCode::Unreachable,
+                        "the agent channel is unavailable on this machine (see the service log)",
+                    ),
+                    Some(remote) => {
+                        let dial = Dial {
+                            addrs: manager.addrs(handle).unwrap_or_default(),
+                            policy: manager.server_policy(handle).unwrap_or(Policy::Any),
+                            trust: |addr, fingerprint: &str| manager.pin(handle, addr, fingerprint),
+                        };
+                        remote.request(handle, dial, action).await
+                    }
+                },
+            };
+            let _ = tx.send(AgentReply {
+                conn,
+                seq,
+                peer,
+                request,
+                response,
+            });
+        });
+    }
+
+    fn agent_replied(&mut self, reply: AgentReply) {
+        let outcome = match &reply.response {
+            proto::Response::Error { code, message } => Err(format!("{code}: {message}")),
+            _ => Ok(()),
+        };
+        self.audit.record(&reply.peer, &reply.request, &outcome);
+        self.reply(
+            reply.conn,
+            reply.seq,
+            Ok(Reply::Agent(Box::new(reply.response))),
+        );
+    }
+
+    fn handle_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Session(TargetEvent::Started { requester, reason }) => {
+                let who = self.requester_name(&requester);
+                log::info!("agent session of {who} started");
+                self.notifier.agent_started(&who, reason.as_deref());
+                self.notify_frontend(FrontendEvent::AgentSession {
+                    target: "self".into(),
+                    requester: requester.to_string(),
+                    state: AgentSessionState::Started,
+                    reason: None,
+                    purpose: reason,
+                });
+            }
+            AgentEvent::Session(TargetEvent::Ended { requester, reason }) => {
+                let who = self.requester_name(&requester);
+                log::info!("agent session of {who} ended: {reason}");
+                self.notifier.agent_ended(&who, &reason.to_string());
+                self.notify_frontend(FrontendEvent::AgentSession {
+                    target: "self".into(),
+                    requester: requester.to_string(),
+                    state: AgentSessionState::Ended,
+                    reason: Some(reason),
+                    purpose: None,
+                });
+            }
+            AgentEvent::Audited(audited) => {
+                if let Requester::Peer(fingerprint) = &audited.requester {
+                    self.audit
+                        .record_agent(fingerprint, audited.request, &audited.result);
+                }
+            }
+            AgentEvent::RemoteEnded(RemoteEnded { handle, reason }) => {
+                log::info!("agent session on client {handle} ended: {reason}");
+                self.notify_frontend(FrontendEvent::AgentSession {
+                    target: handle.to_string(),
+                    requester: "self".into(),
+                    state: AgentSessionState::Ended,
+                    reason: Some(reason),
+                    purpose: None,
+                });
+            }
+        }
+    }
+
+    /// who holds an agent session, for notices and the log
+    fn requester_name(&self, requester: &Requester) -> String {
+        match requester {
+            Requester::Local => "an agent on this machine".into(),
+            Requester::Peer(fingerprint) => self
+                .clients
+                .authorized_keys()
+                .remove(fingerprint)
+                .unwrap_or_else(|| fingerprint.clone()),
+        }
     }
 
     /// why control cannot move to `handle`, if it cannot. Capture reads
@@ -1231,6 +1423,50 @@ mod tests {
             push_target(Position::Bottom, EdgeRange::new(100 - 1, 100)),
             (Edge::Bottom, 65207)
         );
+    }
+
+    /// a CLI grant applies to agent requests at once, and a peer's KVM
+    /// input ends the agent's session until it opens a new one
+    #[tokio::test]
+    async fn grants_apply_at_once_and_peer_input_preempts_the_agent() {
+        use crate::agent::proto::{ErrorCode, Grant, Request, Response};
+        LocalSet::new()
+            .run_until(async {
+                let dir = temp_dir("service-agent");
+                let (mut service, _) = service(&dir, "").await;
+                let target = service.agent.target().clone();
+                let open = || Request::Open { reason: None };
+                let key = || Request::Key {
+                    keys: vec![input_event::scancode::Linux::KeyA],
+                    observe: None,
+                };
+                let code = |r: Response| match r {
+                    Response::Error { code, .. } => Some(code),
+                    _ => None,
+                };
+                let denied = target.handle(&Requester::Local, open()).await;
+                assert_eq!(code(denied), Some(ErrorCode::Denied));
+
+                let grant = FrontendRequest::AgentGrant {
+                    requester: "self".into(),
+                    input: Some(Grant::Allow),
+                    screen: None,
+                    clipboard: None,
+                };
+                service.handle_request(&grant).await.unwrap();
+                let saved = fs::read_to_string(dir.join("config.toml")).unwrap();
+                assert!(saved.contains("[agent.self]"), "{saved}");
+                let opened = target.handle(&Requester::Local, open()).await;
+                assert_eq!(opened, Response::Ok { frame: None });
+
+                service
+                    .handle_emulation_event(EmulationEvent::PeerInput)
+                    .await;
+                let refused = target.handle(&Requester::Local, key()).await;
+                assert_eq!(code(refused), Some(ErrorCode::Preempted));
+                fs::remove_dir_all(&dir).unwrap();
+            })
+            .await;
     }
 
     /// B6: SIGTERM and SIGHUP (systemd stop, closed terminal) end the run
