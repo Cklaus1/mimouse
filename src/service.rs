@@ -513,6 +513,11 @@ impl Service {
             FrontendRequest::TelemetryShow => Reply::TelemetryShow(self.telemetry.show()),
             // counted in `handle_ipc_event`
             FrontendRequest::CountCommand { .. } => Reply::Done,
+            FrontendRequest::Agent { .. }
+            | FrontendRequest::AgentTargets
+            | FrontendRequest::AgentGrant { .. } => {
+                return Err("agent control is being built".into());
+            }
         };
         Ok(reply)
     }

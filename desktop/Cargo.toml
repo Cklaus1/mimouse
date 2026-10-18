@@ -1,0 +1,17 @@
+[package]
+name = "desktop"
+description = "screenshots and desktop state for mimouse agents"
+version = "0.4.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Cklaus1/mimouse"
+publish = false
+
+[dependencies]
+log = "0.4.22"
+thiserror = "2.0.0"
+tokio = { version = "1.32.0", features = ["rt", "sync", "time", "macros"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+tokio = { version = "1.32.0", features = ["test-util"] }

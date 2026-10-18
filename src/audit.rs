@@ -70,7 +70,13 @@ impl Drop for AuditLog {
 }
 
 fn line(requester: &Peer, request: &FrontendRequest, result: &Result<(), String>) -> String {
-    let mut details = serde_json::to_value(request).expect("serializable request");
+    let mut details = match request {
+        // typed text and clipboard contents never reach the log
+        FrontendRequest::Agent { target, request } => {
+            json!({"action": "agent", "target": target, "request": request.audit()})
+        }
+        _ => serde_json::to_value(request).expect("serializable request"),
+    };
     let action = details
         .as_object_mut()
         .and_then(|o| o.remove("action"))

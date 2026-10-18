@@ -322,6 +322,33 @@ pub enum Reply {
     Telemetry(TelemetryStatus),
     /// the next upload (`telemetry show`)
     TelemetryShow(TelemetryShow),
+    /// a target's answer to an `agent` request (errors included, so the
+    /// code is machine-readable)
+    Agent(Box<crate::agent::proto::Response>),
+    /// `agent_targets`
+    AgentTargets(Vec<AgentTarget>),
+    /// `agent_grant`: the requester's grants now in effect
+    AgentGrant(AgentGrantInfo),
+}
+
+/// a machine an agent request can go to
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTarget {
+    /// `self`, or the client id
+    pub target: String,
+    /// host name of the client, or of this machine
+    pub name: String,
+    /// the client's pinned fingerprint
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// grants written by `agent_grant`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGrantInfo {
+    /// `self` or the requester's fingerprint
+    pub requester: String,
+    pub grants: crate::agent::proto::Grants,
 }
 
 /// telemetry as the service runs it
@@ -551,6 +578,26 @@ pub enum FrontendRequest {
     CountCommand {
         command: String,
     },
+    /// An agent request to `target` (`self`, a client id or host name).
+    /// Answered with `Reply::Agent`; audited with sizes only
+    /// (`proto::Request::audit`).
+    Agent {
+        target: String,
+        request: crate::agent::proto::Request,
+    },
+    /// the machines agent requests can go to
+    AgentTargets,
+    /// Sets what `requester` (`self`, a fingerprint, or the description of
+    /// an authorized key) may do on this machine; unset scopes stay.
+    AgentGrant {
+        requester: String,
+        #[serde(default)]
+        input: Option<crate::agent::proto::Grant>,
+        #[serde(default)]
+        screen: Option<crate::agent::proto::Grant>,
+        #[serde(default)]
+        clipboard: Option<crate::agent::proto::Grant>,
+    },
 }
 
 impl FrontendRequest {
@@ -563,6 +610,7 @@ impl FrontendRequest {
                 | Self::TelemetryStatus
                 | Self::TelemetryShow
                 | Self::CountCommand { .. }
+                | Self::AgentTargets
         )
     }
 

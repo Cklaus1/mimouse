@@ -1,3 +1,4 @@
+pub mod agent;
 mod approval;
 mod audit;
 mod capture;

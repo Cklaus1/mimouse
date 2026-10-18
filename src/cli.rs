@@ -530,6 +530,9 @@ fn print_reply(reply: &Reply, state: &ServiceState, json: bool) {
             }
             eprint!("{}", show_notes(show));
         }
+        (Reply::Agent(response), _) => println!("{}", to_json(response)),
+        (Reply::AgentTargets(targets), _) => println!("{}", to_json(targets)),
+        (Reply::AgentGrant(info), _) => println!("{}", to_json(info)),
     }
 }
 
