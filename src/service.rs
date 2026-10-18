@@ -710,6 +710,11 @@ impl Service {
                     self.notify_frontend(FrontendEvent::Disconnected { addr });
                 }
             }
+            EmulationEvent::Left { addr } => {
+                if let Some(incoming) = self.incoming.get(&addr) {
+                    self.capture.set_returning(incoming.handle, false);
+                }
+            }
             EmulationEvent::PortChanged(port) => {
                 let result = match port {
                     Ok(port) => {
@@ -874,7 +879,8 @@ impl Service {
         // a person at a peer moved into this machine
         self.agent.target().person_input();
         let known = self.incoming.get(&addr);
-        if known.is_some_and(|i| i.pos == pos && i.fingerprint == fingerprint) {
+        if let Some(i) = known.filter(|i| i.pos == pos && i.fingerprint == fingerprint) {
+            self.capture.set_returning(i.handle, true);
             return;
         }
         if let Some(incoming) = self.incoming.remove(&addr) {
@@ -885,6 +891,7 @@ impl Service {
         self.next_trigger_handle += 1;
         self.capture
             .create(handle, pos, CaptureType::EnterOnly, None);
+        self.capture.set_returning(handle, true);
         self.incoming.insert(
             addr,
             Incoming {

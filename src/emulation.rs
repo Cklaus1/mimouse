@@ -13,7 +13,7 @@ use input_event::Event;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -51,6 +51,10 @@ pub(crate) enum EmulationEvent {
     },
     /// connection closed
     Disconnected {
+        addr: SocketAddr,
+    },
+    /// the peer at `addr` stopped controlling this machine (`Leave`)
+    Left {
         addr: SocketAddr,
     },
     /// the port of the listener has changed
@@ -252,6 +256,10 @@ impl ListenTask {
         let mut interval = tokio::time::interval(WATCHDOG_TICK);
         let mut last_response = HashMap::new();
         let mut rejections = RecentRejections::default();
+        // peers told to leave: their input still on the way is dropped
+        // until they enter again, so it cannot push the pointer across the
+        // edge again and take this machine's input
+        let mut sent_away = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -261,6 +269,7 @@ impl ListenTask {
                         match event {
                             ProtoEvent::Enter(pos) | ProtoEvent::EnterAt(pos, _) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    sent_away.remove(&addr);
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -273,10 +282,13 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                sent_away.remove(&addr);
                                 self.enter_gate.left(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                self.event_tx.send(EmulationEvent::Left { addr }).expect("channel closed");
                             }
+                            ProtoEvent::Input(_) if sent_away.contains(&addr) => {}
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             _ => {}
@@ -301,6 +313,9 @@ impl ListenTask {
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => {
                         self.enter_gate.left(addr);
+                        // what it holds is released now, its key-ups are dropped
+                        sent_away.insert(addr);
+                        self.emulation_proxy.remove(addr);
                         self.listener.reply(addr, ProtoEvent::Leave(0)).await
                     }
                     EmulationRequest::ChangePort(port) => {
@@ -316,6 +331,7 @@ impl ListenTask {
                         log::warn!("releasing keys: {addr} not responding!");
                         crate::telemetry::COUNTERS.watchdog_releases.bump();
                         self.emulation_proxy.remove(addr);
+                        sent_away.remove(&addr);
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                     }
                 }
