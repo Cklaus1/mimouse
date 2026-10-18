@@ -29,6 +29,7 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Config write-backs edit `config.toml` in place, keeping comments, key order and unknown keys. A save merges with changes made to the file in the meantime.
 - Opt-in telemetry, off by default: `mimouse cli telemetry on|off|status|show`. See the README for what is sent.
 - Packages: `.deb` and `.rpm` (with a systemd user unit and a firewalld service), a Windows `.exe` with version information, and Scoop, winget and Homebrew manifests.
+- `docs/adding-a-backend.md`: how to add a capture, emulation or clipboard backend, with the contract suite each kind must pass.
 
 ### Fixed
 
@@ -42,9 +43,9 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Windows: logoff and shutdown stop the service cleanly, releasing held keys on the controlled machine. A process that uses user32 never gets the console logoff/shutdown events.
 - Malformed datagrams, DTLS certificate chains and IPC requests are rejected instead of panicking. Event streams of a destroyed capture are dropped. Windows drops input that `SendInput` refuses instead of retrying it forever.
 - Clipboard: updates arrive in order, the newest wins, and file names are de-duplicated after Windows sanitizing.
-
 - GNOME: clipboard sharing no longer stops for good when the portal refuses a new session for a while (mutter: `Session creation inhibited`); it retries every 10 s. Only a denied dialog still needs a service restart.
 - Windows: clipboard monitoring that fails is restarted every 10 s instead of leaving local copies unshared until the service restarts.
+
 ### Security
 
 - The certificate key `mimouse.pem` is owner-only (0600, or an owner-only DACL on Windows), and looser permissions are repaired at startup.

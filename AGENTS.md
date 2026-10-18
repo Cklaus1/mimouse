@@ -177,7 +177,7 @@ Config dir: Linux/macOS `$XDG_CONFIG_HOME/mimouse/` else `~/.config/mimouse/`; W
 ## Conventions
 
 - Backends are cargo features in the root `Cargo.toml`; gate modules with the cfgs emitted by `build.rs`.
-  `build.rs` reads the host, so cross-checking needs `--no-default-features`.
+  `build.rs` reads the host, so cross-checking needs `--no-default-features`. Adding a capture, emulation or clipboard backend: `docs/adding-a-backend.md`.
 - `build.rs` embeds a VERSIONINFO resource (winresource) for Windows targets; keep it, a resource-less exe was quarantined by Defender.
 - Tokio single-threaded runtime (`LocalSet`), `futures` streams, `async_trait`; no blocking in async code.
 - Errors via `thiserror`. Comments only for non-obvious invariants.
