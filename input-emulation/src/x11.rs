@@ -13,7 +13,8 @@ use crate::error::EmulationError;
 
 use super::geometry::{Rect, entry_point};
 use super::normalize::Steps;
-use super::{Edge, Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::text::{self, Keystroke};
+use super::{Edge, Emulation, EmulationHandle, TextSupport, error::X11EmulationCreationError};
 
 /// one scroll button click per wheel notch
 const V120_PER_CLICK: u32 = 120;
@@ -107,12 +108,17 @@ impl X11Emulation {
         }
     }
 
-    #[allow(dead_code)]
     fn emulate_key(&self, key: u32, state: u8) {
         let key = key + 8; // xorg keycodes are shifted by 8
         unsafe {
             xtest::XTestFakeKeyEvent(self.display, key, state as i32, 0);
         }
+    }
+
+    /// the evdev code of the first key with `keysym`, `None` without one
+    fn key_for(&self, keysym: xkeysym::Keysym) -> Option<u32> {
+        let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym.raw().into()) };
+        u32::from(code).checked_sub(8).filter(|&code| code > 0)
     }
 }
 
@@ -190,6 +196,45 @@ impl Emulation for X11Emulation {
             xlib::XFlush(self.display);
         }
         Ok(Some((x, y)))
+    }
+
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Layout
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        Some(vec![self.screen()])
+    }
+
+    fn pointer_to(&mut self, _: EmulationHandle, x: i32, y: i32) -> Result<bool, EmulationError> {
+        unsafe {
+            // screen -1: the screen the pointer is on
+            xtest::XTestFakeMotionEvent(self.display, -1, x, y, 0);
+            xlib::XFlush(self.display);
+        }
+        Ok(true)
+    }
+
+    /// The key with the keysym on its first or Shift level in the first
+    /// group; AltGr levels are not searched.
+    fn keystroke(&self, c: char) -> Option<Keystroke> {
+        /// `ShiftMask`
+        const SHIFT: u32 = 1 << 0;
+        let keysym = text::keysym(c)?;
+        let key = self.key_for(keysym)?;
+        let level = (0..2).find(|&level| {
+            let at = unsafe { xlib::XkbKeycodeToKeysym(self.display, (key + 8) as u8, 0, level) };
+            at == keysym.raw().into()
+        })?;
+        let mut stroke = Keystroke {
+            key,
+            ..Default::default()
+        };
+        if level == 1 {
+            stroke.modifiers[0] = self.key_for(xkeysym::Keysym::Shift_L)?;
+            stroke.depressed = SHIFT;
+        }
+        Some(stroke)
     }
 
     async fn create(&mut self, _: EmulationHandle) {

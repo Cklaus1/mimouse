@@ -13,11 +13,15 @@ use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VIRTUAL_KEY,
+    VK_RETURN, VK_TAB,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
@@ -28,8 +32,9 @@ use windows::core::BOOL;
 use super::geometry::{Rect, entry_point};
 use super::keys::{Repeat, RepeatPlanner};
 use super::normalize::Steps;
+use super::text::{Piece, exact_pieces};
 use super::windows_logic::{Wheel, wheel};
-use super::{Edge, Emulation, EmulationHandle};
+use super::{Edge, Emulation, EmulationHandle, TextSupport, Typed};
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -113,6 +118,59 @@ impl Emulation for WindowsEmulation {
         Ok(Some((x, y)))
     }
 
+    /// any text, as Unicode key events
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Exact
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        let _physical = PhysicalPixels::new();
+        let monitors = monitors();
+        (!monitors.is_empty()).then_some(monitors)
+    }
+
+    fn pointer_to(&mut self, _: EmulationHandle, x: i32, y: i32) -> Result<bool, EmulationError> {
+        let _physical = PhysicalPixels::new();
+        if let Err(e) = unsafe { SetCursorPos(x, y) } {
+            log::warn!("SetCursorPos({x}, {y}): {e}");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn type_text(
+        &mut self,
+        _: EmulationHandle,
+        text: &str,
+    ) -> Result<Option<Typed>, EmulationError> {
+        let (pieces, unmapped) = exact_pieces(text, usize::MAX);
+        let mut inputs = Vec::new();
+        for piece in &pieces {
+            let (vk, units, flags) = match piece {
+                Piece::Units(units) => (VIRTUAL_KEY(0), &units[..], KEYEVENTF_UNICODE),
+                Piece::Return => (VK_RETURN, &[0][..], KEYBD_EVENT_FLAGS(0)),
+                Piece::Tab => (VK_TAB, &[0][..], KEYBD_EVENT_FLAGS(0)),
+            };
+            for &unit in units {
+                for up in [KEYBD_EVENT_FLAGS(0), KEYEVENTF_KEYUP] {
+                    let ki = KEYBDINPUT {
+                        wVk: vk,
+                        wScan: unit,
+                        dwFlags: flags | up,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    };
+                    inputs.push(INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 { ki },
+                    });
+                }
+            }
+        }
+        send_input_safe(&inputs);
+        Ok(Some(Typed { unmapped }))
+    }
+
     async fn create(&mut self, _handle: EmulationHandle) {}
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
@@ -158,6 +216,25 @@ fn monitors() -> Vec<Rect> {
     monitors
 }
 
+/// Physical pixels for this thread while alive, the pixels screenshots
+/// have: monitor rectangles and cursor positions are not scaled by DPI.
+struct PhysicalPixels(DPI_AWARENESS_CONTEXT);
+
+impl PhysicalPixels {
+    fn new() -> Self {
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
+    }
+}
+
+impl Drop for PhysicalPixels {
+    fn drop(&mut self) {
+        // invalid: setting it failed, nothing to restore
+        if !self.0.is_invalid() {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+}
+
 impl WindowsEmulation {
     fn spawn_repeat_task(&mut self, key: u32) {
         self.kill_repeat_task();
@@ -183,19 +260,21 @@ const REFUSED_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// when the last warning was logged and how many events were refused since
 static REFUSED: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
 
-/// Sends `input` once. Windows refuses injection while the secure desktop
-/// (lock screen, UAC) is shown or UIPI blocks it; the event is dropped then,
-/// since retrying would spin the runtime thread until the desktop returns.
-fn send_input_safe(input: INPUT) {
+/// Sends `inputs` once. Windows refuses injection while the secure desktop
+/// (lock screen, UAC) is shown or UIPI blocks it; the events are dropped
+/// then, since retrying would spin the runtime thread until the desktop
+/// returns.
+fn send_input_safe(inputs: &[INPUT]) {
     // number of events submitted
-    if unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) } > 0 {
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+    if sent >= inputs.len() {
         return;
     }
     let Ok(mut refused) = REFUSED.lock() else {
         return;
     };
     let (last_warning, count) = &mut *refused;
-    *count += 1;
+    *count += (inputs.len() - sent) as u64;
     if last_warning.is_none_or(|t| t.elapsed() >= REFUSED_WARN_INTERVAL) {
         log::warn!(
             "Windows refused {count} injected input event(s), dropped (secure desktop or a more privileged window has focus)"
@@ -206,17 +285,17 @@ fn send_input_safe(input: INPUT) {
 }
 
 fn send_mouse_input(mi: MOUSEINPUT) {
-    send_input_safe(INPUT {
+    send_input_safe(&[INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
-    });
+    }]);
 }
 
 fn send_keyboard_input(ki: KEYBDINPUT) {
-    send_input_safe(INPUT {
+    send_input_safe(&[INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
-    });
+    }]);
 }
 fn rel_mouse(dx: i32, dy: i32) {
     let mi = MOUSEINPUT {

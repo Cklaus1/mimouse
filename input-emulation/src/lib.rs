@@ -6,11 +6,14 @@ use std::{
 };
 use tokio::sync::watch;
 
-use input_event::{Event, PointerEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
+pub use self::dummy::{DummyRecord, Received};
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
-pub use self::geometry::Edge;
+pub use self::geometry::{Edge, Rect};
+
 use self::normalize::{Peer, Steps};
+use self::text::Keystroke;
 
 #[cfg(windows)]
 mod windows;
@@ -46,8 +49,28 @@ mod geometry;
 #[cfg(any(windows, target_os = "macos", test))]
 mod keys;
 mod normalize;
+mod text;
 
 pub type EmulationHandle = u64;
+
+/// How a backend types text ([`InputEmulation::type_text`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextSupport {
+    /// any Unicode text, whatever the keyboard layout
+    Exact,
+    /// the characters the target's keyboard layout has keys for, with
+    /// Shift and AltGr (Level3/Level5) at most
+    Layout,
+    /// no typing: every character is unmapped
+    None,
+}
+
+/// What [`InputEmulation::type_text`] could not type.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Typed {
+    /// the characters no key types, in order; they were skipped
+    pub unmapped: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
@@ -143,6 +166,18 @@ impl InputEmulation {
         }
     }
 
+    /// A backend that discards everything (as [`Backend::Dummy`]) and logs
+    /// it to `record` instead, for tests of the layers above.
+    pub fn dummy(record: DummyRecord) -> Self {
+        Self::with_emulation(
+            Box::new(dummy::DummyEmulation::recording(record)),
+            Selected {
+                backend: Backend::Dummy,
+                auto: false,
+            },
+        )
+    }
+
     /// `permission_pending` is `true` while the backend waits for a
     /// permission request (e.g. the portal dialog)
     pub async fn new(
@@ -159,6 +194,120 @@ impl InputEmulation {
     /// the backend in use and how it was chosen
     pub fn selected(&self) -> Selected {
         self.selected
+    }
+
+    /// how the backend types text
+    pub fn text_support(&self) -> TextSupport {
+        self.emulation.text_support()
+    }
+
+    /// The displays in the units the backend places the pointer in, `None`
+    /// if it cannot place the pointer absolutely.
+    pub fn desktop(&self) -> Option<Vec<Rect>> {
+        self.emulation.desktop()
+    }
+
+    /// Moves the pointer for `handle` to `(x, y)` of a desktop image `size`
+    /// pixels large (e.g. a screenshot of all displays), mapped uniformly
+    /// onto the bounding box of [`InputEmulation::desktop`] and clamped into
+    /// it. `false` if the pointer was not placed: the backend cannot place
+    /// it absolutely, there is no display, `size` is empty, `handle` was not
+    /// created, or after `terminate`.
+    pub fn pointer_to(
+        &mut self,
+        handle: EmulationHandle,
+        x: i32,
+        y: i32,
+        size: (u32, u32),
+    ) -> Result<bool, EmulationError> {
+        if self.terminated || !self.peers.contains_key(&handle) {
+            return Ok(false);
+        }
+        let Some((x, y)) = self
+            .emulation
+            .desktop()
+            .and_then(|displays| geometry::desktop_to_backend(&displays, x, y, size))
+        else {
+            return Ok(false);
+        };
+        self.emulation.pointer_to(handle, x, y)
+    }
+
+    /// Types `text` for `handle`, `"\r\n"` and `'\r'` as a newline, and
+    /// returns what no key types (see [`TextSupport`]); those characters are
+    /// skipped. With [`TextSupport::Layout`] each character is a press and
+    /// release of its key, inside the level modifiers it needs (modifiers
+    /// `handle` holds stay held), so typing leaves no key down. Nothing is
+    /// typed for a handle that was not created or after `terminate`.
+    pub async fn type_text(
+        &mut self,
+        handle: EmulationHandle,
+        text: &str,
+    ) -> Result<Typed, EmulationError> {
+        if self.terminated || !self.peers.contains_key(&handle) {
+            return Ok(Typed {
+                unmapped: text::chars(text).collect(),
+            });
+        }
+        if let Some(typed) = self.emulation.type_text(handle, text).await? {
+            return Ok(typed);
+        }
+        let mut unmapped = String::new();
+        for c in text::chars(text) {
+            match self.emulation.keystroke(c) {
+                Some(stroke) => self.keystroke(handle, stroke).await?,
+                None => unmapped.push(c),
+            }
+        }
+        Ok(Typed { unmapped })
+    }
+
+    /// Presses and releases `stroke` through [`InputEmulation::consume`],
+    /// so whatever is down while it types counts as held by `handle`.
+    async fn keystroke(
+        &mut self,
+        handle: EmulationHandle,
+        stroke: Keystroke,
+    ) -> Result<(), EmulationError> {
+        let key = |key, state| {
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key,
+                state,
+            })
+        };
+        let depressed = |depressed| {
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })
+        };
+        let holds = |this: &Self, key| this.peers.get(&handle).is_some_and(|p| p.holds(key));
+        let mut pressed = [0; 3];
+        for (slot, modifier) in stroke.modifiers().enumerate() {
+            if !holds(self, modifier) {
+                self.consume(key(modifier, 1), handle).await?;
+                pressed[slot] = modifier;
+            }
+        }
+        if stroke.depressed != 0 {
+            self.consume(depressed(stroke.depressed), handle).await?;
+        }
+        // a held key would not type: its press is not a change
+        if holds(self, stroke.key) {
+            self.consume(key(stroke.key, 0), handle).await?;
+        }
+        self.consume(key(stroke.key, 1), handle).await?;
+        self.consume(key(stroke.key, 0), handle).await?;
+        for &modifier in pressed.iter().rev().filter(|&&m| m != 0) {
+            self.consume(key(modifier, 0), handle).await?;
+        }
+        if stroke.depressed != 0 {
+            self.consume(depressed(0), handle).await?;
+        }
+        Ok(())
     }
 
     /// Emulates `event` for `handle` (see [`Peer::plan`]); events for a
@@ -401,6 +550,38 @@ trait Emulation: Send {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError>;
+    /// how the backend types text
+    fn text_support(&self) -> TextSupport {
+        TextSupport::None
+    }
+    /// the displays in the units of [`Emulation::pointer_to`], `None` if
+    /// the pointer cannot be placed absolutely
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        None
+    }
+    /// Moves the pointer to `(x, y)` of [`Emulation::desktop`]; `false` if
+    /// it was not placed.
+    fn pointer_to(
+        &mut self,
+        _handle: EmulationHandle,
+        _x: i32,
+        _y: i32,
+    ) -> Result<bool, EmulationError> {
+        Ok(false)
+    }
+    /// Types `text` itself; `None` to have it typed with
+    /// [`Emulation::keystroke`] key events instead.
+    async fn type_text(
+        &mut self,
+        _handle: EmulationHandle,
+        _text: &str,
+    ) -> Result<Option<Typed>, EmulationError> {
+        Ok(None)
+    }
+    /// the keys that type `c` in the target's layout, `None` if none does
+    fn keystroke(&self, _c: char) -> Option<Keystroke> {
+        None
+    }
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
@@ -461,6 +642,101 @@ mod tests {
                 Call::Destroy(1),
             ]
         );
+    }
+
+    fn depressed(depressed: u32) -> Event {
+        Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        })
+    }
+
+    #[test]
+    fn layout_text_is_typed_inside_its_modifiers() {
+        use crate::testing::{KEY_E, KEY_LEFTSHIFT as SHIFT, KEY_RIGHTALT as ALTGR};
+        let (mut emulation, mut calls) = Recorder::emulation(Steps::EXACT, true);
+        let typed = block_on(async {
+            emulation.create(1).await;
+            calls.take();
+            emulation.type_text(1, "A€").await.unwrap()
+        });
+        assert_eq!(typed.unmapped, "");
+        let consumed = [
+            key(SHIFT, 1),
+            depressed(1),
+            key(KEY_A, 1),
+            key(KEY_A, 0),
+            key(SHIFT, 0),
+            depressed(0),
+            key(SHIFT, 1),
+            key(ALTGR, 1),
+            depressed(0x81),
+            key(KEY_E, 1),
+            key(KEY_E, 0),
+            key(ALTGR, 0),
+            key(SHIFT, 0),
+            depressed(0),
+        ];
+        let mut expected = vec![Call::TypeText(1, "A€".into())];
+        expected.extend(consumed.map(|e| Call::Consume(1, e)));
+        assert_eq!(calls.take(), expected);
+    }
+
+    #[test]
+    fn typing_keeps_what_the_peer_holds() {
+        use crate::testing::KEY_LEFTSHIFT as SHIFT;
+        let (mut emulation, mut calls) = Recorder::emulation(Steps::EXACT, true);
+        block_on(async {
+            emulation.create(1).await;
+            emulation.consume(key(SHIFT, 1), 1).await.unwrap();
+            emulation.consume(key(KEY_A, 1), 1).await.unwrap();
+            calls.take();
+            emulation.type_text(1, "A").await.unwrap();
+        });
+        // Shift stays down; the held A is released so its press types
+        let consumed = [
+            depressed(1),
+            key(KEY_A, 0),
+            key(KEY_A, 1),
+            key(KEY_A, 0),
+            depressed(0),
+        ];
+        let mut expected = vec![Call::TypeText(1, "A".into())];
+        expected.extend(consumed.map(|e| Call::Consume(1, e)));
+        assert_eq!(calls.take(), expected);
+        block_on(emulation.destroy(1));
+        assert_eq!(
+            calls.take(),
+            [
+                Call::Consume(1, key(SHIFT, 0)),
+                Call::Consume(1, RESET),
+                Call::Destroy(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_typing_is_released_on_destroy() {
+        use crate::testing::{Fake, KEY_LEFTSHIFT as SHIFT};
+        use futures::FutureExt;
+        // stalls on the press of A, after Shift and the modifier state
+        let fake = Fake {
+            steps: Steps::EXACT,
+            places_pointer: true,
+            stall_at: Some(2),
+        };
+        let (mut emulation, mut calls) = Recorder::wrap(Box::new(fake));
+        block_on(emulation.create(1));
+        assert!(emulation.type_text(1, "A").now_or_never().is_none());
+        calls.take();
+        block_on(emulation.destroy(1));
+        let calls = calls.take();
+        for released in [key(KEY_A, 0), key(SHIFT, 0)] {
+            assert!(calls.contains(&Call::Consume(1, released)), "{calls:?}");
+        }
+        assert_eq!(calls.last(), Some(&Call::Destroy(1)));
     }
 
     #[test]

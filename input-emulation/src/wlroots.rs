@@ -1,6 +1,6 @@
 use crate::error::EmulationError;
 
-use super::{Emulation, error::WlrootsEmulationCreationError};
+use super::{Emulation, TextSupport, error::WlrootsEmulationCreationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use std::collections::HashMap;
@@ -40,7 +40,8 @@ use wayland_client::{
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 
 use super::error::WaylandBindError;
-use super::geometry::{Rect, entry_point};
+use super::geometry::{Rect, bounds, entry_point};
+use super::text::{Keystroke, Layout};
 use super::{Edge, EmulationHandle};
 
 /// How long the compositor may take to send the keymap, and then the output
@@ -80,6 +81,8 @@ impl Keymap {
 
 struct State {
     keymap: Option<Keymap>,
+    /// the keys of `keymap`, for typing text
+    layout: Layout,
     /// the seat's keyboard, which receives the keymap; one at most, since
     /// each gets every keymap event
     keyboard: Option<WlKeyboard>,
@@ -165,6 +168,7 @@ impl WlrootsEmulation {
             stalled: false,
             state: State {
                 keymap: None,
+                layout: Layout::default(),
                 keyboard: None,
                 input_for_client: HashMap::new(),
                 seat,
@@ -271,6 +275,56 @@ impl WlrootsEmulation {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Moves the pointer of `handle` to the point `place` picks on the
+    /// displays and returns it, `None` if the pointer was not moved.
+    fn move_pointer(
+        &mut self,
+        handle: EmulationHandle,
+        place: impl FnOnce(&[Rect]) -> Option<(i32, i32)>,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        self.read_events()?;
+
+        let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
+            return Ok(None);
+        };
+        if self.last_flush_failed {
+            match self.queue.flush() {
+                // outgoing buffer still full, like `consume`: drop the move
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    log::warn!("can't keep up, discarding pointer move ({handle})");
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        let displays = self.state.displays();
+        let (Some((x, y)), Some(layout)) = (place(&displays), bounds(&displays)) else {
+            return Ok(None);
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        // absolute motion is relative to the bounding box of the layout
+        virtual_input.pointer.motion_absolute(
+            now,
+            (x - layout.x) as u32,
+            (y - layout.y) as u32,
+            layout.width as u32,
+            layout.height as u32,
+        );
+        virtual_input.pointer.frame();
+        match self.queue.flush() {
+            Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.last_flush_failed = true;
+                log::warn!("can't keep up, pointer move ({handle}) delayed");
+            }
+            Ok(()) => self.last_flush_failed = false,
+            Err(e) => Err(e)?,
+        }
+        Ok(Some((x, y)))
     }
 }
 
@@ -392,59 +446,29 @@ impl Emulation for WlrootsEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        self.read_events()?;
+        self.move_pointer(handle, |displays| entry_point(displays, edge, fraction))
+    }
 
-        let Some(virtual_input) = self.state.input_for_client.get(&handle) else {
-            return Ok(None);
-        };
-        if self.last_flush_failed {
-            match self.queue.flush() {
-                // outgoing buffer still full, like `consume`: drop the move
-                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    log::warn!("can't keep up, discarding entry point ({handle})");
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Layout
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
         let displays = self.state.displays();
-        let Some((x, y)) = entry_point(&displays, edge, fraction) else {
-            return Ok(None);
-        };
-        // absolute motion is relative to the bounding box of the layout
-        let left = displays.iter().map(|d| d.x).min().unwrap_or_default();
-        let top = displays.iter().map(|d| d.y).min().unwrap_or_default();
-        let right = displays
-            .iter()
-            .map(|d| d.x + d.width)
-            .max()
-            .unwrap_or_default();
-        let bottom = displays
-            .iter()
-            .map(|d| d.y + d.height)
-            .max()
-            .unwrap_or_default();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
-        virtual_input.pointer.motion_absolute(
-            now,
-            (x - left) as u32,
-            (y - top) as u32,
-            (right - left) as u32,
-            (bottom - top) as u32,
-        );
-        virtual_input.pointer.frame();
-        match self.queue.flush() {
-            Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.last_flush_failed = true;
-                log::warn!("can't keep up, entry point ({handle}) delayed");
-            }
-            Ok(()) => self.last_flush_failed = false,
-            Err(e) => Err(e)?,
-        }
-        Ok(Some((x, y)))
+        bounds(&displays).is_some().then_some(displays)
+    }
+
+    fn pointer_to(
+        &mut self,
+        handle: EmulationHandle,
+        x: i32,
+        y: i32,
+    ) -> Result<bool, EmulationError> {
+        Ok(self.move_pointer(handle, |_| Some((x, y)))?.is_some())
+    }
+
+    fn keystroke(&self, c: char) -> Option<Keystroke> {
+        self.state.layout.keystroke(c)
     }
 
     async fn create(&mut self, handle: EmulationHandle) {
@@ -657,6 +681,7 @@ impl Dispatch<WlKeyboard, ()> for State {
                     .keyboard
                     .keymap(keymap.format, keymap.fd.as_fd(), keymap.size);
             }
+            state.layout = Layout::new(&keymap.text).unwrap_or_default();
             state.keymap = Some(keymap);
         }
     }

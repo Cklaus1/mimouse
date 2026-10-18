@@ -46,6 +46,9 @@ ashpd = { version = "0.13.9", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.5.0", features = ["tokio"], optional = true }
+# keymap lookups for typing, libxkbcommon loaded at runtime (never linked)
+xkbcommon-dl = { version = "0.4.2", optional = true }
+xkeysym = { version = "0.2.1", optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.0"
@@ -60,6 +63,7 @@ windows = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics",
     "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -71,7 +75,9 @@ wlroots = [
     "dep:wayland-protocols",
     "dep:wayland-protocols-wlr",
     "dep:wayland-protocols-misc",
+    "dep:xkbcommon-dl",
+    "dep:xkeysym",
 ]
-x11 = ["dep:x11"]
-remote_desktop_portal = ["dep:ashpd"]
-libei = ["dep:reis", "dep:ashpd"]
+x11 = ["dep:x11", "dep:xkeysym"]
+remote_desktop_portal = ["dep:ashpd", "dep:xkeysym"]
+libei = ["dep:reis", "dep:ashpd", "dep:xkbcommon-dl", "dep:xkeysym"]

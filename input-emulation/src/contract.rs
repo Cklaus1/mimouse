@@ -15,7 +15,7 @@ use input_event::{BTN_LEFT, Event, KeyboardEvent, PointerEvent};
 
 use crate::dummy::DummyEmulation;
 use crate::normalize::Steps;
-use crate::testing::{Call, Calls, Fake, Recorder};
+use crate::testing::{Call, Calls, FAKE_DISPLAY, Fake, Recorder};
 use crate::{Edge, Emulation, EmulationHandle, InputEmulation};
 
 const TRACES: &[(&str, &str)] = &[
@@ -93,8 +93,14 @@ struct Subject {
     name: &'static str,
     /// whether it can place the pointer where a cursor enters
     places_pointer: bool,
+    /// what it cannot type of [`TEXT`]
+    unmapped: &'static str,
     make: fn() -> Box<dyn Emulation>,
 }
+
+/// text with newlines, a Shift and an AltGr character and one without a key
+/// in the fake layout
+const TEXT: &str = "aA\r\n€b";
 
 fn fake(steps: Steps, places_pointer: bool) -> Box<dyn Emulation> {
     Box::new(Fake {
@@ -108,17 +114,20 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "dummy",
         places_pointer: false,
+        unmapped: "",
         make: || Box::new(DummyEmulation::new()),
     },
     Subject {
         name: "fake, exact steps",
         places_pointer: true,
+        unmapped: "\nb",
         make: || fake(Steps::EXACT, true),
     },
     // as X11: whole pixels, whole wheel notches
     Subject {
         name: "fake, notch steps",
         places_pointer: false,
+        unmapped: "\nb",
         make: || {
             let steps = Steps {
                 whole_pixels: true,
@@ -131,6 +140,7 @@ const SUBJECTS: &[Subject] = &[
     Subject {
         name: "fake, line steps",
         places_pointer: true,
+        unmapped: "\nb",
         make: || {
             let steps = Steps {
                 whole_pixels: true,
@@ -139,11 +149,13 @@ const SUBJECTS: &[Subject] = &[
             fake(steps, true)
         },
     },
-    // a compositor without outputs: nowhere to place the pointer
+    // a compositor without outputs: nowhere to place the pointer; its
+    // keymap does not compile, so there is nothing to type with
     #[cfg(wlroots)]
     Subject {
         name: "wlroots",
         places_pointer: false,
+        unmapped: "aA\n€b",
         make: || Box::new(crate::wlroots::tests::on_fake_compositor()),
     },
 ];
@@ -223,7 +235,7 @@ fn assert_contract(context: &str, calls: &[Call], steps: Steps) {
                 );
                 terminated = true;
             }
-            Call::Create(_) | Call::EnterAt(_) => {}
+            Call::Create(_) | Call::EnterAt(_) | Call::PointerTo(..) | Call::TypeText(..) => {}
         }
     }
 }
@@ -267,6 +279,9 @@ async fn terminate_releases_everything_once_and_ends_input() {
             feed(&mut emulation, &events, &[1, 2, 3]).await;
             emulation.enter_at(1, Edge::Left, 0).unwrap();
             assert!(!emulation.push_through(1, Edge::Left, 0).await.unwrap());
+            assert!(!emulation.pointer_to(1, 0, 0, (10, 10)).unwrap());
+            let typed = emulation.type_text(1, "a").await.unwrap();
+            assert_eq!(typed.unmapped, "a", "{context}");
             emulation.destroy(1).await;
             let calls = calls.take();
             assert_contract(&context, &calls, steps);
@@ -302,6 +317,58 @@ async fn the_pointer_is_pushed_only_where_it_can_be_placed() {
         let moved = calls[1..].iter().any(|c| matches!(c, Call::Consume(1, _)));
         assert_eq!(moved, pushed, "{}", subject.name);
         assert_contract(subject.name, &calls, steps);
+    }
+}
+
+#[tokio::test]
+async fn typing_leaves_nothing_held() {
+    for subject in SUBJECTS {
+        let (mut emulation, mut calls, steps) = subject.start();
+        emulation.create(1).await;
+        calls.take();
+        let typed = emulation.type_text(1, TEXT).await.unwrap();
+        assert_eq!(typed.unmapped, subject.unmapped, "{}", subject.name);
+        let mut typing = calls.take();
+        emulation.destroy(1).await;
+        let destroy = calls.take();
+        // nothing was left to release: destroy only resets the modifiers
+        let releases: Vec<_> = destroy
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Call::Consume(_, Event::Keyboard(KeyboardEvent::Key { .. }))
+                )
+            })
+            .collect();
+        assert_eq!(releases, [] as [&Call; 0], "{}", subject.name);
+        typing.extend(destroy);
+        assert_contract(subject.name, &typing, steps);
+    }
+}
+
+#[tokio::test]
+async fn the_pointer_is_placed_only_where_it_can_be() {
+    for subject in SUBJECTS {
+        let (mut emulation, mut calls, _) = subject.start();
+        emulation.create(1).await;
+        calls.take();
+        let placed = emulation.pointer_to(1, 960, 540, (1920, 1080)).unwrap();
+        assert_eq!(placed, subject.places_pointer, "{}", subject.name);
+        let expected = match placed {
+            // the middle of the screenshot is the middle of the display
+            true => vec![Call::PointerTo(
+                1,
+                FAKE_DISPLAY.x + FAKE_DISPLAY.width / 2,
+                FAKE_DISPLAY.height / 2,
+            )],
+            false => vec![],
+        };
+        assert_eq!(calls.take(), expected, "{}", subject.name);
+        // an empty screenshot or an unknown handle places nothing
+        assert!(!emulation.pointer_to(1, 0, 0, (0, 1080)).unwrap());
+        assert!(!emulation.pointer_to(2, 0, 0, (1920, 1080)).unwrap());
+        assert_eq!(calls.take(), [], "{}", subject.name);
     }
 }
 

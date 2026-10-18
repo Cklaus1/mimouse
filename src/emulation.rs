@@ -4,7 +4,11 @@ use crate::ipc::BackendInUse;
 use crate::listen::{ListenEvent, ListenerCreationError, MiMouseListener};
 use crate::proto::{Position, ProtoEvent};
 use futures::StreamExt;
-use input_emulation::{Edge, EmulationHandle, InputEmulation, InputEmulationError};
+use futures::future::{FutureExt, LocalBoxFuture};
+use input_emulation::{
+    Edge, EmulationCreationError, EmulationError, EmulationHandle, InputEmulation,
+    InputEmulationError, TextSupport,
+};
 use input_event::Event;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -16,7 +20,7 @@ use std::{
 };
 use tokio::{
     select,
-    sync::watch,
+    sync::{oneshot, watch},
     task::{JoinHandle, spawn_local},
 };
 
@@ -25,6 +29,7 @@ pub(crate) struct Emulation {
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
+    agent: EmulationAgent,
 }
 
 pub(crate) enum EmulationEvent {
@@ -59,6 +64,103 @@ pub(crate) enum EmulationEvent {
     /// the backend waits for the user to approve emulating input (or no
     /// longer does)
     AwaitingApproval(bool),
+    /// a peer's input was emulated; sent at most once per
+    /// [`PEER_INPUT_EVERY`], so an agent session can yield to the user
+    PeerInput,
+}
+
+/// how often [`EmulationEvent::PeerInput`] is sent at most
+const PEER_INPUT_EVERY: Duration = Duration::from_millis(100);
+
+/// an agent's emulation session: its own held input, released when it ends
+pub(crate) type AgentSession = u64;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AgentError {
+    #[error("input emulation is off")]
+    EmulationOff,
+    #[error("the emulation backend cannot do this")]
+    Unsupported,
+    #[error("input emulation failed: {0}")]
+    Failed(String),
+}
+
+/// what the active emulation backend offers an agent
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentEmulation {
+    pub backend: String,
+    /// whether it places the pointer at screenshot coordinates
+    pub absolute: bool,
+    pub text: TextSupport,
+}
+
+/// Drives emulation for agent sessions; clones share the emulation task.
+#[derive(Clone)]
+pub(crate) struct EmulationAgent {
+    request_tx: Sender<ProxyRequest>,
+}
+
+impl EmulationAgent {
+    /// A request whose reply is dropped unanswered when the emulation task
+    /// is gone, which reads as [`AgentError::EmulationOff`].
+    fn request<T>(
+        &self,
+        request: impl FnOnce(oneshot::Sender<T>) -> AgentRequest,
+    ) -> oneshot::Receiver<T> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_tx.send(ProxyRequest::Agent(request(tx)));
+        rx
+    }
+
+    /// emulates `event` for `session`
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
+    pub(crate) async fn agent_event(
+        &self,
+        session: AgentSession,
+        event: Event,
+    ) -> Result<(), AgentError> {
+        let reply = self.request(|tx| AgentRequest::Event(session, event, tx));
+        reply.await.unwrap_or(Err(AgentError::EmulationOff))
+    }
+
+    /// Moves the pointer to `(x, y)` of a `size` screenshot of the whole
+    /// desktop; [`AgentError::Unsupported`] if the backend cannot place it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
+    pub(crate) async fn agent_pointer_to(
+        &self,
+        session: AgentSession,
+        x: i32,
+        y: i32,
+        size: (u32, u32),
+    ) -> Result<(), AgentError> {
+        let reply = self.request(|tx| AgentRequest::PointerTo(session, x, y, size, tx));
+        reply.await.unwrap_or(Err(AgentError::EmulationOff))
+    }
+
+    /// types `text` for `session`; the characters it could not type
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
+    pub(crate) async fn agent_type(
+        &self,
+        session: AgentSession,
+        text: String,
+    ) -> Result<String, AgentError> {
+        let reply = self.request(|tx| AgentRequest::Type(session, text, tx));
+        reply.await.unwrap_or(Err(AgentError::EmulationOff))
+    }
+
+    /// ends `session`, releasing what it holds
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
+    pub(crate) fn agent_end(&self, session: AgentSession) {
+        let _ = self
+            .request_tx
+            .send(ProxyRequest::Agent(AgentRequest::End(session)));
+    }
+
+    /// the active backend, `None` while emulation is off
+    #[cfg_attr(not(test), expect(dead_code, reason = "called by the agent layer"))]
+    pub(crate) async fn agent_info(&self) -> Option<AgentEmulation> {
+        self.request(AgentRequest::Info).await.ok().flatten()
+    }
 }
 
 enum EmulationRequest {
@@ -76,6 +178,7 @@ impl Emulation {
         listener: MiMouseListener,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
+        let agent = emulation_proxy.agent();
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -90,7 +193,14 @@ impl Emulation {
             task,
             request_tx,
             event_rx,
+            agent,
         }
+    }
+
+    /// a handle for agent sessions, usable while the emulation runs
+    #[expect(dead_code, reason = "called by the agent layer")]
+    pub(crate) fn agent(&self) -> EmulationAgent {
+        self.agent.clone()
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
@@ -297,10 +407,82 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    #[cfg_attr(not(test), expect(dead_code, reason = "sent by the agent layer"))]
+    Agent(AgentRequest),
 }
+
+/// requests of [`EmulationAgent`], answered on their reply channel
+enum AgentRequest {
+    Event(AgentSession, Event, oneshot::Sender<Result<(), AgentError>>),
+    PointerTo(
+        AgentSession,
+        i32,
+        i32,
+        (u32, u32),
+        oneshot::Sender<Result<(), AgentError>>,
+    ),
+    Type(
+        AgentSession,
+        String,
+        oneshot::Sender<Result<String, AgentError>>,
+    ),
+    End(AgentSession),
+    Info(oneshot::Sender<Option<AgentEmulation>>),
+}
+
+impl AgentRequest {
+    /// answers as emulation is off; an ended session is forgotten
+    fn refuse(self, agents: &mut HashMap<AgentSession, EmulationHandle>) {
+        match self {
+            AgentRequest::Event(.., reply) | AgentRequest::PointerTo(.., reply) => {
+                let _ = reply.send(Err(AgentError::EmulationOff));
+            }
+            AgentRequest::Type(.., reply) => {
+                let _ = reply.send(Err(AgentError::EmulationOff));
+            }
+            AgentRequest::End(session) => {
+                agents.remove(&session);
+            }
+            AgentRequest::Info(reply) => {
+                let _ = reply.send(None);
+            }
+        }
+    }
+}
+
+/// Replies `result` to the agent; an error also ends the backend, so it is
+/// returned after the agent heard of it.
+fn answer<T>(
+    reply: oneshot::Sender<Result<T, AgentError>>,
+    result: Result<T, EmulationError>,
+) -> Result<(), EmulationError> {
+    match result {
+        Ok(value) => {
+            let _ = reply.send(Ok(value));
+            Ok(())
+        }
+        Err(e) => {
+            let _ = reply.send(Err(AgentError::Failed(e.to_string())));
+            Err(e)
+        }
+    }
+}
+
+/// creates a backend, reporting a pending permission request on the sender
+type CreateBackend = Box<
+    dyn Fn(
+        watch::Sender<bool>,
+    ) -> LocalBoxFuture<'static, Result<InputEmulation, EmulationCreationError>>,
+>;
 
 impl EmulationProxy {
     fn new(backend: Option<input_emulation::Backend>) -> Self {
+        Self::with_backend(Box::new(move |permission_pending| {
+            InputEmulation::new(backend, permission_pending).boxed_local()
+        }))
+    }
+
+    fn with_backend(create: CreateBackend) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let (permission_pending, pending_rx) = watch::channel(false);
@@ -321,13 +503,15 @@ impl EmulationProxy {
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
-            backend,
+            create,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
             permission_pending,
             handles: Default::default(),
+            agents: Default::default(),
             next_id: 0,
+            peer_input_at: None,
             backoff: Backoff::default(),
         };
         let task = spawn_local(emulation_task.run());
@@ -337,6 +521,12 @@ impl EmulationProxy {
             request_tx,
             task,
             event_rx,
+        }
+    }
+
+    fn agent(&self) -> EmulationAgent {
+        EmulationAgent {
+            request_tx: self.request_tx.clone(),
         }
     }
 
@@ -400,14 +590,18 @@ impl EmulationProxy {
 }
 
 struct EmulationTask {
-    backend: Option<input_emulation::Backend>,
+    create: CreateBackend,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     /// `true` while the backend waits for a permission request
     permission_pending: watch::Sender<bool>,
     handles: HashMap<SocketAddr, EmulationHandle>,
+    /// agent sessions' handles, numbered with the peers'
+    agents: HashMap<AgentSession, EmulationHandle>,
     next_id: EmulationHandle,
+    /// when [`EmulationEvent::PeerInput`] was last sent
+    peer_input_at: Option<tokio::time::Instant>,
     /// delay before recreating a backend that ended with a transient error
     backoff: Backoff,
 }
@@ -458,6 +652,7 @@ impl EmulationTask {
                         ProxyRequest::EnterAt(..) => { /* emulation inactive => ignore */ }
                         ProxyRequest::PushPointer(..) => { /* emulation inactive => ignore */ }
                         ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                        ProxyRequest::Agent(request) => request.refuse(&mut self.agents),
                     },
                 }
             }
@@ -470,9 +665,9 @@ impl EmulationTask {
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend, self.permission_pending.clone()) => r?,
+            r = (self.create)(self.permission_pending.clone()) => r?,
             // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            _ = wait_for_termination(&mut self.request_rx, &mut self.agents) => return Ok(()),
         };
         self.backoff.reset();
 
@@ -504,10 +699,24 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+        let handles: Vec<_> = self
+            .handles
+            .values()
+            .chain(self.agents.values())
+            .copied()
+            .collect();
+        for &handle in &handles {
             tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = emulation.create(handle) => {},
+                _ = wait_for_termination(&mut self.request_rx, &mut self.agents) => return Ok(()),
+            }
+        }
+        // sessions that ended meanwhile hold nothing, but have a handle
+        for handle in handles {
+            if !self.agents.values().any(|&h| h == handle)
+                && !self.handles.values().any(|&h| h == handle)
+            {
+                emulation.destroy(handle).await;
             }
         }
         Ok(())
@@ -523,6 +732,7 @@ impl EmulationTask {
                     ProxyRequest::Input(event, addr) => {
                         let handle = self.handle(emulation, addr).await;
                         emulation.consume(event, handle).await?;
+                        self.peer_input();
                     },
                     ProxyRequest::EnterAt(addr, edge, fraction) => {
                         let handle = self.handle(emulation, addr).await;
@@ -548,6 +758,7 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::Agent(request) => self.agent_request(emulation, request).await?,
                 },
             }
         }
@@ -562,11 +773,90 @@ impl EmulationTask {
         if let Some(&handle) = self.handles.get(&addr) {
             return handle;
         }
-        let handle = self.next_id;
-        self.next_id += 1;
-        emulation.create(handle).await;
+        let handle = self.new_handle(emulation).await;
         self.handles.insert(addr, handle);
         handle
+    }
+
+    /// the emulation handle for an agent's `session`, created on first use
+    async fn agent_handle(
+        &mut self,
+        emulation: &mut InputEmulation,
+        session: AgentSession,
+    ) -> EmulationHandle {
+        if let Some(&handle) = self.agents.get(&session) {
+            return handle;
+        }
+        let handle = self.new_handle(emulation).await;
+        self.agents.insert(session, handle);
+        handle
+    }
+
+    async fn new_handle(&mut self, emulation: &mut InputEmulation) -> EmulationHandle {
+        let handle = self.next_id;
+        self.next_id += 1;
+        debug_assert_ne!(handle, PUSH_HANDLE);
+        emulation.create(handle).await;
+        handle
+    }
+
+    /// reports emulated peer input, at most once per [`PEER_INPUT_EVERY`]
+    fn peer_input(&mut self) {
+        let now = tokio::time::Instant::now();
+        if self
+            .peer_input_at
+            .is_none_or(|at| now.duration_since(at) >= PEER_INPUT_EVERY)
+        {
+            self.peer_input_at = Some(now);
+            self.event_tx
+                .send(EmulationEvent::PeerInput)
+                .expect("channel closed");
+        }
+    }
+
+    /// Serves an agent; a backend error is the agent's answer and ends the
+    /// backend, as for peer input.
+    async fn agent_request(
+        &mut self,
+        emulation: &mut InputEmulation,
+        request: AgentRequest,
+    ) -> Result<(), EmulationError> {
+        match request {
+            AgentRequest::Event(session, event, reply) => {
+                let handle = self.agent_handle(emulation, session).await;
+                answer(reply, emulation.consume(event, handle).await)
+            }
+            AgentRequest::PointerTo(session, x, y, size, reply) => {
+                let handle = self.agent_handle(emulation, session).await;
+                match emulation.pointer_to(handle, x, y, size) {
+                    Ok(false) => {
+                        let _ = reply.send(Err(AgentError::Unsupported));
+                        Ok(())
+                    }
+                    placed => answer(reply, placed.map(drop)),
+                }
+            }
+            AgentRequest::Type(session, text, reply) => {
+                let handle = self.agent_handle(emulation, session).await;
+                let typed = emulation.type_text(handle, &text).await;
+                answer(reply, typed.map(|typed| typed.unmapped))
+            }
+            AgentRequest::End(session) => {
+                if let Some(handle) = self.agents.remove(&session) {
+                    emulation.destroy(handle).await;
+                }
+                Ok(())
+            }
+            AgentRequest::Info(reply) => {
+                let info = AgentEmulation {
+                    backend: emulation.selected().backend.to_string(),
+                    absolute: emulation.desktop().is_some(),
+                    text: emulation.text_support(),
+                };
+                let _ = reply.send(Some(info));
+                Ok(())
+            }
+        }
     }
 }
 
@@ -644,7 +934,11 @@ fn to_ipc_pos(pos: Position) -> crate::ipc::Position {
     }
 }
 
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
+/// Answers requests as emulation is off until `Terminate`.
+async fn wait_for_termination(
+    rx: &mut Receiver<ProxyRequest>,
+    agents: &mut HashMap<AgentSession, EmulationHandle>,
+) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
@@ -652,6 +946,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::EnterAt(..) | ProxyRequest::PushPointer(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::Agent(request) => request.refuse(agents),
         }
     }
 }
@@ -801,5 +1096,218 @@ mod enter_tests {
         assert!(gate.crossing(a, ms(1850)));
         // the Leave got lost, but the next crossing is seconds later
         assert!(gate.crossing(a, ms(6000)));
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    use input_emulation::{DummyRecord, Received};
+    use input_event::KeyboardEvent;
+    use tokio::task::LocalSet;
+
+    const KEY_A: u32 = 30;
+
+    fn key(state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: KEY_A,
+            state,
+        })
+    }
+
+    /// a proxy on recording dummy backends
+    fn proxy(record: &DummyRecord) -> EmulationProxy {
+        let record = record.clone();
+        EmulationProxy::with_backend(Box::new(move |_| {
+            let emulation = InputEmulation::dummy(record.clone());
+            async move { Ok(emulation) }.boxed_local()
+        }))
+    }
+
+    /// the next event of `proxy` that is not about approval
+    async fn next_event(proxy: &mut EmulationProxy) -> EmulationEvent {
+        loop {
+            match proxy.event().await {
+                EmulationEvent::AwaitingApproval(_) => continue,
+                event => return event,
+            }
+        }
+    }
+
+    async fn enabled(proxy: &mut EmulationProxy) {
+        let event = next_event(proxy).await;
+        assert!(matches!(event, EmulationEvent::EmulationEnabled(_)));
+    }
+
+    /// the handles created on the backend
+    fn created(received: &[Received]) -> Vec<EmulationHandle> {
+        let created = received.iter().filter_map(|r| match r {
+            Received::Create(handle) => Some(*handle),
+            _ => None,
+        });
+        created.collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_drives_its_own_handle_and_ending_it_releases_it() {
+        LocalSet::new()
+            .run_until(async {
+                let record = DummyRecord::default();
+                let mut proxy = proxy(&record);
+                let agent = proxy.agent();
+                enabled(&mut proxy).await;
+                agent.agent_event(1, key(1)).await.unwrap();
+                let typed = agent.agent_type(1, "hi\r\n".into()).await.unwrap();
+                assert_eq!(typed, "");
+                assert_eq!(
+                    record.take(),
+                    [
+                        Received::Create(0),
+                        Received::Event(0, key(1)),
+                        Received::Typed(0, "hi\n".into()),
+                    ]
+                );
+                agent.agent_end(1);
+                // answered in order: the session ended before
+                let info = agent.agent_info().await.unwrap();
+                let received = record.take();
+                assert!(
+                    received.contains(&Received::Event(0, key(0))),
+                    "{received:?}"
+                );
+                assert_eq!(received.last(), Some(&Received::Destroy(0)));
+                let expected = AgentEmulation {
+                    backend: "dummy".into(),
+                    absolute: false,
+                    text: TextSupport::Exact,
+                };
+                assert_eq!(info, expected);
+                // the dummy cannot place the pointer: no session is opened
+                let placed = agent.agent_pointer_to(2, 5, 5, (10, 10)).await;
+                assert!(matches!(placed, Err(AgentError::Unsupported)), "{placed:?}");
+                proxy.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sessions_never_share_a_handle_with_peers_or_the_push() {
+        LocalSet::new()
+            .run_until(async {
+                let record = DummyRecord::default();
+                let mut proxy = proxy(&record);
+                let agent = proxy.agent();
+                enabled(&mut proxy).await;
+                let peer: SocketAddr = "192.0.2.1:4242".parse().unwrap();
+                proxy.consume(key(1), peer);
+                agent.agent_event(1, key(1)).await.unwrap();
+                agent.agent_event(2, key(1)).await.unwrap();
+                proxy.push_pointer(Edge::Left, 0);
+                agent.agent_event(1, key(0)).await.unwrap();
+                assert_eq!(created(&record.take()), [0, 1, 2, PUSH_HANDLE]);
+                proxy.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_input_is_reported_at_most_every_100_ms() {
+        LocalSet::new()
+            .run_until(async {
+                let record = DummyRecord::default();
+                let mut proxy = proxy(&record);
+                let agent = proxy.agent();
+                enabled(&mut proxy).await;
+                let peer: SocketAddr = "192.0.2.1:4242".parse().unwrap();
+                let mut reports = 0;
+                for _ in 0..30 {
+                    proxy.consume(key(1), peer);
+                    proxy.consume(key(0), peer);
+                    // processed in order: the peer's input is emulated
+                    agent.agent_info().await.unwrap();
+                    while let Some(event) = proxy.event().now_or_never() {
+                        assert!(matches!(event, EmulationEvent::PeerInput));
+                        reports += 1;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                // 300 ms of input: at 0, 100 and 200 ms
+                assert_eq!(reports, 3);
+                // an agent's input is not a peer's
+                agent.agent_event(1, key(1)).await.unwrap();
+                tokio::time::sleep(PEER_INPUT_EVERY).await;
+                agent.agent_event(1, key(0)).await.unwrap();
+                assert!(proxy.event().now_or_never().is_none());
+                proxy.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn while_emulation_is_off_agents_are_told_so() {
+        LocalSet::new()
+            .run_until(async {
+                // creating the backend never ends (an unanswered dialog)
+                let pending = EmulationProxy::with_backend(Box::new(|_| {
+                    std::future::pending().boxed_local()
+                }));
+                // no backend works yet: retried with backoff
+                let failing = EmulationProxy::with_backend(Box::new(|_| {
+                    async { Err(EmulationCreationError::NoAvailableBackend) }.boxed_local()
+                }));
+                for mut proxy in [pending, failing] {
+                    let agent = proxy.agent();
+                    let sent = agent.agent_event(1, key(1)).await;
+                    assert!(matches!(sent, Err(AgentError::EmulationOff)), "{sent:?}");
+                    let typed = agent.agent_type(1, "a".into()).await;
+                    assert!(matches!(typed, Err(AgentError::EmulationOff)), "{typed:?}");
+                    let placed = agent.agent_pointer_to(1, 0, 0, (1, 1)).await;
+                    assert!(
+                        matches!(placed, Err(AgentError::EmulationOff)),
+                        "{placed:?}"
+                    );
+                    agent.agent_end(1);
+                    assert_eq!(agent.agent_info().await, None);
+                    proxy.terminate().await;
+                    // the emulation task is gone
+                    let sent = agent.agent_event(1, key(1)).await;
+                    assert!(matches!(sent, Err(AgentError::EmulationOff)), "{sent:?}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_backend_tells_the_agent_and_restarts_with_its_handles() {
+        LocalSet::new()
+            .run_until(async {
+                let record = DummyRecord::default();
+                let mut proxy = proxy(&record);
+                let agent = proxy.agent();
+                enabled(&mut proxy).await;
+                agent.agent_event(1, key(1)).await.unwrap();
+                agent.agent_event(2, key(1)).await.unwrap();
+                record.fail_next();
+                let failed = agent.agent_event(1, key(0)).await;
+                assert!(matches!(failed, Err(AgentError::Failed(_))), "{failed:?}");
+                agent.agent_end(2);
+                assert!(matches!(
+                    next_event(&mut proxy).await,
+                    EmulationEvent::EmulationDisabled
+                ));
+                enabled(&mut proxy).await;
+                // a new backend after the backoff: session 1 keeps its
+                // handle, the ended session 2 holds none
+                let received = record.take();
+                let restarted = received.iter().position(|r| *r == Received::Terminate);
+                assert_eq!(created(&received[restarted.unwrap()..]), [0]);
+                agent.agent_event(1, key(1)).await.unwrap();
+                assert_eq!(record.take(), [Received::Event(0, key(1))]);
+                agent.agent_event(3, key(1)).await.unwrap();
+                assert_eq!(created(&record.take()), [2]);
+                proxy.terminate().await;
+            })
+            .await;
     }
 }

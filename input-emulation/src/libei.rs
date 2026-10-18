@@ -32,7 +32,8 @@ use input_event::{Event, KeyboardEvent, PointerEvent};
 use crate::{PermissionPending, error::EmulationError};
 
 use super::geometry::{Rect, entry_point};
-use super::{Edge, Emulation, EmulationHandle, error::LibeiEmulationCreationError};
+use super::text::{Keystroke, Layout};
+use super::{Edge, Emulation, EmulationHandle, TextSupport, error::LibeiEmulationCreationError};
 
 /// a device interface, with the device it belongs to
 type Slot<T> = Arc<RwLock<Option<(ei::Device, T)>>>;
@@ -45,6 +46,8 @@ struct Devices {
     scroll: Slot<ei::Scroll>,
     button: Slot<ei::Button>,
     keyboard: Slot<ei::Keyboard>,
+    /// the keys of the keyboard's keymap, for typing text
+    layout: Slot<Layout>,
     /// devices the EIS resumed: events to a paused device are a protocol
     /// error
     resumed: Arc<RwLock<HashSet<ei::Device>>>,
@@ -70,6 +73,7 @@ impl Devices {
         clear(&self.scroll, device);
         clear(&self.button, device);
         clear(&self.keyboard, device);
+        clear(&self.layout, device);
         self.resumed.write().unwrap().remove(device);
     }
 }
@@ -192,11 +196,63 @@ impl LibeiEmulation {
             session,
         })
     }
+
+    /// Moves the absolute pointer to the point `place` picks on its regions
+    /// and returns it, `None` if the pointer was not moved.
+    fn move_pointer(
+        &mut self,
+        place: impl FnOnce(&[Rect]) -> Option<(i32, i32)>,
+    ) -> Result<Option<(i32, i32)>, EmulationError> {
+        let point = {
+            let absolute = self.devices.absolute.read().unwrap();
+            let Some((d, (p, regions))) = self.devices.usable(&absolute) else {
+                log::warn!("no usable absolute pointer device: pointer not placed");
+                return Ok(None);
+            };
+            let Some((x, y)) = place(regions) else {
+                log::warn!("absolute pointer device has no regions: pointer not placed");
+                return Ok(None);
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+            p.motion_absolute(x as f32, y as f32);
+            d.frame(self.conn.serial(), now);
+            (x, y)
+        };
+        self.context
+            .flush()
+            .map_err(|e| io::Error::new(e.kind(), e))?;
+        Ok(Some(point))
+    }
 }
 
 impl Drop for LibeiEmulation {
     fn drop(&mut self) {
         self.ei_task.abort();
+    }
+}
+
+/// the keys of an XKB keymap the EIS sent, `None` for another keymap type
+/// or one that cannot be read
+fn read_layout(keymap: &event::Keymap) -> Option<Layout> {
+    use std::os::unix::fs::FileExt;
+    if keymap.type_ != ei::keyboard::KeymapType::Xkb {
+        return None;
+    }
+    let read = || {
+        let file = fs::File::from(keymap.fd.try_clone()?);
+        let mut text = vec![0; keymap.size as usize];
+        file.read_exact_at(&mut text, 0)?;
+        io::Result::Ok(text)
+    };
+    match read() {
+        Ok(text) => Layout::new(&text),
+        Err(e) => {
+            log::warn!("could not read the keymap: {e}");
+            None
+        }
     }
 }
 
@@ -301,28 +357,28 @@ impl Emulation for LibeiEmulation {
         edge: Edge,
         fraction: u16,
     ) -> Result<Option<(i32, i32)>, EmulationError> {
-        let point = {
-            let absolute = self.devices.absolute.read().unwrap();
-            let Some((d, (p, regions))) = self.devices.usable(&absolute) else {
-                log::warn!("no usable absolute pointer device: pointer not placed");
-                return Ok(None);
-            };
-            let Some((x, y)) = entry_point(regions, edge, fraction) else {
-                log::warn!("absolute pointer device has no regions: pointer not placed");
-                return Ok(None);
-            };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64;
-            p.motion_absolute(x as f32, y as f32);
-            d.frame(self.conn.serial(), now);
-            (x, y)
-        };
-        self.context
-            .flush()
-            .map_err(|e| io::Error::new(e.kind(), e))?;
-        Ok(Some(point))
+        self.move_pointer(|regions| entry_point(regions, edge, fraction))
+    }
+
+    fn text_support(&self) -> TextSupport {
+        TextSupport::Layout
+    }
+
+    fn desktop(&self) -> Option<Vec<Rect>> {
+        let absolute = self.devices.absolute.read().unwrap();
+        let (_, (_, regions)) = self.devices.usable(&absolute)?;
+        Some(regions.clone())
+    }
+
+    fn pointer_to(&mut self, _: EmulationHandle, x: i32, y: i32) -> Result<bool, EmulationError> {
+        Ok(self.move_pointer(|_| Some((x, y)))?.is_some())
+    }
+
+    fn keystroke(&self, c: char) -> Option<Keystroke> {
+        let keyboard = self.devices.keyboard.read().unwrap();
+        self.devices.usable(&keyboard)?;
+        let layout = self.devices.layout.read().unwrap();
+        layout.as_ref()?.1.keystroke(c)
     }
 
     async fn create(&mut self, _: EmulationHandle) {}
@@ -419,6 +475,12 @@ fn handle_ei_event(event: EiEvent, devices: &Devices) -> Result<(), EmulationErr
                     .replace((device.device().clone(), (absolute, regions)));
             }
             if let Some(keyboard) = device.interface::<Keyboard>() {
+                let layout = device.keymap().and_then(read_layout);
+                if layout.is_none() {
+                    log::warn!("keyboard without a usable keymap: text cannot be typed");
+                }
+                *devices.layout.write().unwrap() =
+                    layout.map(|layout| (device.device().clone(), layout));
                 devices
                     .keyboard
                     .write()
