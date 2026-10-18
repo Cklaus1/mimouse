@@ -188,7 +188,8 @@ impl InputEmulation {
         backend: Option<Backend>,
         permission_pending: watch::Sender<bool>,
     ) -> Result<InputEmulation, EmulationCreationError> {
-        let (emulation, selected) = select(backend, AUTO_BACKENDS, |backend| {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let (emulation, selected) = select(backend, &auto_backends(wayland), |backend| {
             Self::create_backend(backend, &permission_pending)
         })
         .await?;
@@ -482,6 +483,20 @@ const AUTO_BACKENDS: &[Backend] = &[
     #[cfg(target_os = "macos")]
     Backend::MacOs,
 ];
+
+/// [`AUTO_BACKENDS`] for this session: under Wayland never X11, which on
+/// Xwayland reaches only X11 clients, and where Xwayland emulates through
+/// the RemoteDesktop portal (GNOME) makes the desktop ask the user again
+fn auto_backends(wayland: bool) -> Vec<Backend> {
+    #[cfg(x11)]
+    if wayland {
+        let not_x11 = |backend: &Backend| *backend != Backend::X11;
+        return AUTO_BACKENDS.iter().copied().filter(not_x11).collect();
+    }
+    #[cfg(not(x11))]
+    let _ = wayland;
+    AUTO_BACKENDS.to_vec()
+}
 
 /// the `configured` backend, else the first of `auto` that `create`
 /// succeeds with, stopping early when the user denied a permission request
@@ -922,5 +937,24 @@ mod tests {
             auto: true,
         };
         assert_eq!(result.unwrap(), (Backend::X11, auto));
+    }
+
+    /// under Wayland a failing portal backend is retried (no backend is
+    /// transient), never replaced by X11 on Xwayland; an X11 session keeps it
+    #[cfg(x11)]
+    #[test]
+    fn auto_selection_never_uses_x11_under_wayland() {
+        let only_x11 = |backend: Backend| async move {
+            match backend {
+                Backend::X11 => Ok(backend),
+                _ => Err(EmulationCreationError::NoAvailableBackend),
+            }
+        };
+        let result = block_on(select(None, &auto_backends(true), only_x11));
+        let error = InputEmulationError::from(result.unwrap_err());
+        assert!(error.is_transient(), "{error}");
+
+        let result = block_on(select(None, &auto_backends(false), only_x11));
+        assert_eq!(result.unwrap().0, Backend::X11);
     }
 }

@@ -44,20 +44,21 @@ A backend implements one trait, runs under a shared layer that keeps the cross-p
 - `focus(pos, range)` starts capture without a crossing and reports `Begin`. A backend that cannot grab input by itself returns `CaptureError::FocusByPointerPush`, and the service pushes the local pointer through the barrier with input emulation.
 - `set_hotkeys` is only for backends that see local keys while input is local (Windows, macOS). Feed keys to `chord::ChordMatcher` (`feed` → `Fed::{Pass, Fired, Swallowed}`, `swallow`); never write a second chord state machine.
 - Events produced in OS callbacks go through `event_queue`. It never blocks or panics; over its limit it drops motion and presses but keeps releases, `Modifiers` and `End`.
-- `terminate()` tears everything down.
+- `terminate()` tears everything down and must return promptly, also while a permission dialog is pending.
 
-`InputCapture` alone owns the pending queue and the client ids. It drops queued input on `release()` and on a destroyed id, and it handles enter-only ids (inbound peers that get only `Begin`/`End`). Don't reimplement these in a backend.
+`InputCapture` alone owns the pending queue and the client ids. On `release()` it drops queued input and any input the backend yields before its next `Begin`; it drops a destroyed id's events, ignores `destroy` of an unknown id, ends the stream after `terminate()`, and handles enter-only ids (inbound peers that get only `Begin`/`End`). Don't reimplement these in a backend.
 
 Contract: `input-capture/src/contract.rs` lists the rules every backend keeps under `InputCapture` (module doc) and checks them on each `SUBJECTS` entry. The rules cover:
 
 - which ids get a crossing, input and `End`;
-- barrier ranges, and a destroyed id getting nothing more;
-- `release()` dropping queued input;
+- barrier ranges, and a destroyed id getting nothing more (an unknown id: nothing at all);
+- `release()` dropping queued input and the input of the ended capture;
 - focus, including `FocusByPointerPush`;
 - hotkeys following the barriers;
 - a flooded OS queue keeping releases and `End`;
 - errors arriving after the events queued before them;
-- held keys handed over once.
+- held keys handed over once;
+- the stream ending at `terminate()`.
 
 A `Subject` declares whether `focus` starts capture by itself (`focuses`) and whether the backend can report where no barrier is (`reports_anywhere`). It also gives a `start` function that returns the backend and a `Driver`, which makes it report events. Add your backend there if it can run in CI without a real desktop, as layer-shell does against a fake compositor (`layer_shell::tests::on_fake_compositor`). Otherwise add a `fake(...)` subject that reproduces its queue limit and focus behaviour with `testing::Fake`, as Windows, macOS and libei have. Put its decisions in pure, platform-independent functions (like `input-capture/src/geometry.rs`) and test those.
 

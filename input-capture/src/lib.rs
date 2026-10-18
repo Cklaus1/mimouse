@@ -198,6 +198,11 @@ pub struct InputCapture {
     focus: Option<CaptureHandle>,
     /// `None`: a backend injected through [`InputCapture::with_backend`]
     selected: Option<Selected>,
+    /// released and no `Begin` since: input the backend still yields
+    /// belongs to the ended capture
+    released: bool,
+    /// the stream has ended
+    terminated: bool,
 }
 
 impl InputCapture {
@@ -229,7 +234,10 @@ impl InputCapture {
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let (pos, ..) = *self.id_map.get(&id).expect("no position for this handle");
+        let Some(&(pos, ..)) = self.id_map.get(&id) else {
+            log::debug!("destroying capture {id}: no such client");
+            return Ok(());
+        };
         let old = self.barrier_range(pos);
         self.id_map.remove(&id);
         if self.focus == Some(id) {
@@ -313,10 +321,12 @@ impl InputCapture {
         self.pending.retain(|(id, _)| id_map.contains_key(id));
     }
 
-    /// release mouse; queued input of the ended capture is dropped, so
-    /// nothing reaches a peer after its `Leave`
+    /// release mouse; input of the ended capture, queued here or still
+    /// held by the backend, is dropped until the next `Begin`, so nothing
+    /// reaches a peer after its `Leave`
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        self.released = true;
         let id_map = &self.id_map;
         self.pending.retain(|(id, event)| {
             id_map.contains_key(id) && !matches!(event, CaptureEvent::Input(_))
@@ -337,8 +347,10 @@ impl InputCapture {
         std::mem::take(&mut self.pressed_keys)
     }
 
-    /// destroy the input capture
+    /// destroy the input capture; the stream ends
     pub async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.terminated = true;
+        self.pending.clear();
         self.capture.terminate().await
     }
 
@@ -368,6 +380,8 @@ impl InputCapture {
             hotkeys: Vec::new(),
             focus: None,
             selected: None,
+            released: false,
+            terminated: false,
         }
     }
 
@@ -394,6 +408,9 @@ impl Stream for InputCapture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
         if let Some(e) = self.pending.pop_front() {
             return Poll::Ready(Some(Ok(e)));
         }
@@ -413,6 +430,12 @@ impl Stream for InputCapture {
                 Err(e) => return Poll::Ready(Some(Err(e))),
             };
 
+            // input of a released capture, until the next crossing
+            match event {
+                CaptureEvent::Begin(_) => self.released = false,
+                CaptureEvent::Input(_) if self.released => continue,
+                _ => {}
+            }
             // handle key presses
             if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
                 event

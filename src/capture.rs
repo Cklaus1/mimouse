@@ -387,7 +387,7 @@ impl CaptureTask {
                     match event {
                         // connection acknowlegded => set state to Sending
                         ConnEvent::Received(ProtoEvent::Ack(_)) => {
-                            log::info!("client {handle} acknowledged the connection!");
+                            log::debug!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                         }
                         // client disconnected

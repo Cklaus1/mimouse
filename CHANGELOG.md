@@ -46,6 +46,9 @@ First MiMouse release. MiMouse is originally forked from [Lan Mouse](https://git
 - Clipboard: updates arrive in order, the newest wins, and file names are de-duplicated after Windows sanitizing.
 - GNOME: clipboard sharing no longer stops for good when the portal refuses a new session for a while (mutter: `Session creation inhibited`); it retries every 10 s. Only a denied dialog still needs a service restart.
 - Windows: clipboard monitoring that fails is restarted every 10 s instead of leaving local copies unshared until the service restarts.
+- GNOME (Wayland): with no `emulation_backend` configured, emulation no longer falls back to X11 on Xwayland when the portal refuses it (e.g. while the screen is locked). GNOME's Xwayland asked to share the desktop again and again for it; emulation now retries libei until the desktop accepts.
+- GNOME: stopping the service no longer hangs while the input capture dialog is waiting for approval.
+- Input the capture backend still held when control returned is no longer sent to the peer after it was released.
 
 ### Security
 
